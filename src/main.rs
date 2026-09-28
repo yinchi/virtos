@@ -50,7 +50,7 @@ pub extern "C" fn kernel_main(dtb_ptr: usize) -> ! {
     let hardening = init_devices(dtb_ptr, &mut uart);
     writeln!(uart, "MMU enabled (PAN: {})", hardening.pan).expect("Could not write to UART");
 
-    writeln!(uart, "{:?}", gic().lock()).expect("Could not write to UART");
+    writeln!(uart, "{:?}", gic()).expect("Could not write to UART");
 
     writeln!(
         uart,
@@ -65,9 +65,33 @@ pub extern "C" fn kernel_main(dtb_ptr: usize) -> ! {
     }
 }
 
+/// One name per entry in `vectors.s`'s exception vector table, in the same order -- `vectors.s`
+/// passes the index of whichever entry it branched through as `vector`.
+const VECTOR_NAMES: [&str; 16] = [
+    "sync_el1t",
+    "irq_el1t",
+    "fiq_el1t",
+    "error_el1t",
+    "sync_el1h",
+    "irq_el1h",
+    "fiq_el1h",
+    "error_el1h",
+    "sync_el0_64",
+    "irq_el0_64",
+    "fiq_el0_64",
+    "error_el0_64",
+    "sync_el0_32",
+    "irq_el0_32",
+    "fiq_el0_32",
+    "error_el0_32",
+];
+
 #[unsafe(no_mangle)]
-extern "C" fn unexpected_exception(_: usize) -> ! {
-    panic!("Unexpected exception occurred!");
+extern "C" fn unexpected_exception(vector: usize) -> ! {
+    panic!(
+        "Unexpected exception: {}",
+        VECTOR_NAMES.get(vector).unwrap_or(&"<unknown vector>")
+    );
 }
 
 #[panic_handler]
