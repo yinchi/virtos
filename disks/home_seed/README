@@ -1,0 +1,3 @@
+This disk has been pre-seeded from the `disks/home_seed/` directory on the
+host system.  The `just seed-home` command can be used to re-seed this disk
+from the host (no-op if `home.img` already exists).

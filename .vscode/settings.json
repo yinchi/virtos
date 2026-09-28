@@ -1,0 +1,8 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+    "rust-analyzer.linkedProjects": [
+        "${workspaceFolder}/Cargo.toml"
+    ],
+    "rust-analyzer.cargo.target": "aarch64-unknown-none-softfloat",
+    "rust-analyzer.checkOnSave.allTargets": false
+}

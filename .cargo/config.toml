@@ -1,0 +1,12 @@
+[build]
+target = "aarch64-unknown-none-softfloat"
+
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+    "-C", "link-arg=-Tlink.ld",
+    # Do not generate unwind tables; these create unnecessary sections
+    # in the binary that the linker may place arbitrarily, breaking the
+    # entry point.  No unwind support exists in our no_std bare-metal
+    # environment, anyway.
+    "-C", "force-unwind-tables=no",
+]
