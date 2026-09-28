@@ -31,18 +31,14 @@ pub fn init_gic(gicd: usize, gicc: usize) {
     let mut gic = gic();
     gic.setup();
     gic.set_priority_mask(0xff);
-
-    // TODO: enable individual SPIs (`enable_spi`) and unmask IRQs (PSTATE.I) once a real device
-    // needs one -- there is nothing to interrupt yet.
 }
 
-/// Enable the specified SPI (Shared Peripheral Interrupt)
-pub fn enable_spi(spi: u32) {
+/// Enable the given interrupt (SPI or PPI) at the GIC.
+pub fn enable_interrupt(id: IntId) {
     let mut gic = gic();
-    let id = IntId::spi(spi);
     gic.set_interrupt_priority(id, INTERRUPT_PRIORITY); // arbitrary priority value
     gic.enable_interrupt(id, true)
-        .expect("Failed to enable SPI in");
+        .expect("Failed to enable interrupt");
 }
 
 /// Called from `vectors.s` on every IRQ taken at EL1 (`irq_el1h`).
@@ -52,6 +48,9 @@ extern "C" fn irq_handler() {
     // Group0: matches this QEMU config (no GIC Security Extensions), which uses the plain
     // IAR/EOIR registers rather than the separate Group1 AIAR/AEOIR ones.
     if let Some(intid) = gic.get_and_acknowledge_interrupt(InterruptGroup::Group0) {
+        if intid == IntId::ppi(super::timer::PPI) {
+            super::timer::ack(super::timer::freq());
+        }
         gic.end_interrupt(intid, InterruptGroup::Group0);
     }
 }

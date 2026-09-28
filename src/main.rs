@@ -3,13 +3,17 @@
 
 mod arch;
 
-use crate::arch::gic::gic;
+use crate::arch::gic::{enable_interrupt, gic};
 use crate::arch::init::{UART_BASE, init_devices};
 use crate::arch::rtc::DEFAULT_TIMEZONE;
 use crate::arch::rtc::rtc;
+use crate::arch::timer;
+use arm_gic::IntId;
 use arm_pl011_uart::{
     DataBits, LineConfig, PL011Registers, Parity, StopBits, Uart, UniqueMmioPointer,
 };
+use arm_sysregs::el0::accessors::{read_daif, write_daif};
+use arm_sysregs::el0::registers::Daif;
 use core::{fmt::Write, ptr::NonNull};
 use linked_list_allocator::LockedHeap;
 
@@ -59,7 +63,25 @@ pub extern "C" fn kernel_main(dtb_ptr: usize) -> ! {
     )
     .expect("Could not write to UART");
 
-    // Placeholder until we have a shell
+    // Temporary: confirm the IRQ pipeline just wired up (vectors.s/gic.rs) actually dispatches,
+    // by making the EL1 physical timer fire a few times. Replace with the next thing to check
+    // once this is confirmed working.
+    enable_interrupt(IntId::ppi(timer::PPI));
+    // SAFETY: single-threaded boot code; nothing else touches DAIF concurrently.
+    unsafe { write_daif(read_daif() & !Daif::I) };
+    timer::arm(timer::freq()); // fires roughly once per second
+
+    let mut last = 0;
+    while last < 5 {
+        let n = timer::ticks();
+        if n != last {
+            last = n;
+            writeln!(uart, "tick {last}").expect("Could not write to UART");
+        }
+        unsafe { core::arch::asm!("wfe") }
+    }
+    writeln!(uart, "Timer IRQ pipeline OK").expect("Could not write to UART");
+
     loop {
         unsafe { core::arch::asm!("wfe") }
     }
