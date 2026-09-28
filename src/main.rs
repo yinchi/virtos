@@ -8,7 +8,8 @@ use crate::arch::gic::gic;
 use crate::arch::init::{UART_BASE, init_devices};
 use crate::arch::rtc::DEFAULT_TIMEZONE;
 use crate::arch::rtc::rtc;
-use crate::drivers::virtio::{blk, gpu};
+use crate::arch::timer;
+use crate::drivers::virtio::{blk, gpu, input};
 use arm_pl011_uart::{
     DataBits, LineConfig, PL011Registers, Parity, StopBits, Uart, UniqueMmioPointer,
 };
@@ -107,6 +108,28 @@ pub extern "C" fn kernel_main(dtb_ptr: usize) -> ! {
         .expect("Could not write to UART");
     } else {
         writeln!(uart, "No virtio-gpu device found").expect("Could not write to UART");
+    }
+
+    // Temporary: confirm virtio-keyboard actually delivers real key events, not just that it
+    // doesn't crash -- polling for a few seconds and printing whatever arrives raw (no keymap
+    // yet). Replace with the next thing to check once this is confirmed working.
+    if let Some(keyboard) = input::get() {
+        writeln!(uart, "virtio-keyboard: polling for 5s, press a key...")
+            .expect("Could not write to UART");
+        let deadline = timer::now() + timer::freq() * 5;
+        while timer::now() < deadline {
+            if let Some(event) = keyboard.poll() {
+                writeln!(
+                    uart,
+                    "key event: type={:#x} code={} value={}",
+                    event.event_type, event.code, event.value
+                )
+                .expect("Could not write to UART");
+            }
+        }
+        writeln!(uart, "virtio-keyboard: done polling").expect("Could not write to UART");
+    } else {
+        writeln!(uart, "No virtio-keyboard device found").expect("Could not write to UART");
     }
 
     loop {

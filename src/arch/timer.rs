@@ -2,7 +2,9 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use arm_sysregs::el0::accessors::{read_cntfrq_el0, write_cntp_ctl_el0, write_cntp_tval_el0};
+use arm_sysregs::el0::accessors::{
+    read_cntfrq_el0, read_cntpct_el0, write_cntp_ctl_el0, write_cntp_tval_el0,
+};
 use arm_sysregs::el0::registers::{CntpCtlEl0, CntpTvalEl0};
 
 /// PPI number for the non-secure EL1 physical timer interrupt (confirmed via the DTB's `timer`
@@ -15,6 +17,13 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 /// The system counter's frequency in Hz, fixed by the platform at boot.
 pub fn freq() -> u64 {
     read_cntfrq_el0().clockfreq() as u64
+}
+
+/// The system counter's current value, in the same units `freq()` counts per second. A free
+/// running count, unrelated to `arm`/`ack`'s compare-based timer -- useful for a plain "has this
+/// many seconds passed yet" wait with no interrupt involved.
+pub fn now() -> u64 {
+    read_cntpct_el0().physicalcount()
 }
 
 /// Arms (or re-arms) the timer to fire `ticks` counter cycles from now.

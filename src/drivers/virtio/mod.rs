@@ -4,6 +4,7 @@
 pub mod blk;
 pub mod gpu;
 pub mod hal;
+pub mod input;
 
 use core::ptr::NonNull;
 
@@ -31,6 +32,7 @@ pub fn discover(mmio_slots: impl Iterator<Item = (usize, usize)>) {
         match transport.device_type() {
             DeviceType::Block => blk::add(transport),
             DeviceType::GPU => gpu::set(transport),
+            DeviceType::Input => input::set(transport),
             _ => {}
         }
     }
