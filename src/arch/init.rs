@@ -2,6 +2,12 @@ use fdt::Fdt;
 
 use crate::arch::mmu;
 use crate::arch::rtc::RTC;
+use crate::drivers::virtio::blk;
+
+/// The most `virtio,mmio` slots QEMU's `virt` machine ever exposes, regardless of how many
+/// `-device` flags are actually given -- fixed by the machine model, not derived from the DTB.
+/// Only a bound for a stack-local scratch array below; every slot the DTB actually lists is used.
+const MAX_VIRTIO_MMIO_SLOTS: usize = 32;
 
 /// Base address of the UART device: hard-coded, unlike every other device's, since it's used to
 /// print the very first boot message, before the DTB is even read.
@@ -110,6 +116,43 @@ pub fn init_devices(
         rtc.size.expect("RTC has no size in its DTB `reg` entry"),
     );
     RTC.call_once(|| unsafe { arm_pl031::Rtc::new(rtc.starting_address as _) });
+
+    // Every `virtio,mmio` slot the DTB lists (QEMU always emits all of them, whether or not a
+    // `-device` backs each one -- an empty slot just reads back a device ID of 0 harmlessly).
+    // Slots are only 0x200 bytes each, 8 to a 4 KiB page, so mapping them individually would try
+    // to map the same page twice for adjacent slots and be rejected; map the single contiguous
+    // window they occupy instead, its bounds taken from the DTB rather than hard-coded.
+    let mut slots = [(0usize, 0usize); MAX_VIRTIO_MMIO_SLOTS];
+    let mut slot_count = 0;
+    let mut window: Option<(usize, usize)> = None;
+    for node in fdt.all_nodes() {
+        if !node
+            .compatible()
+            .is_some_and(|c| c.all().any(|s| s == "virtio,mmio"))
+        {
+            continue;
+        }
+        let Some(region) = node.reg().and_then(|mut regions| regions.next()) else {
+            continue;
+        };
+        let base = region.starting_address as usize;
+        let size = region
+            .size
+            .expect("virtio,mmio node has no size in its DTB `reg` entry");
+
+        if slot_count < MAX_VIRTIO_MMIO_SLOTS {
+            slots[slot_count] = (base, size);
+            slot_count += 1;
+        }
+        window = Some(match window {
+            None => (base, base + size),
+            Some((start, end)) => (start.min(base), end.max(base + size)),
+        });
+    }
+    if let Some((start, end)) = window {
+        mmu::map_device(start, end - start);
+    }
+    blk::find_all(slots[..slot_count].iter().copied());
 
     hardening
 }

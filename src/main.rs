@@ -2,18 +2,16 @@
 #![no_main]
 
 mod arch;
+mod drivers;
 
-use crate::arch::gic::{enable_interrupt, gic};
+use crate::arch::gic::gic;
 use crate::arch::init::{UART_BASE, init_devices};
 use crate::arch::rtc::DEFAULT_TIMEZONE;
 use crate::arch::rtc::rtc;
-use crate::arch::timer;
-use arm_gic::IntId;
+use crate::drivers::virtio::blk;
 use arm_pl011_uart::{
     DataBits, LineConfig, PL011Registers, Parity, StopBits, Uart, UniqueMmioPointer,
 };
-use arm_sysregs::el0::accessors::{read_daif, write_daif};
-use arm_sysregs::el0::registers::Daif;
 use core::{fmt::Write, ptr::NonNull};
 use linked_list_allocator::LockedHeap;
 
@@ -63,24 +61,23 @@ pub extern "C" fn kernel_main(dtb_ptr: usize) -> ! {
     )
     .expect("Could not write to UART");
 
-    // Temporary: confirm the IRQ pipeline just wired up (vectors.s/gic.rs) actually dispatches,
-    // by making the EL1 physical timer fire a few times. Replace with the next thing to check
-    // once this is confirmed working.
-    enable_interrupt(IntId::ppi(timer::PPI));
-    // SAFETY: single-threaded boot code; nothing else touches DAIF concurrently.
-    unsafe { write_daif(read_daif() & !Daif::I) };
-    timer::arm(timer::freq()); // fires roughly once per second
-
-    let mut last = 0;
-    while last < 5 {
-        let n = timer::ticks();
-        if n != last {
-            last = n;
-            writeln!(uart, "tick {last}").expect("Could not write to UART");
-        }
-        unsafe { core::arch::asm!("wfe") }
+    // Temporary: confirm virtio-blk actually reads real bytes off a disk image, not just that it
+    // doesn't crash -- checking for the FAT boot sector's own signature bytes. Replace with the
+    // next thing to check once this is confirmed working.
+    writeln!(uart, "virtio-blk devices found: {}", blk::count()).expect("Could not write to UART");
+    if blk::count() > 0 {
+        let dev = blk::get(0);
+        let mut sector = [0u8; 512];
+        dev.read_blocks(0, &mut sector).expect("blk0 read failed");
+        writeln!(
+            uart,
+            "blk0: {} bytes, boot sector signature {:#04x} {:#04x} (expect 0x55 0xaa)",
+            dev.capacity_bytes(),
+            sector[510],
+            sector[511]
+        )
+        .expect("Could not write to UART");
     }
-    writeln!(uart, "Timer IRQ pipeline OK").expect("Could not write to UART");
 
     loop {
         unsafe { core::arch::asm!("wfe") }
