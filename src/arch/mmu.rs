@@ -21,6 +21,7 @@ use arm_sysregs::el1::{
     },
     registers::{MairEl1, SctlrEl1, TcrEl1},
 };
+use spin::Mutex;
 
 /////////////////////////////////////////////////////////////////////////////////////////////
 // MAIR_EL1 attribute indexes: there are 8 1-byte slots, of which we use 0 and 1.
@@ -53,10 +54,11 @@ const ROOT_LEVEL: usize = 1;
 const ASID: usize = 0;
 
 /// The page table `enable` builds and activates, and every later `map_device` call extends.
-/// SAFETY (every access): this project is single-threaded and pre-scheduler, so `enable` and
-/// `map_device` never race each other -- `enable` writes it exactly once, before `map_device`
-/// could ever be reached, and every later reader/writer runs strictly after that.
-static mut IDMAP: Option<IdMap<El1And0>> = None;
+/// Locked rather than a bare `static mut`: `map_device` only ever needs the table for one
+/// `map_range` call at a time and never holds it across anything else, so a lock costs nothing
+/// here and comes with no deadlock risk -- unlike `gic.rs`'s `GicV2`, nothing touches this from
+/// an interrupt handler.
+static IDMAP: Mutex<Option<IdMap<El1And0>>> = Mutex::new(None);
 
 /// What `enable` turned on beyond translation itself -- reported at boot.
 pub struct Hardening {
@@ -207,12 +209,10 @@ pub fn enable() -> Hardening {
         unsafe { write_pan(Pan::PAN) };
     }
 
-    // SAFETY: sole write to IDMAP, happening once, here, before anything else could reach it.
-    // Keeping it alive is not optional: `IdMap`'s `Drop` impl panics if an active mapping is
-    // ever dropped, since that would free memory the CPU is still using as its page table.
-    unsafe {
-        IDMAP = Some(idmap);
-    }
+    // Keeping IDMAP alive from here on is not optional: `IdMap`'s `Drop` impl panics if an
+    // active mapping is ever dropped, since that would free memory the CPU is still using as
+    // its page table.
+    *IDMAP.lock() = Some(idmap);
     Hardening { pan }
 }
 
@@ -229,12 +229,10 @@ pub fn map_device(base: usize, size: usize) {
         | El1Attributes::ACCESSED
         | El1Attributes::UXN
         | El1Attributes::PXN;
-    // SAFETY: see IDMAP.
-    #[allow(clippy::deref_addrof)]
-    let idmap = unsafe { &mut *(&raw mut IDMAP) }
+    IDMAP
+        .lock()
         .as_mut()
-        .expect("mmu::map_device called before mmu::enable");
-    idmap
+        .expect("mmu::map_device called before mmu::enable")
         .map_range(&MemoryRegion::new(base, base + size), device)
         .expect("mmu::map_device: overlapping or invalid range");
 }

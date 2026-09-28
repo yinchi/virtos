@@ -8,6 +8,8 @@
 //! (a scheduler, which doesn't exist yet), so there's nothing to gain yet from the extra SPI
 //! wiring and IRQ dispatch it would need.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use virtio_drivers::Error;
 use virtio_drivers::device::blk::VirtIOBlk;
 use virtio_drivers::transport::mmio::MmioTransport;
@@ -20,7 +22,7 @@ pub const MAX_BLK: usize = 4;
 /// Every discovered block device, in slot order. Only the first `BLK_COUNT` entries are valid.
 static mut BLK: [Option<Blk>; MAX_BLK] = [const { None }; MAX_BLK];
 /// How many of `BLK`'s entries `add` populated.
-static mut BLK_COUNT: usize = 0;
+static BLK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Wrapper around a VirtIO block device.
 pub struct Blk {
@@ -49,23 +51,21 @@ impl Blk {
 /// or arrives past `MAX_BLK`, is dropped like an empty slot.
 #[allow(clippy::deref_addrof)]
 pub(super) fn add(transport: MmioTransport<'static>) {
-    // SAFETY: sole writer, called once per slot before `get`/`count` are ever reached.
-    let (blk, count) = unsafe { (&mut *(&raw mut BLK), &mut *(&raw mut BLK_COUNT)) };
-    if *count == MAX_BLK {
+    let count = BLK_COUNT.load(Ordering::Relaxed);
+    if count == MAX_BLK {
         return;
     }
     let Ok(inner) = VirtIOBlk::<VirtioHalImpl, _>::new(transport) else {
         return;
     };
-    blk[*count] = Some(Blk { inner });
-    *count += 1;
+    // SAFETY: sole writer, called once per slot before `get` is ever reached.
+    unsafe { (&mut *(&raw mut BLK))[count] = Some(Blk { inner }) };
+    BLK_COUNT.store(count + 1, Ordering::Relaxed);
 }
 
-/// How many block devices `find_all` found.
-#[allow(clippy::deref_addrof)]
+/// How many block devices `add` found.
 pub fn count() -> usize {
-    // SAFETY: read-only after `find_all` has run.
-    unsafe { *(&raw const BLK_COUNT) }
+    BLK_COUNT.load(Ordering::Relaxed)
 }
 
 /// Block device `dev` (an index below `count()`).
