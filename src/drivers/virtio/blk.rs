@@ -1,4 +1,5 @@
-//! Finds the VirtIO block devices among the `virtio,mmio` slots the device tree lists.
+//! The VirtIO block devices `super::discover` finds among the `virtio,mmio` slots the device
+//! tree lists.
 //!
 //! Uses `VirtIOBlk`'s plain, synchronous `read_blocks`/`write_blocks` -- which busy-polls the
 //! virtqueue directly, no interrupt involved -- rather than its non-blocking submit/complete
@@ -9,18 +10,16 @@
 
 use virtio_drivers::Error;
 use virtio_drivers::device::blk::VirtIOBlk;
-use virtio_drivers::transport::DeviceType;
 use virtio_drivers::transport::mmio::MmioTransport;
 
 use super::hal::VirtioHalImpl;
-use super::mmio_transports;
 
 /// The most block devices this kernel tracks.
 pub const MAX_BLK: usize = 4;
 
 /// Every discovered block device, in slot order. Only the first `BLK_COUNT` entries are valid.
 static mut BLK: [Option<Blk>; MAX_BLK] = [const { None }; MAX_BLK];
-/// How many of `BLK`'s entries `find_all` populated.
+/// How many of `BLK`'s entries `add` populated.
 static mut BLK_COUNT: usize = 0;
 
 /// Wrapper around a VirtIO block device.
@@ -45,24 +44,21 @@ impl Blk {
     }
 }
 
-/// Finds every block device among `mmio_slots` (`(base, size)` pairs, already mapped by the
-/// caller -- see `mmu::map_device`), up to `MAX_BLK`. Populates the static `BLK` table that
-/// `get`/`count` read back; a device whose driver fails to initialize is skipped like an empty
-/// slot.
+/// Claims a slot `super::discover` classified as a block device, up to `MAX_BLK`. Populates the
+/// static `BLK` table that `get`/`count` read back; a device whose driver fails to initialize,
+/// or arrives past `MAX_BLK`, is dropped like an empty slot.
 #[allow(clippy::deref_addrof)]
-pub fn find_all(mmio_slots: impl Iterator<Item = (usize, usize)>) {
-    // SAFETY: sole writer, called once before `get`/`count` are ever reached.
+pub(super) fn add(transport: MmioTransport<'static>) {
+    // SAFETY: sole writer, called once per slot before `get`/`count` are ever reached.
     let (blk, count) = unsafe { (&mut *(&raw mut BLK), &mut *(&raw mut BLK_COUNT)) };
-    for transport in mmio_transports(mmio_slots, DeviceType::Block) {
-        if *count == MAX_BLK {
-            break;
-        }
-        let Ok(inner) = VirtIOBlk::<VirtioHalImpl, _>::new(transport) else {
-            continue;
-        };
-        blk[*count] = Some(Blk { inner });
-        *count += 1;
+    if *count == MAX_BLK {
+        return;
     }
+    let Ok(inner) = VirtIOBlk::<VirtioHalImpl, _>::new(transport) else {
+        return;
+    };
+    blk[*count] = Some(Blk { inner });
+    *count += 1;
 }
 
 /// How many block devices `find_all` found.

@@ -2,7 +2,7 @@ use fdt::Fdt;
 
 use crate::arch::mmu;
 use crate::arch::rtc::RTC;
-use crate::drivers::virtio::blk;
+use crate::drivers::virtio;
 
 /// The most `virtio,mmio` slots QEMU's `virt` machine ever exposes, regardless of how many
 /// `-device` flags are actually given -- fixed by the machine model, not derived from the DTB.
@@ -152,7 +152,7 @@ pub fn init_devices(
     if let Some((start, end)) = window {
         mmu::map_device(start, end - start);
     }
-    blk::find_all(slots[..slot_count].iter().copied());
+    virtio::discover(slots[..slot_count].iter().copied());
 
     hardening
 }

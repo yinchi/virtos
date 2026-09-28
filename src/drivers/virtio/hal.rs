@@ -10,8 +10,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE, PhysAddr};
 
-/// Number of pages in the DMA pool: room for a block device's virtqueue.
-const DMA_POOL_PAGES: usize = 64;
+/// Number of pages in the DMA pool: room for every device's virtqueues plus the GPU's own
+/// 640x480x4-byte pixel buffer (`gpu::WIDTH * gpu::HEIGHT * 4` = ~1.2 MiB, itself DMA-allocated
+/// via `change_resolution`), with some headroom.
+const DMA_POOL_PAGES: usize = 512; // 2 MiB
 const DMA_POOL_SIZE: usize = DMA_POOL_PAGES * PAGE_SIZE;
 
 #[repr(align(4096))]

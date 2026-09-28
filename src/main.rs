@@ -8,7 +8,7 @@ use crate::arch::gic::gic;
 use crate::arch::init::{UART_BASE, init_devices};
 use crate::arch::rtc::DEFAULT_TIMEZONE;
 use crate::arch::rtc::rtc;
-use crate::drivers::virtio::blk;
+use crate::drivers::virtio::{blk, gpu};
 use arm_pl011_uart::{
     DataBits, LineConfig, PL011Registers, Parity, StopBits, Uart, UniqueMmioPointer,
 };
@@ -77,6 +77,36 @@ pub extern "C" fn kernel_main(dtb_ptr: usize) -> ! {
             sector[511]
         )
         .expect("Could not write to UART");
+    }
+
+    // Temporary: confirm virtio-gpu actually drives the display -- a visible test pattern, not
+    // just "didn't crash". Replace with the next thing to check once this is confirmed working.
+    if let Some(gpu) = gpu::get() {
+        let fb = gpu.framebuffer();
+        // SAFETY: `fb.ptr` is the DMA-backed pixel buffer virtio-gpu just handed back, valid for
+        // `fb.stride * fb.height` bytes for as long as `gpu` is alive, which outlives this loop.
+        let pixels = unsafe { core::slice::from_raw_parts_mut(fb.ptr, fb.stride * fb.height) };
+        for y in 0..fb.height {
+            // Three horizontal bands, BGRX8888: red, green, blue, top to bottom.
+            let (b, g, r) = match y * 3 / fb.height {
+                0 => (0u8, 0u8, 255u8),
+                1 => (0, 255, 0),
+                _ => (255, 0, 0),
+            };
+            for x in 0..fb.width {
+                let px = y * fb.stride + x * 4;
+                pixels[px..px + 4].copy_from_slice(&[b, g, r, 0]);
+            }
+        }
+        gpu.flush();
+        writeln!(
+            uart,
+            "virtio-gpu: drew {}x{} test pattern",
+            fb.width, fb.height
+        )
+        .expect("Could not write to UART");
+    } else {
+        writeln!(uart, "No virtio-gpu device found").expect("Could not write to UART");
     }
 
     loop {
