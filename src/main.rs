@@ -27,13 +27,14 @@ mod bare_metal {
     use crate::arch::timer;
     use crate::console::{self, Console, DEFAULT_BG as BG, DEFAULT_FG as FG};
     use crate::drivers::virtio::{blk, gpu, input};
-    use crate::fs::blkio::BlkIo;
+    use crate::fs;
     use crate::keyboard::KeyState;
     use arm_pl011_uart::{
         DataBits, LineConfig, PL011Registers, Parity, StopBits, Uart, UniqueMmioPointer,
     };
     use core::{fmt::Write, ptr::NonNull};
-    use embedded_io::{Read, Seek, SeekFrom};
+    use hadris_fat::FatVolumeReadExt;
+    use hadris_fat::sync::DirectoryEntry;
     use linked_list_allocator::LockedHeap;
 
     /// Size of the kernel heap. `aarch64-paging`'s `IdMap` allocates its page-table nodes from it, so
@@ -82,24 +83,36 @@ mod bare_metal {
         )
         .expect("Could not write to UART");
 
-        // Temporary: confirm the blk-to-byte-stream adapter (`fs::blkio::BlkIo`) reads the same
-        // bytes `Blk::read_blocks` proved it could -- the FAT boot sector's own signature --
-        // exercising the sector arithmetic and the `embedded_io` impls before anything mounts a
-        // filesystem through them. Replace with the next thing to check once this is confirmed
-        // working.
+        // Temporary: confirm mounting a FAT volume through `BlkIo` actually works -- list the root
+        // directory and read back a file's content, not just raw sector bytes off the device.
+        // Both devices, since blk0 (system.img) currently holds only empty directories and blk1
+        // (home.img) is what actually exercises the file-content read path. Replace with the next
+        // thing to check once this is confirmed working.
         writeln!(uart, "virtio-blk devices found: {}", blk::count())
             .expect("Could not write to UART");
-        if blk::count() > 0 {
-            let mut io = BlkIo::new(blk::get(0));
-            let mut sector = [0u8; 512];
-            io.seek(SeekFrom::Start(0)).expect("blkio seek failed");
-            io.read_exact(&mut sector).expect("blkio read failed");
-            writeln!(
-                uart,
-                "blk0 via BlkIo: boot sector signature {:#04x} {:#04x} (expect 0x55 0xaa)",
-                sector[510], sector[511]
-            )
-            .expect("Could not write to UART");
+        for dev in 0..blk::count() {
+            fs::volume::open(dev);
+            let vol = fs::volume::get(dev).expect("just opened");
+            let root = vol.root_dir();
+            writeln!(uart, "blk{dev} root directory:").expect("Could not write to UART");
+            for entry in root.entries() {
+                let DirectoryEntry::Entry(entry) = entry.expect("directory entry read failed");
+                writeln!(uart, "  {} ({} bytes)", entry.name(), entry.len())
+                    .expect("Could not write to UART");
+                if entry.is_file() {
+                    let mut reader = vol
+                        .read_file(&entry)
+                        .expect("failed to open file for reading");
+                    let mut buf = [0u8; 256];
+                    let n = reader.read(&mut buf).expect("file read failed");
+                    writeln!(
+                        uart,
+                        "    {:?}",
+                        core::str::from_utf8(&buf[..n]).unwrap_or("<non-UTF-8>")
+                    )
+                    .expect("Could not write to UART");
+                }
+            }
         }
 
         // Temporary: confirm the console + keyboard pipeline works end to end -- real typed

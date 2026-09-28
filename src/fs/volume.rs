@@ -1,0 +1,39 @@
+//! Opening `blk`'s block devices as FAT volumes through `blkio::BlkIo`.
+//!
+//! Volume-level only: no path/namespace concept at all, just "this device's filesystem is now
+//! readable/writable" -- the same split the reference lab draws between `fs::mounts::open_volume`
+//! (this layer) and `fs::mounts::mount` (path-level: resolving a device by label, and recording
+//! where in a directory tree it answers for). That path-level layer -- `mount`/`umount` syscalls,
+//! `/etc/fstab` -- is deferred (`plans/USERSPACE_PLAN.md`); this module is named `volume`, not
+//! `mount`, specifically so the function that eventually implements *that* doesn't collide with
+//! this one.
+
+use hadris_fat::sync::FatVolume;
+
+use super::blkio::BlkIo;
+use crate::drivers::virtio::blk::{self, MAX_BLK};
+
+/// One open volume per `blk` device, indexed the same way `blk::get` is.
+static mut VOLUMES: [Option<FatVolume<BlkIo>>; MAX_BLK] = [const { None }; MAX_BLK];
+
+/// Opens the FAT volume on `blk` device `dev`.
+///
+/// # Panics
+/// If `dev` holds no valid FAT filesystem.
+pub fn open(dev: usize) {
+    let io = BlkIo::new(blk::get(dev));
+    let vol = FatVolume::open(io).expect("failed to open FAT volume");
+    // SAFETY: sole writer, and `get` is only ever called for a `dev` some earlier `open` call
+    // already populated.
+    #[allow(clippy::deref_addrof)]
+    unsafe {
+        (&mut *(&raw mut VOLUMES))[dev] = Some(vol)
+    };
+}
+
+/// The FAT volume open on `blk` device `dev`, if `open` has been called for it.
+#[allow(clippy::deref_addrof)]
+pub fn get(dev: usize) -> Option<&'static mut FatVolume<BlkIo>> {
+    // SAFETY: see `open`.
+    unsafe { (&mut *(&raw mut VOLUMES))[dev].as_mut() }
+}
