@@ -1,6 +1,11 @@
 default:
     just --list
 
+# Run the pure-logic modules' unit tests on the host, not the bare-metal target -- see
+# Cargo.toml's `[target.'cfg(target_os = "none")'.dependencies]` comment for how the split works.
+test-host:
+    cargo test --target aarch64-unknown-linux-gnu
+
 HOME_IMG := "home.img"
 
 # Serial number for the system image (all zeros)

@@ -25,6 +25,14 @@ fn add_asm(dir: &Path, build: &mut cc::Build) -> bool {
 }
 
 fn main() {
+    // Skip entirely when building for a host test target (`cargo test --target <host triple>`,
+    // see Cargo.toml's `[target.'cfg(target_os = "none")'.dependencies]` comment): this assembly
+    // defines the bare-metal entry point (`_start`) and friends, which would collide with the
+    // host OS's own C runtime if linked into a normal executable.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("none") {
+        return;
+    }
+
     println!("cargo:rerun-if-changed=link.ld");
     println!("cargo:rerun-if-changed=src");
     let mut build = cc::Build::new();
