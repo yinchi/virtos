@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-aarch64-cpu = "11.2.0"
 aarch64-paging = "0.12.1"
 arm-gic = "0.10.0"
 arm-pl011-uart = { version = "0.5.1", features = ["embedded-io"] }
@@ -12,6 +11,7 @@ arm-sysregs = { version = "0.5.1", features = ["el1"] }
 arm_pl031 = "0.2.1"
 bimap = { version = "0.6.3", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
+chrono-tz = { version = "0.10.4", default-features = false }
 embedded-io = { version = "0.7.1", default-features = false, features = ["alloc"] }
 fdt = "0.1.5"
 hadris-fat = { version = "2.4.0", default-features = false, features = ["alloc", "lfn", "read", "write", "sync"] }
