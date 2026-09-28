@@ -14,6 +14,10 @@ mod drivers;
 mod console;
 mod keyboard;
 
+// Mixed: `fs::sector` is pure like the above, `fs::blkio` is hardware-only like `drivers` --
+// see `fs/mod.rs`.
+mod fs;
+
 #[cfg(target_os = "none")]
 mod bare_metal {
     use crate::arch::gic::gic;
@@ -23,11 +27,13 @@ mod bare_metal {
     use crate::arch::timer;
     use crate::console::{self, Console, DEFAULT_BG as BG, DEFAULT_FG as FG};
     use crate::drivers::virtio::{blk, gpu, input};
+    use crate::fs::blkio::BlkIo;
     use crate::keyboard::KeyState;
     use arm_pl011_uart::{
         DataBits, LineConfig, PL011Registers, Parity, StopBits, Uart, UniqueMmioPointer,
     };
     use core::{fmt::Write, ptr::NonNull};
+    use embedded_io::{Read, Seek, SeekFrom};
     use linked_list_allocator::LockedHeap;
 
     /// Size of the kernel heap. `aarch64-paging`'s `IdMap` allocates its page-table nodes from it, so
@@ -76,21 +82,22 @@ mod bare_metal {
         )
         .expect("Could not write to UART");
 
-        // Temporary: confirm virtio-blk actually reads real bytes off a disk image, not just that it
-        // doesn't crash -- checking for the FAT boot sector's own signature bytes. Replace with the
-        // next thing to check once this is confirmed working.
+        // Temporary: confirm the blk-to-byte-stream adapter (`fs::blkio::BlkIo`) reads the same
+        // bytes `Blk::read_blocks` proved it could -- the FAT boot sector's own signature --
+        // exercising the sector arithmetic and the `embedded_io` impls before anything mounts a
+        // filesystem through them. Replace with the next thing to check once this is confirmed
+        // working.
         writeln!(uart, "virtio-blk devices found: {}", blk::count())
             .expect("Could not write to UART");
         if blk::count() > 0 {
-            let dev = blk::get(0);
+            let mut io = BlkIo::new(blk::get(0));
             let mut sector = [0u8; 512];
-            dev.read_blocks(0, &mut sector).expect("blk0 read failed");
+            io.seek(SeekFrom::Start(0)).expect("blkio seek failed");
+            io.read_exact(&mut sector).expect("blkio read failed");
             writeln!(
                 uart,
-                "blk0: {} bytes, boot sector signature {:#04x} {:#04x} (expect 0x55 0xaa)",
-                dev.capacity_bytes(),
-                sector[510],
-                sector[511]
+                "blk0 via BlkIo: boot sector signature {:#04x} {:#04x} (expect 0x55 0xaa)",
+                sector[510], sector[511]
             )
             .expect("Could not write to UART");
         }

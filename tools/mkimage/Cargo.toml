@@ -1,0 +1,13 @@
+[package]
+name = "mkimage"
+version = "0.1.0"
+edition = "2024"
+
+# A host-side build tool (plain `std`, runs on the dev machine at build time) -- deliberately its
+# own crate, not a member of the kernel's workspace, exactly like `user/*` will be: the kernel
+# needs `hadris-fat` with `default-features = false` (no `std`); this tool needs the opposite.
+# Building them in one workspace would mean reasoning about that feature interaction; as separate
+# crates, each resolves its own dependency graph independently. See `plans/USERSPACE_PLAN.md`'s
+# "Build & packaging" section.
+[dependencies]
+hadris-fat = { version = "2.4.0", features = ["lfn"] }

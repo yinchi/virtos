@@ -1,4 +1,4 @@
-/target
+**/target
 *.img
 *.elf
-PORTING.md
+/plans
