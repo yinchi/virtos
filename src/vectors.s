@@ -71,10 +71,12 @@
 
 /* The exception vector table itself: 16 entries, aligned to 0x800 (2^11) as a whole, each entry
  * aligned to 0x80 (2^7) by `ventry`. Row = where the exception came from, column = exception
- * type -- see the AArch64 exception model. Only `irq_el1h` (a device interrupt while the kernel
- * itself runs, the only case reachable so far: nothing runs at EL0 yet) has a real handler;
- * every other entry still traps to `unexpected_exception` so a bug is visible immediately
- * instead of silently doing the wrong thing. `x0` carries the vector's index into that panic. */
+ * type -- see the AArch64 exception model. Four entries have real handlers: `irq_el1h` (a device
+ * interrupt while the kernel itself runs), `sync_el0_64` (a syscall or fault from a running EL0
+ * program), and `irq_el0_64` (a device interrupt while that program runs -- handled identically
+ * to `irq_el1h`, so a program keeps running preemptibly exactly like kernel code does). Every
+ * other entry still traps to `unexpected_exception` so a bug is visible immediately instead of
+ * silently doing the wrong thing. `x0` carries the vector's index into that panic. */
 .align 11
 .global vectors
 vectors:
@@ -134,12 +136,13 @@ error_el1h:
 
 sync_el0_64:
     kernel_entry
-    mov x0, #8
-    bl unexpected_exception
+    mov x0, sp
+    bl sync_el0_handler
+    kernel_exit
 irq_el0_64:
     kernel_entry
-    mov x0, #9
-    bl unexpected_exception
+    bl irq_handler
+    kernel_exit
 fiq_el0_64:
     kernel_entry
     mov x0, #10

@@ -1,9 +1,10 @@
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
-// `keyboard::queue` holds its buffered characters in a `VecDeque`; `alloc` isn't in the
-// `no_std` prelude the way `std` is, so it needs its own `extern crate` to be reachable.
-#[cfg(target_os = "none")]
+// `keyboard::queue` and `exec::elfparse` hold data in `alloc` collections (`VecDeque`, `Vec`);
+// `alloc` isn't in the prelude the way `std` is, so it needs its own `extern crate` to be
+// reachable -- ungated (unlike the hardware-only modules below) since `exec::elfparse` is pure and
+// needs it under the host test target too.
 extern crate alloc;
 
 // Everything below is bare-metal-only (touches hardware, or exists only to serve code that
@@ -14,17 +15,22 @@ extern crate alloc;
 mod arch;
 #[cfg(target_os = "none")]
 mod drivers;
+#[cfg(target_os = "none")]
+mod syscall;
 
 // Pure logic, no hardware dependency: builds and runs under both targets.
 mod console;
 mod keyboard;
 
-// Mixed: `fs::sector` is pure like the above, `fs::blkio` is hardware-only like `drivers` --
-// see `fs/mod.rs`.
+// Mixed: each has a pure part (`fs::sector`, `exec::elfparse`) and a hardware-only part
+// (`fs::blkio`, `exec::elf`/`exec::process`) -- see their own `mod.rs` for the split.
+mod exec;
 mod fs;
 
+// `pub(crate)` (not private) so `syscall::sync_el0_handler`'s fault path can grab a UART via
+// `bare_metal::get_uart` too, the same way `panic` and `unexpected_exception` below do.
 #[cfg(target_os = "none")]
-mod bare_metal {
+pub(crate) mod bare_metal {
     use crate::arch::gic::gic;
     use crate::arch::init::{UART_BASE, init_devices};
     use crate::arch::rtc::DEFAULT_TIMEZONE;
@@ -32,14 +38,16 @@ mod bare_metal {
     use crate::arch::timer;
     use crate::console::{self, Console, DEFAULT_BG as BG, DEFAULT_FG as FG};
     use crate::drivers::virtio::{blk, gpu, input};
+    use crate::exec;
     use crate::fs;
+    use crate::fs::blkio::BlkIo;
     use crate::keyboard;
     use arm_pl011_uart::{
         DataBits, LineConfig, PL011Registers, Parity, StopBits, Uart, UniqueMmioPointer,
     };
     use core::{fmt::Write, ptr::NonNull};
     use hadris_fat::FatVolumeReadExt;
-    use hadris_fat::sync::DirectoryEntry;
+    use hadris_fat::sync::{DirectoryEntry, FatDir, FileEntry};
     use linked_list_allocator::LockedHeap;
 
     /// Size of the kernel heap. `aarch64-paging`'s `IdMap` allocates its page-table nodes from it, so
@@ -64,6 +72,18 @@ mod bare_metal {
         uart.enable(line_config, 115200, 16_000_000)
             .expect("Could not enable UART");
         uart
+    }
+
+    /// The entry named `name` directly inside `dir`, if there is one. Case-insensitive, matching
+    /// FAT's own short-name semantics.
+    fn find_entry(dir: &FatDir<'_, BlkIo>, name: &str) -> Option<FileEntry> {
+        for entry in dir.entries() {
+            let DirectoryEntry::Entry(entry) = entry.expect("directory entry read failed");
+            if entry.name().eq_ignore_ascii_case(name) {
+                return Some(entry);
+            }
+        }
+        None
     }
 
     #[unsafe(no_mangle)]
@@ -122,6 +142,29 @@ mod bare_metal {
                     .expect("Could not write to UART");
                 }
             }
+        }
+
+        // Temporary: confirm the ELF loader + EL0 entry plumbing work end to end -- a real
+        // program, read off disk and run at EL0 exactly the way a future shell would launch one,
+        // rather than a synthetic in-memory test. Replace with the next thing to check once this
+        // is confirmed working.
+        {
+            let vol = fs::volume::get(0).expect("system.img not opened");
+            let root = vol.root_dir();
+            let usr = find_entry(&root, "usr").expect("usr not found on system.img");
+            let usr_dir = root.open_entry(&usr).expect("failed to open usr");
+            let bin = find_entry(&usr_dir, "bin").expect("usr/bin not found on system.img");
+            let bin_dir = usr_dir.open_entry(&bin).expect("failed to open usr/bin");
+            let hello = find_entry(&bin_dir, "hello").expect("usr/bin/hello not found");
+
+            let mut reader = vol.read_file(&hello).expect("failed to open usr/bin/hello");
+            let program = reader.read_to_vec().expect("failed to read usr/bin/hello");
+
+            writeln!(uart, "Running usr/bin/hello ({} bytes)...", program.len())
+                .expect("Could not write to UART");
+            exec::process::run_program(&program).expect("run_program failed");
+            writeln!(uart, "usr/bin/hello exited; back in the kernel")
+                .expect("Could not write to UART");
         }
 
         // Temporary: confirm the console + keyboard pipeline works end to end -- real typed
@@ -185,8 +228,11 @@ mod bare_metal {
 
     #[unsafe(no_mangle)]
     extern "C" fn unexpected_exception(vector: usize) -> ! {
+        let esr = arm_sysregs::el1::accessors::read_esr_el1();
+        let far = arm_sysregs::el1::accessors::read_far_el1();
+        let elr = arm_sysregs::el1::accessors::read_elr_el1();
         panic!(
-            "Unexpected exception: {}",
+            "Unexpected exception: {} (ESR_EL1 {esr:?}, FAR_EL1 {far:#x}, ELR_EL1 {elr:#x})",
             VECTOR_NAMES.get(vector).unwrap_or(&"<unknown vector>")
         );
     }

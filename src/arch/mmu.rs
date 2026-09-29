@@ -8,8 +8,11 @@
 //! device was added. This project runs at most one CPU with a single address space, so there's
 //! only one ASID and one page table, ever.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use aarch64_paging::{
-    descriptor::El1Attributes,
+    MapError,
+    descriptor::{El1Attributes, PhysicalAddress},
     idmap::IdMap,
     paging::{El1And0, MemoryRegion},
 };
@@ -53,12 +56,47 @@ const ROOT_LEVEL: usize = 1;
 /// Only ever one address space -- no per-process ASIDs needed.
 const ASID: usize = 0;
 
+// Fixed EL0-accessible user window -- deliberately far from the kernel's own image (64 MiB into
+// RAM, matching the reference lab's own choice for this exact QEMU `virt` machine): an off-by-one
+// in this module's own boundary math lands in genuinely unmapped memory and faults immediately,
+// rather than landing ambiguously on an adjacent mapped region with the wrong permissions. Left
+// unmapped by `enable` itself -- it's the ELF loader (`exec::elf`) that owns every mapping inside
+// it, one program load at a time, using each segment's own `p_flags`.
+//
+// Sized to fit comfortably under QEMU's default 128 MiB RAM (confirmed via `info mtree`) for this
+// exact `virt` machine, same reasoning as the reference lab's own choice: the kernel image and
+// heap sit below `USER_BASE`, the window ends at `0x4600_0000`, and the top 32 MiB stays free.
+pub const USER_BASE: usize = 0x4400_0000;
+pub const USER_SIZE: usize = 0x0200_0000; // 32 MiB
+
+// The window's layout, from the bottom: the program image (its segments, wherever it links them,
+// page-aligned), a gap, an unmapped guard, then the stack up to the top of the window. Only the
+// pages a program's segments and stack actually need are ever mapped (`exec::elf`) -- the gap
+// after the image (where a heap would grow, once one exists) and the guard stay unmapped, so a
+// stack overflow or a wild pointer into the gap faults instead of silently running into the
+// program's own data.
+/// The stack's size: generous, per the project's own rule of thumb for MiB-scale stacks/buffers.
+pub const USER_STACK_SIZE: usize = 0x0010_0000; // 1 MiB
+/// The unmapped guard below the stack -- larger than any single frame a sane program has, so one
+/// large frame can't step over it.
+pub const USER_GUARD_SIZE: usize = 0x0001_0000; // 64 KiB
+/// One past the highest stack address: the initial stack pointer's starting point.
+pub const USER_STACK_TOP: usize = USER_BASE + USER_SIZE;
+/// The lowest stack address; the guard lies just below it.
+pub const USER_STACK_BOTTOM: usize = USER_STACK_TOP - USER_STACK_SIZE;
+/// The highest address (exclusive) a program's own segments may occupy.
+pub const USER_IMAGE_END: usize = USER_STACK_BOTTOM - USER_GUARD_SIZE;
+
 /// The page table `enable` builds and activates, and every later `map_device` call extends.
 /// Locked rather than a bare `static mut`: `map_device` only ever needs the table for one
 /// `map_range` call at a time and never holds it across anything else, so a lock costs nothing
 /// here and comes with no deadlock risk -- unlike `gic.rs`'s `GicV2`, nothing touches this from
 /// an interrupt handler.
 static IDMAP: Mutex<Option<IdMap<El1And0>>> = Mutex::new(None);
+
+/// Whether PAN is on (the CPU has FEAT_PAN and `enable` turned it on). `user_access` only touches
+/// the `PAN` register if so, since writing it is undefined on a CPU without the feature.
+static PAN_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// What `enable` turned on beyond translation itself -- reported at boot.
 pub struct Hardening {
@@ -207,6 +245,7 @@ pub fn enable() -> Hardening {
     if pan {
         // SAFETY: only reached when the CPU has FEAT_PAN, checked above.
         unsafe { write_pan(Pan::PAN) };
+        PAN_ENABLED.store(true, Ordering::Relaxed);
     }
 
     // Keeping IDMAP alive from here on is not optional: `IdMap`'s `Drop` impl panics if an
@@ -214,6 +253,65 @@ pub fn enable() -> Hardening {
     // its page table.
     *IDMAP.lock() = Some(idmap);
     Hardening { pan }
+}
+
+/// Maps or unmaps `start..end` within the user window -- `Some(attrs)` maps every page in range
+/// with `attrs`, `None` unmaps it. Used by the ELF loader (`exec::elf`), which needs finer control
+/// than `map_device`'s "always unmapped -> mapped, exactly once" contract: it re-maps a segment
+/// with fresh attributes as it locks down final permissions, and clears out whatever a previous
+/// program left mapped before loading a new one -- both are mapped-to-mapped or
+/// mapped-to-unmapped transitions `map_range` itself refuses (see `enable`/`map_device`'s own doc
+/// comments on that break-before-make restriction). `IdMap::modify_range` handles both directions,
+/// and a still-unmapped range too -- the case this always is on a range's very first use.
+///
+/// # Panics
+/// If called before `enable`.
+pub fn set_user_pages(
+    start: usize,
+    end: usize,
+    attrs: Option<El1Attributes>,
+) -> Result<(), MapError> {
+    let region = MemoryRegion::new(start, end);
+    IDMAP
+        .lock()
+        .as_mut()
+        .expect("mmu::set_user_pages called before mmu::enable")
+        .modify_range(&region, &|chunk, descriptor| {
+            let flags = match attrs {
+                // A level-3 entry is a page descriptor, which must be marked as such.
+                Some(a) if descriptor.level() == 3 => a | El1Attributes::TABLE_OR_PAGE,
+                Some(a) => a,
+                None => El1Attributes::empty(),
+            };
+            descriptor.set(PhysicalAddress(chunk.start().0), flags)
+        })
+}
+
+/// Lets the kernel touch user memory for as long as the returned guard lives, by clearing PAN.
+/// Held only around the few places that mean to -- the ELF loader, argv/envp setup, and any
+/// syscall that takes a user pointer (none of these exist yet; this is the guard they'll use, per
+/// `plans/USERSPACE_PLAN.md`'s step 3/4 split). Does nothing if the CPU has no PAN.
+#[must_use = "PAN is only cleared while the guard is alive"]
+pub fn user_access() -> UserAccess {
+    if PAN_ENABLED.load(Ordering::Relaxed) {
+        // SAFETY: only reached when the CPU has FEAT_PAN (`PAN_ENABLED` is only ever set then).
+        unsafe { write_pan(Pan::empty()) };
+    }
+    UserAccess
+}
+
+/// Dropping this restores PAN to on, if `user_access` turned it off. Holding it across an
+/// exception (a nested syscall, or a fault) doesn't leave PAN off longer than intended either:
+/// `enable`'s `SPAN = 0` makes every exception entry set PAN again regardless of this guard.
+pub struct UserAccess;
+
+impl Drop for UserAccess {
+    fn drop(&mut self) {
+        if PAN_ENABLED.load(Ordering::Relaxed) {
+            // SAFETY: as in `user_access`.
+            unsafe { write_pan(Pan::PAN) };
+        }
+    }
 }
 
 /// Maps `base..base+size` as device (MMIO) memory -- non-cacheable, never executable at any

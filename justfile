@@ -37,18 +37,22 @@ fmt:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo fmt --all -- --check
-    for crate in {{OTHER_CRATES}}; do
+    # `while read` rather than `for crate in` OTHER_CRATES directly: it contains newlines if there's
+    # more than one crate; IFS parses the quoted variable and iterates over the crates correctly.
+    while IFS= read -r crate; do
+        [ -n "$crate" ] || continue
         (cd "$crate" && cargo fmt --all -- --check)
-    done
+    done <<< "{{OTHER_CRATES}}"
 
 # Same, but rewrites instead of just checking -- what `prek.toml`'s commit hook runs.
 fmt-fix:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo fmt --all
-    for crate in {{OTHER_CRATES}}; do
+    while IFS= read -r crate; do
+        [ -n "$crate" ] || continue
         (cd "$crate" && cargo fmt --all)
-    done
+    done <<< "{{OTHER_CRATES}}"
 
 # Unlike `fmt`, target matters here: a crate under `tools/` is host-side (see `build-mkimage`'s
 # note) and needs its host triple explicitly; anything else (e.g. a future `user/*` crate) *wants*
@@ -60,26 +64,28 @@ clippy:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo clippy
-    for crate in {{OTHER_CRATES}}; do
+    while IFS= read -r crate; do
+        [ -n "$crate" ] || continue
         target=""
         case "$crate" in
             ./tools/*) target="--target {{HOST_TRIPLE}}" ;;
         esac
         (cd "$crate" && cargo clippy $target)
-    done
+    done <<< "{{OTHER_CRATES}}"
 
 # Same, but fixes instead of just checking -- what `prek.toml`'s commit hook runs.
 clippy-fix:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo clippy --fix --allow-dirty
-    for crate in {{OTHER_CRATES}}; do
+    while IFS= read -r crate; do
+        [ -n "$crate" ] || continue
         target=""
         case "$crate" in
             ./tools/*) target="--target {{HOST_TRIPLE}}" ;;
         esac
         (cd "$crate" && cargo clippy $target --fix --allow-dirty)
-    done
+    done <<< "{{OTHER_CRATES}}"
 
 # Format + lint every crate in this repo.
 lint: fmt clippy
@@ -119,14 +125,34 @@ reseed-home:
     mv {{HOME_IMG}} {{HOME_IMG}}.bak
     just seed-home
 
-# TODO: system recipe to depend on building user programs and copying them into disks/system/usr/bin
+# Every `user/*` crate -- one EL0 program per directory, found the same way `OTHER_CRATES` is, so
+# a new one needs no justfile edit. Each wants the kernel's own bare-metal default target (see
+# `OTHER_CRATES`'s comment), inherited from the repo root's `.cargo/config.toml`.
+USER_CRATES := `find user -mindepth 1 -maxdepth 1 -type d 2>/dev/null`
+
+# Builds every user/* crate (release) and strips the result into disks/system/usr/bin/<name> --
+# what `mkimage` (`build-mkimage`) marks executable (`ATTR_EXEC`) when `system` below packages it.
+# `strip -o` rather than stripping in place: the unstripped binary stays in that crate's own
+# `target/` for a debugger to use, only the copy actually shipped in the image is stripped.
+build-user:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p disks/system/usr/bin
+    # `while read` rather than `for crate in` USER_CRATES directly: it contains newlines if there's
+    # more than one crate; IFS parses the quoted variable and iterates over the crates correctly.
+    while IFS= read -r crate; do
+        [ -n "$crate" ] || continue
+        name=$(basename "$crate")
+        (cd "$crate" && cargo build --release)
+        aarch64-linux-gnu-strip -o disks/system/usr/bin/"$name" \
+            "$crate/target/aarch64-unknown-none-softfloat/release/$name"
+    done <<< "{{USER_CRATES}}"
 
 # Build the system image
-system: build-mkimage
+system: build-mkimage build-user
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{justfile_directory()}}  # The directory containing this justfile
     mkdir -p disks/system/root  # Mount point for the HOME disk (/root)
-    mkdir -p disks/system/usr/bin  # TODO: copy user programs into this directory
     {{MKIMAGE}} system.img 64M SYSTEM {{SYSTEM_ID}} disks/system
     echo "Created system.img with serial {{SYSTEM_ID}}."

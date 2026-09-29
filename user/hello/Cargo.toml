@@ -1,0 +1,21 @@
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2024"
+
+# The first real EL0 program: proves `exec::process::run_program`'s whole round trip (ELF loaded,
+# mapped, entered, and returned from via `exit`) before anything more ambitious is attempted. No
+# `userlib` yet (`plans/USERSPACE_PLAN.md`'s step 6) -- just enough inline asm to make one syscall.
+# A sibling crate to the kernel, never a Cargo workspace member of it (see the kernel's own
+# `Cargo.toml`/`tools/mkimage`'s "Repo organization" note in `plans/PORTING.md`): it wants the same
+# bare-metal target as the kernel, inherited from the repo root's `.cargo/config.toml`, but its own
+# `link.ld` (in this directory) gives it a completely different load address and layout.
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"

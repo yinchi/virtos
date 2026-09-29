@@ -2,3 +2,4 @@
 *.img
 *.elf
 /plans
+/disks/system/**/bin
