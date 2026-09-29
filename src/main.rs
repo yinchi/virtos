@@ -127,7 +127,7 @@ pub(crate) mod bare_metal {
 
         // Every interrupt source `init_devices` might enable (currently just the keyboard, via
         // `discover`) is already configured at this point -- safe to start taking IRQs.
-        crate::arch::irq::enable();
+        crate::arch::irq::unmask();
 
         writeln!(uart, "{:?}", gic()).expect("Could not write to UART");
 

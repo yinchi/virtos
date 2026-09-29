@@ -10,6 +10,7 @@ use arm_sysregs::el1::registers::{ElrEl1, SpsrEl1};
 
 use super::elf;
 use super::elfparse::ElfError;
+use crate::arch::irq;
 use crate::arch::mmu::{self, USER_STACK_BOTTOM, USER_STACK_TOP};
 
 unsafe extern "C" {
@@ -33,10 +34,19 @@ unsafe extern "C" {
 /// or faults -- `enter_el0`/`resume_kernel` (`context.s`) are what make an ordinary Rust function
 /// call correctly "pause" for however long the program runs, however it ends.
 ///
+/// Interrupts are masked from the first system-register write below until `enter_el0`'s `eret`
+/// (see `irq::mask`), then explicitly unmasked again once it returns: every path back out of a
+/// program -- `exit`, a caught fault -- is a `sync_el0_64` exception, which unconditionally
+/// re-masks IRQs on entry, and `resume_kernel`'s longjmp-style return (`context.s`) bypasses the
+/// normal `kernel_exit`/`eret` path that would otherwise restore the mask. Without this, the
+/// kernel would carry on with IRQs masked forever after the first program exits -- see `irq::unmask`.
+///
 /// # Safety
 /// `entry` must be mapped EL0-executable and `sp` must be a valid EL0 stack pointer -- callers so
 /// far map both inside `mmu::USER_BASE..USER_BASE + USER_SIZE` before calling this.
 pub unsafe fn enter(entry: usize, sp: usize) {
+    irq::mask();
+
     // M[3:0] = 0b0000 (EL0t), every DAIF bit unmasked (bits 9:6 = 0) -- the program runs
     // preemptible, exactly like any other code, from the moment it starts.
     // SAFETY: SPSR_EL1 only takes effect on the `eret` inside `enter_el0`, below, by which point
@@ -50,6 +60,11 @@ pub unsafe fn enter(entry: usize, sp: usize) {
 
     // SAFETY: SPSR_EL1/ELR_EL1/SP_EL0 are all set, per `enter_el0`'s own contract.
     unsafe { enter_el0() };
+
+    // Back from the program (its `exit` or a fault, both taken as exceptions, so IRQs are masked
+    // again regardless of what the program itself last had them set to) -- unmask unconditionally
+    // so the kernel resumes normal operation, exactly as if this had been an ordinary call.
+    irq::unmask();
 }
 
 /// Loads `elf_bytes`, gives it a fresh stack, and runs it at EL0 to completion, then returns

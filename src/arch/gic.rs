@@ -48,9 +48,7 @@ extern "C" fn irq_handler() {
     // Group0: matches this QEMU config (no GIC Security Extensions), which uses the plain
     // IAR/EOIR registers rather than the separate Group1 AIAR/AEOIR ones.
     if let Some(intid) = gic.get_and_acknowledge_interrupt(InterruptGroup::Group0) {
-        if intid == IntId::ppi(super::timer::PPI) {
-            super::timer::ack(super::timer::freq());
-        } else if Some(intid) == crate::drivers::virtio::input::spi().map(IntId::spi) {
+        if Some(intid) == crate::drivers::virtio::input::spi().map(IntId::spi) {
             crate::keyboard::queue::drain();
         }
         gic.end_interrupt(intid, InterruptGroup::Group0);
