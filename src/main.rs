@@ -16,6 +16,8 @@ mod arch;
 #[cfg(target_os = "none")]
 mod drivers;
 #[cfg(target_os = "none")]
+mod shell;
+#[cfg(target_os = "none")]
 mod syscall;
 
 // Pure logic, no hardware dependency: builds and runs under both targets.
@@ -35,19 +37,16 @@ pub(crate) mod bare_metal {
     use crate::arch::init::{UART_BASE, init_devices};
     use crate::arch::rtc::DEFAULT_TIMEZONE;
     use crate::arch::rtc::rtc;
-    use crate::arch::timer;
-    use crate::console::{self, Console, DEFAULT_BG as BG, DEFAULT_FG as FG};
-    use crate::drivers::virtio::{blk, gpu, input};
-    use crate::exec;
+    use crate::console::{self, Console, DEFAULT_BG as BG};
+    use crate::drivers::virtio::{blk, gpu};
     use crate::fs;
-    use crate::fs::blkio::BlkIo;
-    use crate::keyboard;
+    use crate::shell;
     use arm_pl011_uart::{
         DataBits, LineConfig, PL011Registers, Parity, StopBits, Uart, UniqueMmioPointer,
     };
     use core::{fmt::Write, ptr::NonNull};
     use hadris_fat::FatVolumeReadExt;
-    use hadris_fat::sync::{DirectoryEntry, FatDir, FileEntry};
+    use hadris_fat::sync::DirectoryEntry;
     use linked_list_allocator::LockedHeap;
 
     /// Size of the kernel heap. `aarch64-paging`'s `IdMap` allocates its page-table nodes from it, so
@@ -72,44 +71,6 @@ pub(crate) mod bare_metal {
         uart.enable(line_config, 115200, 16_000_000)
             .expect("Could not enable UART");
         uart
-    }
-
-    /// The entry named `name` directly inside `dir`, if there is one. Case-insensitive, matching
-    /// FAT's own short-name semantics.
-    fn find_entry(dir: &FatDir<'_, BlkIo>, name: &str) -> Option<FileEntry> {
-        for entry in dir.entries() {
-            let DirectoryEntry::Entry(entry) = entry.expect("directory entry read failed");
-            if entry.name().eq_ignore_ascii_case(name) {
-                return Some(entry);
-            }
-        }
-        None
-    }
-
-    /// Reads `usr/bin/<name>` off `system.img` (blk0) and runs it at EL0 to completion, exactly
-    /// the way a future shell would launch one.
-    fn run_user_program(uart: &mut Uart, name: &str) {
-        let vol = fs::volume::get(0).expect("system.img not opened");
-        let root = vol.root_dir();
-        let usr = find_entry(&root, "usr").expect("usr not found on system.img");
-        let usr_dir = root.open_entry(&usr).expect("failed to open usr");
-        let bin = find_entry(&usr_dir, "bin").expect("usr/bin not found on system.img");
-        let bin_dir = usr_dir.open_entry(&bin).expect("failed to open usr/bin");
-        let entry =
-            find_entry(&bin_dir, name).unwrap_or_else(|| panic!("usr/bin/{name} not found"));
-
-        let mut reader = vol
-            .read_file(&entry)
-            .unwrap_or_else(|_| panic!("failed to open usr/bin/{name}"));
-        let program = reader
-            .read_to_vec()
-            .unwrap_or_else(|_| panic!("failed to read usr/bin/{name}"));
-
-        writeln!(uart, "Running usr/bin/{name} ({} bytes)...", program.len())
-            .expect("Could not write to UART");
-        exec::process::run_program(&program).expect("run_program failed");
-        writeln!(uart, "usr/bin/{name} exited; back in the kernel")
-            .expect("Could not write to UART");
     }
 
     #[unsafe(no_mangle)]
@@ -185,46 +146,12 @@ pub(crate) mod bare_metal {
             }
         }
 
-        // Temporary: confirm the ELF loader + EL0 entry plumbing work end to end -- real programs,
-        // read off disk and run at EL0 exactly the way a future shell would launch one, rather
-        // than a synthetic in-memory test. `hello` is a real, stable program (see its own doc
-        // comment); `scratch` is a throwaway harness rewritten to exercise whatever kernel-side
-        // feature is currently being tested, so `hello`'s own behavior never has to be bent out of
-        // shape for that. Replace with the next thing to check once this is confirmed working.
-        for name in ["hello", "scratch"] {
-            run_user_program(&mut uart, name);
-        }
-
-        // Temporary: confirm the console + keyboard pipeline works end to end -- real typed
-        // characters, translated by `keyboard` and echoed to the framebuffer by `console`, not
-        // just raw event codes to the UART or a solid test pattern. Replace with the next thing
-        // to check once this is confirmed working.
-        if let (Some(gpu_dev), Some(_keyboard_dev), Some(console)) =
-            (gpu::get(), input::get(), console::get())
-        {
-            console.puts("virtos> ", FG, BG);
-            gpu_dev.flush();
-
-            writeln!(uart, "console+keyboard: typing for 15s, press some keys...")
-                .expect("Could not write to UART");
-            // The keyboard's own IRQ handler (`gic::irq_handler` -> `keyboard::queue::drain`)
-            // translates and buffers events as they arrive; this loop just consumes them.
-            let deadline = timer::now() + timer::freq() * 15;
-            while timer::now() < deadline {
-                if let Some(ch) = keyboard::queue::pop() {
-                    console.putc(ch, FG, BG);
-                    gpu_dev.flush();
-                }
-            }
-            writeln!(uart, "console+keyboard: done").expect("Could not write to UART");
-        } else {
-            writeln!(uart, "No virtio-gpu or virtio-keyboard device found")
-                .expect("Could not write to UART");
-        }
-
-        loop {
-            unsafe { core::arch::asm!("wfe") }
-        }
+        // `run_forever` never returns: a real program is launched by typing its name here, rather
+        // than `kernel_main` hardcoding which ones run at boot -- see `plans/USERSPACE_PLAN.md`'s
+        // step 6. Supersedes both the old hardcoded `hello`/`scratch` boot-run and the fixed-15s
+        // typing smoke test that came before it; `hello`/`scratch` are still verified, just by
+        // typing their names at the prompt instead of the kernel doing it unconditionally.
+        shell::run_forever(&mut uart);
     }
 
     /// One name per entry in `vectors.s`'s exception vector table, in the same order -- `vectors.s`
