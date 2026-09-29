@@ -1,8 +1,9 @@
 default:
     just --list
 
-# Run the pure-logic modules' unit tests on the host, not the bare-metal target -- see
-# Cargo.toml's `[target.'cfg(target_os = "none")'.dependencies]` comment for how the split works.
+# See Cargo.toml's `[target.'cfg(target_os = "none")'.dependencies]` comment for how the split
+# between bare-metal and host-testable code works.
+# Run the pure-logic modules' unit tests on the host, not the bare-metal target.
 test-host:
     cargo test --target aarch64-unknown-linux-gnu
 
@@ -17,10 +18,71 @@ SYSTEM_ID := "00000000"
 HOST_TRIPLE := `rustc -vV | sed -n 's/^host: //p'`
 MKIMAGE := "tools/mkimage/target/" + HOST_TRIPLE + "/release/mkimage"
 
-# Build the disk-image tool every future `*.img` is built through -- see plans/PORTING.md for why
-# this replaces mtools (it can set this project's own executable-bit convention; mtools can't).
+# See plans/PORTING.md for why this replaces mtools (it can set this project's own
+# executable-bit convention; mtools can't).
+# Build the disk-image tool every future `*.img` is built through.
 build-mkimage:
     cd tools/mkimage && cargo build --release --target {{HOST_TRIPLE}}
+
+# Every crate in this repo besides the kernel (the root `Cargo.toml`) -- found rather than
+# hardcoded, so a new `tools/*` or `user/*` crate is picked up with no justfile/prek.toml edit.
+# Never Cargo workspace members of each other, or of the kernel (see plans/PORTING.md's "Repo
+# organization"), so none of this is reachable from a plain `cargo fmt`/`clippy --all` at the root.
+OTHER_CRATES := `find . -name Cargo.toml -not -path "./Cargo.toml" -not -path "*/target/*" -exec dirname {} \;`
+
+# `--check` reports without rewriting; `fmt-fix` rewrites instead. `cargo fmt` doesn't care about
+# target, so unlike `clippy` below there's no per-crate target override needed here.
+# Format every crate in this repo.
+fmt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo fmt --all -- --check
+    for crate in {{OTHER_CRATES}}; do
+        (cd "$crate" && cargo fmt --all -- --check)
+    done
+
+# Same, but rewrites instead of just checking -- what `prek.toml`'s commit hook runs.
+fmt-fix:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo fmt --all
+    for crate in {{OTHER_CRATES}}; do
+        (cd "$crate" && cargo fmt --all)
+    done
+
+# Unlike `fmt`, target matters here: a crate under `tools/` is host-side (see `build-mkimage`'s
+# note) and needs its host triple explicitly; anything else (e.g. a future `user/*` crate) *wants*
+# the kernel's bare-metal default, so gets no override. None of these can take `--all-targets`
+# either: `#[cfg(test)]` code doesn't compile for the bare-metal target at all (no `test` crate
+# there), which is exactly why host-side tests run via `test-host`'s own target instead.
+# Clippy every crate in this repo.
+clippy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo clippy
+    for crate in {{OTHER_CRATES}}; do
+        target=""
+        case "$crate" in
+            ./tools/*) target="--target {{HOST_TRIPLE}}" ;;
+        esac
+        (cd "$crate" && cargo clippy $target)
+    done
+
+# Same, but fixes instead of just checking -- what `prek.toml`'s commit hook runs.
+clippy-fix:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo clippy --fix --allow-dirty
+    for crate in {{OTHER_CRATES}}; do
+        target=""
+        case "$crate" in
+            ./tools/*) target="--target {{HOST_TRIPLE}}" ;;
+        esac
+        (cd "$crate" && cargo clippy $target --fix --allow-dirty)
+    done
+
+# Format + lint every crate in this repo.
+lint: fmt clippy
 
 # Build the OS as a release binary
 build:

@@ -122,7 +122,7 @@ pub fn init_devices(
     // Slots are only 0x200 bytes each, 8 to a 4 KiB page, so mapping them individually would try
     // to map the same page twice for adjacent slots and be rejected; map the single contiguous
     // window they occupy instead, its bounds taken from the DTB rather than hard-coded.
-    let mut slots = [(0usize, 0usize); MAX_VIRTIO_MMIO_SLOTS];
+    let mut slots = [(0usize, 0usize, None); MAX_VIRTIO_MMIO_SLOTS];
     let mut slot_count = 0;
     let mut window: Option<(usize, usize)> = None;
     for node in fdt.all_nodes() {
@@ -141,7 +141,7 @@ pub fn init_devices(
             .expect("virtio,mmio node has no size in its DTB `reg` entry");
 
         if slot_count < MAX_VIRTIO_MMIO_SLOTS {
-            slots[slot_count] = (base, size);
+            slots[slot_count] = (base, size, first_spi(node));
             slot_count += 1;
         }
         window = Some(match window {
@@ -155,4 +155,15 @@ pub fn init_devices(
     virtio::discover(slots[..slot_count].iter().copied());
 
     hardening
+}
+
+/// The first SPI (`GIC_SPI`, interrupt type cell `0`) named in a node's `interrupts` property, if
+/// it has one -- e.g. every `virtio,mmio` node's own interrupt line.
+fn first_spi(node: fdt::node::FdtNode) -> Option<u32> {
+    let bytes = node.property("interrupts")?.value;
+    let cell = |i: usize| -> Option<u32> {
+        let b = bytes.get(i * 4..i * 4 + 4)?;
+        Some(u32::from_be_bytes(b.try_into().unwrap()))
+    };
+    (cell(0)? == 0).then(|| cell(1)).flatten()
 }

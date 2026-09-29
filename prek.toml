@@ -13,16 +13,20 @@ hooks = [
 [[repos]]
 repo = "local"
 
+# `just fmt-fix`/`clippy-fix` cover every crate in the repo, not just the kernel (root) one --
+# `tools/mkimage` today, any future `user/*` crate automatically (see the justfile's `OTHER_CRATES`
+# comment for how, and plans/PORTING.md's "Repo organization" for why they're separate crates in
+# the first place, unreachable from a plain `cargo fmt`/`clippy --all` at the root).
 [[repos.hooks]]
 id = "cargo_fmt"
 name = "Cargo fmt"
 language = "system"
-entry = "cargo fmt --all"
+entry = "just fmt-fix"
 pass_filenames = false
 
 [[repos.hooks]]
 id = "cargo_clippy"
 name = "Cargo clippy"
 language = "system"
-entry = "cargo clippy --all --fix --allow-dirty"
+entry = "just clippy-fix"
 pass_filenames = false

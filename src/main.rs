@@ -1,6 +1,11 @@
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
+// `keyboard::queue` holds its buffered characters in a `VecDeque`; `alloc` isn't in the
+// `no_std` prelude the way `std` is, so it needs its own `extern crate` to be reachable.
+#[cfg(target_os = "none")]
+extern crate alloc;
+
 // Everything below is bare-metal-only (touches hardware, or exists only to serve code that
 // does); gated so `cargo test --target <host triple>` (`just test-host`) can build and run
 // `console`/`keyboard`'s unit tests as ordinary host tests, without any of this -- see
@@ -28,7 +33,7 @@ mod bare_metal {
     use crate::console::{self, Console, DEFAULT_BG as BG, DEFAULT_FG as FG};
     use crate::drivers::virtio::{blk, gpu, input};
     use crate::fs;
-    use crate::keyboard::KeyState;
+    use crate::keyboard;
     use arm_pl011_uart::{
         DataBits, LineConfig, PL011Registers, Parity, StopBits, Uart, UniqueMmioPointer,
     };
@@ -73,6 +78,10 @@ mod bare_metal {
         // (x0, which goes to argument `dtb_ptr`)
         let hardening = init_devices(dtb_ptr, &mut uart);
         writeln!(uart, "MMU enabled (PAN: {})", hardening.pan).expect("Could not write to UART");
+
+        // Every interrupt source `init_devices` might enable (currently just the keyboard, via
+        // `discover`) is already configured at this point -- safe to start taking IRQs.
+        crate::arch::irq::enable();
 
         writeln!(uart, "{:?}", gic()).expect("Could not write to UART");
 
@@ -119,7 +128,7 @@ mod bare_metal {
         // characters, translated by `keyboard` and echoed to the framebuffer by `console`, not
         // just raw event codes to the UART or a solid test pattern. Replace with the next thing
         // to check once this is confirmed working.
-        if let (Some(gpu_dev), Some(keyboard_dev)) = (gpu::get(), input::get()) {
+        if let (Some(gpu_dev), Some(_keyboard_dev)) = (gpu::get(), input::get()) {
             let fb = gpu_dev.framebuffer();
             let mut console = Console::new(console::Framebuffer {
                 ptr: fb.ptr,
@@ -133,12 +142,11 @@ mod bare_metal {
 
             writeln!(uart, "console+keyboard: typing for 15s, press some keys...")
                 .expect("Could not write to UART");
-            let mut keys = KeyState::new();
+            // The keyboard's own IRQ handler (`gic::irq_handler` -> `keyboard::queue::drain`)
+            // translates and buffers events as they arrive; this loop just consumes them.
             let deadline = timer::now() + timer::freq() * 15;
             while timer::now() < deadline {
-                if let Some(event) = keyboard_dev.poll()
-                    && let Some(ch) = keys.apply(event.code, event.value)
-                {
+                if let Some(ch) = keyboard::queue::pop() {
                     console.putc(ch, FG, BG);
                     gpu_dev.flush();
                 }

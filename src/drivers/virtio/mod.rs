@@ -19,8 +19,11 @@ use virtio_drivers::transport::{DeviceType, Transport};
 /// later device's discovery would otherwise re-probe every earlier one's slot too. A slot that's
 /// empty, not a valid VirtIO device, of no type anything here drives, or whose driver fails to
 /// initialize is skipped silently.
-pub fn discover(mmio_slots: impl Iterator<Item = (usize, usize)>) {
-    for (base, size) in mmio_slots {
+///
+/// Each slot also carries its SPI, if the DTB's `interrupts` property gave it one -- only `input`
+/// currently uses it (to enable that interrupt at the GIC); blk/gpu stay polled.
+pub fn discover(mmio_slots: impl Iterator<Item = (usize, usize, Option<u32>)>) {
+    for (base, size, irq) in mmio_slots {
         let Some(header) = NonNull::new(base as *mut VirtIOHeader) else {
             continue;
         };
@@ -32,7 +35,7 @@ pub fn discover(mmio_slots: impl Iterator<Item = (usize, usize)>) {
         match transport.device_type() {
             DeviceType::Block => blk::add(transport),
             DeviceType::GPU => gpu::set(transport),
-            DeviceType::Input => input::set(transport),
+            DeviceType::Input => input::set(transport, irq),
             _ => {}
         }
     }

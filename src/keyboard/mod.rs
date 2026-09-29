@@ -11,6 +11,11 @@
 //!
 //! Pure -- no dependency on `virtio-drivers` or any other hardware crate, so it builds and runs
 //! under `cargo test --target <host triple>` (`just test-host`) exactly as it does on target.
+//!
+//! `queue` (hardware-only, unlike this module) holds the characters this layer produces between
+//! the keyboard IRQ and whoever reads them.
+#[cfg(target_os = "none")]
+pub mod queue;
 
 const KEY_LSHIFT: u16 = 42;
 const KEY_RSHIFT: u16 = 54;

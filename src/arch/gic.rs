@@ -50,6 +50,8 @@ extern "C" fn irq_handler() {
     if let Some(intid) = gic.get_and_acknowledge_interrupt(InterruptGroup::Group0) {
         if intid == IntId::ppi(super::timer::PPI) {
             super::timer::ack(super::timer::freq());
+        } else if Some(intid) == crate::drivers::virtio::input::spi().map(IntId::spi) {
+            crate::keyboard::queue::drain();
         }
         gic.end_interrupt(intid, InterruptGroup::Group0);
     }
