@@ -195,6 +195,27 @@ impl Console {
     }
 }
 
+/// The console `kernel_main` sets up once a GPU device is found -- lets `syscall::fd`'s `write`
+/// reach it too, the same way `blk`/`gpu`/`input` are each reachable via their own module-level
+/// `get()`. Hardware-only (a real `Console` needs a real framebuffer), unlike the rest of this
+/// module.
+#[cfg(target_os = "none")]
+static mut CONSOLE: Option<Console> = None;
+
+/// Set once, early in `kernel_main`, right after a GPU device is found.
+#[cfg(target_os = "none")]
+pub fn set(console: Console) {
+    unsafe { CONSOLE = Some(console) };
+}
+
+/// The console, if `set` has been called (i.e. a GPU device was found).
+#[cfg(target_os = "none")]
+#[allow(clippy::deref_addrof)]
+pub fn get() -> Option<&'static mut Console> {
+    // SAFETY: single core; `set` runs once before anything else touches `CONSOLE`.
+    unsafe { (&mut *(&raw mut CONSOLE)).as_mut() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

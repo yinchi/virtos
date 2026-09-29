@@ -86,6 +86,32 @@ pub(crate) mod bare_metal {
         None
     }
 
+    /// Reads `usr/bin/<name>` off `system.img` (blk0) and runs it at EL0 to completion, exactly
+    /// the way a future shell would launch one.
+    fn run_user_program(uart: &mut Uart, name: &str) {
+        let vol = fs::volume::get(0).expect("system.img not opened");
+        let root = vol.root_dir();
+        let usr = find_entry(&root, "usr").expect("usr not found on system.img");
+        let usr_dir = root.open_entry(&usr).expect("failed to open usr");
+        let bin = find_entry(&usr_dir, "bin").expect("usr/bin not found on system.img");
+        let bin_dir = usr_dir.open_entry(&bin).expect("failed to open usr/bin");
+        let entry =
+            find_entry(&bin_dir, name).unwrap_or_else(|| panic!("usr/bin/{name} not found"));
+
+        let mut reader = vol
+            .read_file(&entry)
+            .unwrap_or_else(|_| panic!("failed to open usr/bin/{name}"));
+        let program = reader
+            .read_to_vec()
+            .unwrap_or_else(|_| panic!("failed to read usr/bin/{name}"));
+
+        writeln!(uart, "Running usr/bin/{name} ({} bytes)...", program.len())
+            .expect("Could not write to UART");
+        exec::process::run_program(&program).expect("run_program failed");
+        writeln!(uart, "usr/bin/{name} exited; back in the kernel")
+            .expect("Could not write to UART");
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn kernel_main(dtb_ptr: usize) -> ! {
         // SAFETY: the only call to `init`, and it happens before anything else can possibly allocate.
@@ -111,6 +137,21 @@ pub(crate) mod bare_metal {
             rtc().get_time().with_timezone(&DEFAULT_TIMEZONE)
         )
         .expect("Could not write to UART");
+
+        // The global console (`console::set`/`get`): `syscall::fd::write`'s fd 1/2 needs to reach
+        // it, and the interactive test below reuses the same instance -- set up once, as soon as
+        // a GPU device exists, rather than each caller constructing its own.
+        if let Some(gpu_dev) = gpu::get() {
+            let fb = gpu_dev.framebuffer();
+            console::set(Console::new(console::Framebuffer {
+                ptr: fb.ptr,
+                width: fb.width,
+                height: fb.height,
+                stride: fb.stride,
+            }));
+            console::get().expect("just set").clear(BG);
+            gpu_dev.flush();
+        }
 
         // Temporary: confirm mounting a FAT volume through `BlkIo` actually works -- list the root
         // directory and read back a file's content, not just raw sector bytes off the device.
@@ -144,42 +185,23 @@ pub(crate) mod bare_metal {
             }
         }
 
-        // Temporary: confirm the ELF loader + EL0 entry plumbing work end to end -- a real
-        // program, read off disk and run at EL0 exactly the way a future shell would launch one,
-        // rather than a synthetic in-memory test. Replace with the next thing to check once this
-        // is confirmed working.
-        {
-            let vol = fs::volume::get(0).expect("system.img not opened");
-            let root = vol.root_dir();
-            let usr = find_entry(&root, "usr").expect("usr not found on system.img");
-            let usr_dir = root.open_entry(&usr).expect("failed to open usr");
-            let bin = find_entry(&usr_dir, "bin").expect("usr/bin not found on system.img");
-            let bin_dir = usr_dir.open_entry(&bin).expect("failed to open usr/bin");
-            let hello = find_entry(&bin_dir, "hello").expect("usr/bin/hello not found");
-
-            let mut reader = vol.read_file(&hello).expect("failed to open usr/bin/hello");
-            let program = reader.read_to_vec().expect("failed to read usr/bin/hello");
-
-            writeln!(uart, "Running usr/bin/hello ({} bytes)...", program.len())
-                .expect("Could not write to UART");
-            exec::process::run_program(&program).expect("run_program failed");
-            writeln!(uart, "usr/bin/hello exited; back in the kernel")
-                .expect("Could not write to UART");
+        // Temporary: confirm the ELF loader + EL0 entry plumbing work end to end -- real programs,
+        // read off disk and run at EL0 exactly the way a future shell would launch one, rather
+        // than a synthetic in-memory test. `hello` is a real, stable program (see its own doc
+        // comment); `scratch` is a throwaway harness rewritten to exercise whatever kernel-side
+        // feature is currently being tested, so `hello`'s own behavior never has to be bent out of
+        // shape for that. Replace with the next thing to check once this is confirmed working.
+        for name in ["hello", "scratch"] {
+            run_user_program(&mut uart, name);
         }
 
         // Temporary: confirm the console + keyboard pipeline works end to end -- real typed
         // characters, translated by `keyboard` and echoed to the framebuffer by `console`, not
         // just raw event codes to the UART or a solid test pattern. Replace with the next thing
         // to check once this is confirmed working.
-        if let (Some(gpu_dev), Some(_keyboard_dev)) = (gpu::get(), input::get()) {
-            let fb = gpu_dev.framebuffer();
-            let mut console = Console::new(console::Framebuffer {
-                ptr: fb.ptr,
-                width: fb.width,
-                height: fb.height,
-                stride: fb.stride,
-            });
-            console.clear(BG);
+        if let (Some(gpu_dev), Some(_keyboard_dev), Some(console)) =
+            (gpu::get(), input::get(), console::get())
+        {
             console.puts("virtos> ", FG, BG);
             gpu_dev.flush();
 
