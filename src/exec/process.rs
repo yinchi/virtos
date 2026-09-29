@@ -5,13 +5,37 @@
 //! indistinguishable from calling any other function that happens to take a very long time --
 //! during which a whole EL0 program runs -- before returning.
 
+use alloc::vec::Vec;
+
 use arm_sysregs::el1::accessors::{write_elr_el1, write_spsr_el1};
 use arm_sysregs::el1::registers::{ElrEl1, SpsrEl1};
 
+use super::argplan;
 use super::elf;
 use super::elfparse::ElfError;
 use crate::arch::irq;
 use crate::arch::mmu::{self, USER_STACK_BOTTOM, USER_STACK_TOP};
+
+/// The most stack a program's initial `argv` and `envp` together (strings plus pointer arrays)
+/// may take -- far more than a typed line and a sensible environment can ever produce, and an
+/// eighth of the stack (`mmu::USER_STACK_SIZE`), so an absurd list is refused up front instead of
+/// leaving the program almost no stack of its own.
+pub const ARG_MAX: usize = 128 * 1024;
+
+/// Why a program couldn't be started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchError {
+    /// Not a loadable executable -- see `ElfError` for exactly why.
+    Elf(ElfError),
+    /// `args` and `env` together don't fit in `ARG_MAX`.
+    ArgsTooBig,
+}
+
+impl From<ElfError> for LaunchError {
+    fn from(e: ElfError) -> Self {
+        LaunchError::Elf(e)
+    }
+}
 
 unsafe extern "C" {
     /// Checkpoints this project's callee-saved register set and `eret`s into EL0. `SPSR_EL1`/
@@ -30,9 +54,10 @@ unsafe extern "C" {
     pub fn resume_kernel() -> !;
 }
 
-/// Enters EL0 at `entry`, with `sp` as the initial `SP_EL0`, and returns once that program exits
-/// or faults -- `enter_el0`/`resume_kernel` (`context.s`) are what make an ordinary Rust function
-/// call correctly "pause" for however long the program runs, however it ends.
+/// Enters EL0 at `entry`, with `argv` as the initial `SP_EL0` (the top of what `push_strings` just
+/// wrote there -- `argc`/`argv`/`envp` sit at or below it), and returns once that program exits or
+/// faults -- `enter_el0`/`resume_kernel` (`context.s`) are what make an ordinary Rust function call
+/// correctly "pause" for however long the program runs, however it ends.
 ///
 /// Interrupts are masked from the first system-register write below until `enter_el0`'s `eret`
 /// (see `irq::mask`), then explicitly unmasked again once it returns: every path back out of a
@@ -42,9 +67,10 @@ unsafe extern "C" {
 /// kernel would carry on with IRQs masked forever after the first program exits -- see `irq::unmask`.
 ///
 /// # Safety
-/// `entry` must be mapped EL0-executable and `sp` must be a valid EL0 stack pointer -- callers so
-/// far map both inside `mmu::USER_BASE..USER_BASE + USER_SIZE` before calling this.
-pub unsafe fn enter(entry: usize, sp: usize) {
+/// `entry` must be mapped EL0-executable and `argv` must be a valid EL0 stack pointer, with
+/// `argc`/`argv`/`envp` already written at/below it (`push_strings`) -- callers so far map and
+/// write both inside `mmu::USER_BASE..USER_BASE + USER_SIZE` before calling this.
+pub unsafe fn enter(entry: usize, argc: usize, argv: usize, envp: usize) {
     irq::mask();
 
     // M[3:0] = 0b0000 (EL0t), every DAIF bit unmasked (bits 9:6 = 0) -- the program runs
@@ -54,12 +80,26 @@ pub unsafe fn enter(entry: usize, sp: usize) {
     unsafe { write_spsr_el1(SpsrEl1::empty()) };
     // SAFETY: `entry` is mapped EL0-executable, per this function's own safety contract.
     unsafe { write_elr_el1(ElrEl1::empty().with_addr(entry as u64)) };
-    // SAFETY: `sp` is a valid EL0 stack pointer, per this function's own safety contract. No
+    // SAFETY: `argv` is a valid EL0 stack pointer, per this function's own safety contract. No
     // `arm_sysregs` accessor covers SP_EL0.
-    unsafe { core::arch::asm!("msr sp_el0, {sp}", sp = in(reg) sp as u64) };
+    unsafe { core::arch::asm!("msr sp_el0, {sp}", sp = in(reg) argv as u64) };
 
-    // SAFETY: SPSR_EL1/ELR_EL1/SP_EL0 are all set, per `enter_el0`'s own contract.
-    unsafe { enter_el0() };
+    // SAFETY: SPSR_EL1/ELR_EL1/SP_EL0 are all set, per `enter_el0`'s own contract. Inline asm
+    // (rather than a plain `enter_el0()` call) specifically so x0-x2 are loaded in the same
+    // instruction sequence that calls it, with nothing of Rust's own codegen between the two free
+    // to reuse those (ordinarily caller-saved) registers first -- AAPCS64 passes the first three
+    // integer arguments in x0-x2, which is exactly the argc/argv/envp convention a program's own
+    // `_start` expects to find them in.
+    unsafe {
+        core::arch::asm!(
+            "bl {enter}",
+            in("x0") argc,
+            in("x1") argv,
+            in("x2") envp,
+            enter = sym enter_el0,
+            clobber_abi("C"),
+        );
+    }
 
     // Back from the program (its `exit` or a fault, both taken as exceptions, so IRQs are masked
     // again regardless of what the program itself last had them set to) -- unmask unconditionally
@@ -67,15 +107,68 @@ pub unsafe fn enter(entry: usize, sp: usize) {
     irq::unmask();
 }
 
-/// Loads `elf_bytes`, gives it a fresh stack, and runs it at EL0 to completion, then returns
-/// normally -- `elf::load` maps the program's own segments; this additionally maps its stack (no
-/// argv/envp on it yet -- nothing produces real arguments until a shell exists to supply them) and
-/// calls `enter`.
+/// Writes the argument and environment strings onto the stack below `sp` as NUL-terminated
+/// strings, plus a `NULL`-terminated array of pointers for each (`argplan::plan` computes the
+/// layout). Returns `(argv, envp)`, the arrays' addresses; `argv` is also the new stack pointer.
+/// `None` if the plan says everything wouldn't fit above `floor`.
+///
+/// # Safety
+/// `sp`/`floor` must lie inside the user window `elf::load` just mapped, and nothing may be
+/// running in it.
+unsafe fn push_strings(
+    sp: usize,
+    floor: usize,
+    args: &[&str],
+    env: &[&str],
+) -> Option<(usize, usize)> {
+    let plan = argplan::plan(sp, floor, &lens(args), &lens(env))?;
+
+    for (item, &addr) in args
+        .iter()
+        .chain(env)
+        .zip(plan.args.iter().chain(&plan.env))
+    {
+        // SAFETY: `plan` keeps every string and both arrays within `floor..sp`, per this
+        // function's own safety contract.
+        unsafe {
+            core::ptr::copy_nonoverlapping(item.as_ptr(), addr as *mut u8, item.len());
+            *((addr + item.len()) as *mut u8) = 0;
+        }
+    }
+
+    // SAFETY: each array's `len + 1` slots were carved out of the window by `plan`; the last is
+    // the terminating `NULL`.
+    unsafe {
+        for (array, addrs) in [(plan.argv, &plan.args), (plan.envp, &plan.env)] {
+            let array = array as *mut usize;
+            for (i, &addr) in addrs.iter().enumerate() {
+                *array.add(i) = addr;
+            }
+            *array.add(addrs.len()) = 0;
+        }
+    }
+    Some((plan.argv, plan.envp))
+}
+
+fn lens(items: &[&str]) -> Vec<usize> {
+    items.iter().map(|s| s.len()).collect()
+}
+
+/// Loads `elf_bytes`, gives it a fresh stack with `args` as its `argv` and `env` (`NAME=VALUE`
+/// strings) as its `envp`, and runs it at EL0 to completion, then returns normally -- `elf::load`
+/// maps the program's own segments; this additionally maps its stack, writes `args`/`env` onto it
+/// (`push_strings`), and calls `enter`.
 ///
 /// # Errors
-/// Returns `Err` without entering EL0 at all if the ELF is invalid or can't be mapped (see
-/// `elf::load`), or if mapping the stack itself fails.
-pub fn run_program(elf_bytes: &[u8]) -> Result<(), ElfError> {
+/// Returns `Err` without entering EL0 at all if the ELF is invalid (`LaunchError::Elf`), if
+/// `args`/`env` together don't fit in `ARG_MAX` (`LaunchError::ArgsTooBig`), or if mapping the
+/// stack itself fails (`LaunchError::Elf(ElfError::MapFailed)`).
+pub fn run_program(elf_bytes: &[u8], args: &[&str], env: &[&str]) -> Result<(), LaunchError> {
+    let floor = USER_STACK_TOP - ARG_MAX;
+
+    // Dry run first: a list that can't fit must not cost a load.
+    argplan::plan(USER_STACK_TOP, floor, &lens(args), &lens(env)).ok_or(LaunchError::ArgsTooBig)?;
+
     let entry = elf::load(elf_bytes)?;
 
     // The stack, mapped and zeroed the same way a segment is while being filled -- see
@@ -102,8 +195,18 @@ pub fn run_program(elf_bytes: &[u8]) -> Result<(), ElfError> {
         }
     }
 
+    let (argv, envp) = {
+        // The writes inside `push_strings` touch pages marked USER, which PAN would otherwise
+        // forbid.
+        let _user = mmu::user_access();
+        // SAFETY: `USER_STACK_TOP`/`floor` lie inside the stack window just mapped and zeroed
+        // above; nothing else touches it until `enter` below runs the program.
+        unsafe { push_strings(USER_STACK_TOP, floor, args, env) }.ok_or(LaunchError::ArgsTooBig)?
+    };
+
     // SAFETY: `entry` came from `elf::load`, which only ever returns an address inside a segment
-    // it just mapped EL0-executable; `USER_STACK_TOP` is the top of the stack just mapped above.
-    unsafe { enter(entry, USER_STACK_TOP) };
+    // it just mapped EL0-executable; `argv`/`envp` came from `push_strings`, which wrote them (and
+    // everything they point to) inside the same stack window.
+    unsafe { enter(entry, args.len(), argv, envp) };
     Ok(())
 }

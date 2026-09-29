@@ -10,9 +10,14 @@ SECTIONS
 
     .text : { *(.text*) *(.rodata*) }
 
-    /* Non-allocated metadata the linker would otherwise place on its own -- harmless either way
-     * (not ALLOC, so never part of a PT_LOAD segment), dropped just to keep the binary minimal.
-     * `.shstrtab` (and other linker-internal sections `*(*)` would also match) can't be discarded;
-     * name what's actually safe to drop instead of a blanket wildcard. */
-    /DISCARD/ : { *(.comment) }
+    /* `.comment`: non-allocated metadata the linker would otherwise place on its own -- harmless
+     * either way (not ALLOC, so never part of a PT_LOAD segment), dropped just to keep the binary
+     * minimal. `.eh_frame*`: unwind-table data `-C force-unwind-tables=no` (`.cargo/config.toml`)
+     * doesn't reliably suppress -- when present, the linker gives it its own leading read-only
+     * `PT_LOAD` segment, which can share a page with the `.text` segment right after it and get
+     * refused by `exec::elfparse`'s same-page/different-permissions check. Not needed anyway: no
+     * unwinding happens in this `panic = "abort"` binary. `.shstrtab` (and other linker-internal
+     * sections `*(*)` would also match) can't be discarded; name what's actually safe to drop
+     * instead of a blanket wildcard. */
+    /DISCARD/ : { *(.comment) *(.eh_frame*) }
 }

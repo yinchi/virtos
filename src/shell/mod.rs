@@ -12,6 +12,7 @@ use crate::fs::blkio::BlkIo;
 use crate::keyboard;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use arm_pl011_uart::Uart;
 use core::fmt::Write;
 use hadris_fat::FatVolumeReadExt;
@@ -45,10 +46,18 @@ fn report(uart: &mut Uart, msg: &str) {
     }
 }
 
-/// Looks up `usr/bin/<name>` on `system.img` (blk0) and runs it at EL0 to completion. Any
-/// failure -- not mounted, not found, bad ELF -- is reported and swallowed; one bad command
-/// shouldn't take the REPL down with it.
-fn run(uart: &mut Uart, name: &str) {
+/// Looks up `usr/bin/<argv[0]>` on `system.img` (blk0) and runs it at EL0 to completion, passing
+/// `line` split on whitespace as its `argv` (no quoting/escaping -- that's the real shell's job,
+/// step 9) and an empty environment (nothing produces real environment variables yet). Any
+/// failure -- not mounted, not found, bad ELF, argv too large -- is reported and swallowed; one bad
+/// command shouldn't take the REPL down with it.
+///
+/// # Panics
+/// If `line` is empty or all whitespace -- callers must check `!line.trim().is_empty()` first.
+fn run(uart: &mut Uart, line: &str) {
+    let argv: Vec<&str> = line.split_whitespace().collect();
+    let name = argv[0];
+
     let Some(vol) = fs::volume::get(0) else {
         report(uart, "system.img not mounted");
         return;
@@ -78,7 +87,7 @@ fn run(uart: &mut Uart, name: &str) {
         return;
     };
 
-    if let Err(e) = exec::process::run_program(&program) {
+    if let Err(e) = exec::process::run_program(&program, &argv, &[]) {
         report(uart, &format!("{name}: {e:?}"));
     }
 }
@@ -132,9 +141,9 @@ pub fn run_forever(uart: &mut Uart) -> ! {
             gpu_dev.flush();
         }
 
-        let name = line.trim();
-        if !name.is_empty() {
-            run(uart, name);
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            run(uart, trimmed);
         }
         line.clear();
     }

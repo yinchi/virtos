@@ -3,6 +3,7 @@
 //! simplified subset of some later stage).
 
 // Pure logic, no hardware dependency: builds and runs under both targets, like `fs::sector`.
+pub mod argplan;
 pub mod elfparse;
 
 // Hardware-only: touches the page table / system registers, or exists only to serve code that

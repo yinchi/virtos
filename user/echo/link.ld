@@ -1,0 +1,23 @@
+/* Load address must match the kernel's own `arch::mmu::USER_BASE`. Read+exec only, deliberately no
+ * `.data`/`.bss` glob here: the kernel's `mmu::enable` sets SCTLR_EL1.WXN, so any output section
+ * that's ever both writable and executable would come out non-executable in practice (the linker
+ * unions its input sections' flags into one segment) -- this program has no mutable state anyway. */
+ENTRY(_start)
+
+SECTIONS
+{
+    . = 0x44000000;
+
+    .text : { *(.text*) *(.rodata*) }
+
+    /* `.comment`: non-allocated metadata the linker would otherwise place on its own -- harmless
+     * either way (not ALLOC, so never part of a PT_LOAD segment), dropped just to keep the binary
+     * minimal. `.eh_frame*`: unwind-table data `-C force-unwind-tables=no` (`.cargo/config.toml`)
+     * doesn't reliably suppress -- when present, the linker gives it its own leading read-only
+     * `PT_LOAD` segment, which can share a page with the `.text` segment right after it and get
+     * refused by `exec::elfparse`'s same-page/different-permissions check. Not needed anyway: no
+     * unwinding happens in this `panic = "abort"` binary. `.shstrtab` (and other linker-internal
+     * sections `*(*)` would also match) can't be discarded; name what's actually safe to drop
+     * instead of a blanket wildcard. */
+    /DISCARD/ : { *(.comment) *(.eh_frame*) }
+}
