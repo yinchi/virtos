@@ -17,6 +17,9 @@ pub const SYS_GETDENTS: usize = 61; // Linux's `getdents64`
 pub const SYS_READ: usize = 63;
 pub const SYS_WRITE: usize = 64;
 pub const SYS_EXIT: usize = 93;
+pub const SYS_CLOCK_GETTIME: usize = 113; // Linux's `clock_gettime`, but no clockid argument
+// (there's only one clock) and no `timespec` out-param (the RTC has second resolution, nothing to
+// put in `tv_nsec`) -- the Unix timestamp itself comes back directly in `x0`.
 pub const SYS_REBOOT: usize = 142;
 
 /// Longest absolute path this project deals with (`getcwd`'s buffer, `pwd`'s/`stat`'s own stack

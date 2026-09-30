@@ -11,6 +11,7 @@
 //!   works in any program built against this crate, from its very first version.
 //! - `process`: a program's own life -- entry stub and macros, `argc`/`argv`, `exit`, the panic
 //!   handler.
+//! - `time`: `clock_gettime`, wrapped as `time()`.
 
 #![no_std]
 
@@ -23,10 +24,12 @@ mod syscall;
 mod heap;
 mod io;
 mod process;
+mod time;
 
 pub use heap::init_heap;
 pub use io::*;
 pub use process::*;
+pub use time::*;
 
 // The syscall numbers live in the shared `abi` crate (the kernel uses the same ones); re-exported
 // so `userlib::SYS_WRITE`, ... work for a program that wants to make a raw syscall itself.

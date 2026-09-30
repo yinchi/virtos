@@ -19,6 +19,7 @@ edition = "2024"
 [dependencies]
 userlib = { path = "../userlib" }
 getargs = { version = "0.5", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
 
 [profile.dev]
 panic = "abort"
