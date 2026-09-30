@@ -1,6 +1,6 @@
 //! `ls [dir...]` -- lists the names in each named directory, one per line, in the order `getdents`
-//! returns them (not sorted). No `dir` operand lists the filesystem root: there's no working
-//! directory yet for a bare `ls` to default to instead.
+//! returns them (not sorted). No `dir` operand lists the working directory (an empty path, which
+//! `open` resolves against it, same as every other relative path).
 #![no_std]
 #![no_main]
 
@@ -73,7 +73,7 @@ fn run(args: Args) -> ExitCode {
         dirs.push(arg);
     }
     if dirs.is_empty() {
-        dirs.push("/");
+        dirs.push("");
     }
     let mut ok = true;
     for dir in dirs {

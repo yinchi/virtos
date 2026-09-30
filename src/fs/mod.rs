@@ -12,7 +12,13 @@ pub mod blkio;
 #[cfg(target_os = "none")]
 pub mod volume;
 
-/// Resolving a `/`-separated path against one volume's root directory -- no mount table, no
-/// working directory yet.
+/// Resolving a `/`-separated path against one volume's root directory -- no mount table. `cwd`'s
+/// `absolute` handles the working-directory half; everything here still deals in already-absolute
+/// paths.
 #[cfg(target_os = "none")]
 pub mod path;
+
+/// The kernel's one working directory, and resolving a path relative to it -- see its own doc
+/// comment for why this is `fs`, not `shell`.
+#[cfg(target_os = "none")]
+pub mod cwd;

@@ -6,9 +6,11 @@
 /// Syscall numbers. Linux's real aarch64 numbers -- borrowed for familiarity, no other Linux-ABI-
 /// compatibility claim beyond that (the calling convention and argument order are this project's
 /// own, not verified against Linux's).
+pub const SYS_GETCWD: usize = 17;
 pub const SYS_MKDIRAT: usize = 34; // Linux's `mkdirat`, but plain-path: no dirfd, no mode
 pub const SYS_UNLINKAT: usize = 35; // Linux's `unlinkat`, but plain-path and no `AT_REMOVEDIR`
 pub const SYS_RENAMEAT: usize = 38; // Linux's `renameat`, but plain-path on both sides
+pub const SYS_NEWFSTATAT: usize = 79; // Linux's `newfstatat`, but plain-path: no dirfd, no flags
 pub const SYS_OPEN: usize = 56; // Linux's `openat`, but plain-path: no dirfd, no relative-path base
 pub const SYS_CLOSE: usize = 57;
 pub const SYS_GETDENTS: usize = 61; // Linux's `getdents64`
@@ -16,6 +18,16 @@ pub const SYS_READ: usize = 63;
 pub const SYS_WRITE: usize = 64;
 pub const SYS_EXIT: usize = 93;
 pub const SYS_REBOOT: usize = 142;
+
+/// Longest absolute path this project deals with (`getcwd`'s buffer, `pwd`'s/`stat`'s own stack
+/// buffers) -- an arbitrary but generous bound, not a number `hadris-fat`/FAT itself imposes.
+pub const PATH_MAX: usize = 4096;
+
+/// Size of the fixed payload `stat` writes: `size: u32` (little-endian), then `is_dir: u8`. No
+/// attributes or timestamps yet -- nothing reads them for anything currently built (no `chmod` to
+/// report, no `-l`/`-t` flag anywhere that would display a timestamp); grow this the same way
+/// `getdents`'s own record would, once something actually needs one of those fields.
+pub const STAT_SIZE: usize = 4 + 1;
 
 // `open`'s `flags` -- Linux's real values. `O_RDONLY` also opens a directory, for `getdents`.
 // `O_WRONLY` creates the file if it doesn't exist, and always starts it empty (no append mode

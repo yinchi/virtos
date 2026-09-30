@@ -1,8 +1,9 @@
 //! A minimal, kernel-side line-reading REPL: type a name, press Enter, run it. A stopgap for
-//! `plans/USERSPACE_PLAN.md`'s step 6 -- no arguments, no pipelines, no builtins -- living at EL1
-//! (`crate::shell`, the same place the lab's own, later, real shell lives) specifically so it
-//! needs neither `userlib` nor argv/envp to exist first. Gets replaced outright by step 9's
-//! PEG-grammar shell, not grown into one in place.
+//! `plans/USERSPACE_PLAN.md`'s step 6 -- no pipelines -- living at EL1 (`crate::shell`, the same
+//! place the lab's own, later, real shell lives) specifically so it needs neither `userlib` nor
+//! argv/envp to exist first. Gets replaced outright by step 9's PEG-grammar shell, not grown into
+//! one in place. `cd` is its one builtin (`fs::cwd`'s own doc comment explains why it has to be):
+//! everything else is looked up under `usr/bin/` and run as a real EL0 program.
 
 use crate::console::{self, DEFAULT_BG as BG, DEFAULT_FG as FG};
 use crate::drivers::virtio::{gpu, input};
@@ -30,17 +31,42 @@ fn report(uart: &mut Uart, msg: &str) {
     }
 }
 
-/// Looks up `usr/bin/<argv[0]>` on `system.img` (blk0) and runs it at EL0 to completion, passing
-/// `line` split on whitespace as its `argv` (no quoting/escaping -- that's the real shell's job,
-/// step 9) and an empty environment (nothing produces real environment variables yet). Any
-/// failure -- not mounted, not found, bad ELF, argv too large -- is reported and swallowed; one bad
-/// command shouldn't take the REPL down with it.
+/// Makes `argv[1]` (or `/`, with no argument -- there's no `$HOME` to fall back to yet) the
+/// working directory, if it names a real directory. Unlike every other command, this can't be an
+/// ordinary `usr/bin/` program: an EL0 process changing its own working directory would never be
+/// visible to the shell that launched it (real Unix's `cd` is a shell builtin for exactly this
+/// reason), and there's only one working directory to begin with here -- the shell's own, since
+/// at most one program is ever resident (`fs::cwd`'s own doc comment).
+fn cd(uart: &mut Uart, argv: &[&str]) {
+    let target = argv.get(1).copied().unwrap_or("/");
+    let Some(vol) = fs::volume::get(0) else {
+        report(uart, "system.img not mounted");
+        return;
+    };
+    let absolute = fs::cwd::absolute(target);
+    if fs::path::resolve_dir(vol, &absolute).is_err() {
+        report(uart, &format!("cd: {target}: not a directory"));
+        return;
+    }
+    fs::cwd::set(absolute);
+}
+
+/// `cd`, or looks up `usr/bin/<argv[0]>` on `system.img` (blk0) and runs it at EL0 to completion,
+/// passing `line` split on whitespace as its `argv` (no quoting/escaping -- that's the real
+/// shell's job, step 9) and an empty environment (nothing produces real environment variables
+/// yet). Any failure -- not mounted, not found, bad ELF, argv too large -- is reported and
+/// swallowed; one bad command shouldn't take the REPL down with it.
 ///
 /// # Panics
 /// If `line` is empty or all whitespace -- callers must check `!line.trim().is_empty()` first.
 fn run(uart: &mut Uart, line: &str) {
     let argv: Vec<&str> = line.split_whitespace().collect();
     let name = argv[0];
+
+    if name == "cd" {
+        cd(uart, &argv);
+        return;
+    }
 
     let Some(vol) = fs::volume::get(0) else {
         report(uart, "system.img not mounted");
@@ -89,7 +115,7 @@ pub fn run_forever(uart: &mut Uart) -> ! {
         {
             let console = console::get().expect("checked above");
             let gpu_dev = gpu::get().expect("checked above");
-            console.puts("virtos> ", FG, BG);
+            console.puts(&format!("virtos:{}> ", fs::cwd::get()), FG, BG);
             gpu_dev.flush();
             loop {
                 let Some(ch) = keyboard::queue::pop() else {

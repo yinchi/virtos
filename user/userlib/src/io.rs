@@ -1,12 +1,12 @@
 //! Everything a program does with a file descriptor, plus the console and the path-only (no fd)
-//! `mkdir`/`unlink`/`rename`: `open`, `close`, `read`, `write`, `getdents`, `mkdir`, `unlink`,
-//! `rename`, `clear`. Each is a thin wrapper over one syscall (see `syscall.rs`) -- no stdout
-//! buffering yet (every call is its own `write` syscall); revisit if that ever shows up as an
-//! actual cost, not preemptively.
+//! `mkdir`/`unlink`/`rename`/`getcwd`/`stat`: `open`, `close`, `read`, `write`, `getdents`,
+//! `mkdir`, `unlink`, `rename`, `getcwd`, `stat`, `clear`. Each is a thin wrapper over one syscall
+//! (see `syscall.rs`) -- no stdout buffering yet (every call is its own `write` syscall); revisit
+//! if that ever shows up as an actual cost, not preemptively.
 
 use abi::{
-    SYS_CLEAR, SYS_CLOSE, SYS_GETDENTS, SYS_MKDIRAT, SYS_OPEN, SYS_READ, SYS_RENAMEAT,
-    SYS_UNLINKAT, SYS_WRITE,
+    SYS_CLEAR, SYS_CLOSE, SYS_GETCWD, SYS_GETDENTS, SYS_MKDIRAT, SYS_NEWFSTATAT, SYS_OPEN,
+    SYS_READ, SYS_RENAMEAT, SYS_UNLINKAT, SYS_WRITE,
 };
 
 /// `open`'s `flags` -- re-exported so a program writes `userlib::O_RDONLY`/`userlib::O_WRONLY`.
@@ -15,6 +15,9 @@ pub use abi::{O_RDONLY, O_WRONLY};
 /// `getdents`'s record layout -- re-exported so a program writes `userlib::DIRENT_SIZE`/
 /// `userlib::NAME_MAX`.
 pub use abi::{DIRENT_SIZE, NAME_MAX};
+
+/// `getcwd`'s buffer-sizing convention -- re-exported so a program writes `userlib::PATH_MAX`.
+pub use abi::PATH_MAX;
 
 /// Opens the file or directory at `path` (`flags` is `O_RDONLY` or `O_WRONLY`). Returns the new
 /// file descriptor, or a negative value on error (see the kernel's `syscall::fd::open` for what
@@ -87,6 +90,37 @@ pub fn rename(old: &str, new: &str) -> isize {
         new.as_ptr() as usize,
         new.len()
     )
+}
+
+/// Reads the working directory into `buf`. Returns its length, or a negative value if `buf` is
+/// too small.
+pub fn getcwd(buf: &mut [u8]) -> isize {
+    syscall!(SYS_GETCWD, buf.as_mut_ptr() as usize, buf.len())
+}
+
+/// Every field this project's FAT layer reports for a path, via `stat`: its size, and whether
+/// it's a directory. No attributes or timestamps yet -- see `abi::STAT_SIZE`'s own doc comment.
+pub struct Stat {
+    pub size: u32,
+    pub is_dir: bool,
+}
+
+/// Reads `path`'s size and type. `Err` carries the negative value the syscall returned.
+pub fn stat(path: &str) -> Result<Stat, isize> {
+    let mut buf = [0u8; abi::STAT_SIZE];
+    let r = syscall!(
+        SYS_NEWFSTATAT,
+        path.as_ptr() as usize,
+        path.len(),
+        buf.as_mut_ptr() as usize
+    );
+    if r < 0 {
+        return Err(r);
+    }
+    Ok(Stat {
+        size: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        is_dir: buf[4] != 0,
+    })
 }
 
 /// Clears the console (and, via an ANSI escape sequence, whatever real terminal is watching the

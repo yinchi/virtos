@@ -1,7 +1,9 @@
-//! Resolving a `/`-separated path against a volume's root directory. No mount table, no working
-//! directory: every path is walked from `vol.root_dir()`, on whichever single volume the caller
-//! already picked (`syscall::fd::open` and `shell::run` both currently hardcode volume 0 --
-//! `plans/USERSPACE_PLAN.md`'s note on why real multi-volume path resolution isn't needed yet).
+//! Resolving an already-*absolute* `/`-separated path against a volume's root directory -- the
+//! working-directory half of turning what a program typed into one of these lives in `fs::cwd`'s
+//! `absolute`, called before any function here. No mount table either: every path is walked from
+//! `vol.root_dir()`, on whichever single volume the caller already picked (`syscall::fd::open`
+//! and `shell::run` both currently hardcode volume 0 -- `plans/USERSPACE_PLAN.md`'s note on why
+//! real multi-volume path resolution isn't needed yet).
 
 use hadris_fat::sync::{DirectoryEntry, FatDir, FatVolume, FileEntry};
 

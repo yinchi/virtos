@@ -1,9 +1,9 @@
 //! `SVC`-based syscalls and the fault path, both reached from `sync_el0_64` (`vectors.s`) via
 //! `sync_el0_handler`.
 //!
-//! `exit`, `read`, `write`, `open`, `close`, `getdents`, `mkdir`, `unlink`, `rename`, `clear` and
-//! `reboot` so far. Everything else still returns `-1` (see `fd`'s own doc comment on why that's
-//! not yet a real negated-errno convention).
+//! `exit`, `read`, `write`, `open`, `close`, `getdents`, `mkdir`, `unlink`, `rename`, `getcwd`,
+//! `stat`, `clear` and `reboot` so far. Everything else still returns `-1` (see `fd`'s own doc
+//! comment on why that's not yet a real negated-errno convention).
 
 pub mod fd;
 mod power;
@@ -13,8 +13,8 @@ use core::fmt::Write;
 
 use crate::exec::process;
 use abi::{
-    SYS_CLEAR, SYS_CLOSE, SYS_EXIT, SYS_GETDENTS, SYS_MKDIRAT, SYS_OPEN, SYS_READ, SYS_REBOOT,
-    SYS_RENAMEAT, SYS_UNLINKAT, SYS_WRITE,
+    SYS_CLEAR, SYS_CLOSE, SYS_EXIT, SYS_GETCWD, SYS_GETDENTS, SYS_MKDIRAT, SYS_NEWFSTATAT,
+    SYS_OPEN, SYS_READ, SYS_REBOOT, SYS_RENAMEAT, SYS_UNLINKAT, SYS_WRITE,
 };
 
 // The ESR_EL1 EC field values this handler decodes -- see `sync_el0_handler` for what each one
@@ -64,6 +64,8 @@ extern "C" fn sync_el0_handler(regs: *mut TrapFrame) {
                 SYS_MKDIRAT => regs.x[0] = fd::mkdir(a0, a1) as u64,
                 SYS_UNLINKAT => regs.x[0] = fd::unlink(a0, a1) as u64,
                 SYS_RENAMEAT => regs.x[0] = fd::rename(a0, a1, a2, a3) as u64,
+                SYS_GETCWD => regs.x[0] = fd::getcwd(a0, a1) as u64,
+                SYS_NEWFSTATAT => regs.x[0] = fd::stat(a0, a1, a2) as u64,
                 SYS_CLEAR => regs.x[0] = fd::clear() as u64,
                 SYS_REBOOT => regs.x[0] = power::reboot(a0) as u64,
                 SYS_EXIT => {

@@ -1,5 +1,7 @@
 //! File descriptor dispatch for `open`/`close`/`read`/`write`/`getdents`, plus the path-only
-//! (no fd involved) `mkdir`/`unlink`/`rename`. One fd table, not one per program: at most one
+//! (no fd involved) `mkdir`/`unlink`/`rename`/`getcwd`/`stat`. Every path a program supplies is
+//! resolved against the working directory first (`fs::cwd::absolute`) before it ever reaches
+//! `fs::path`. One fd table, not one per program: at most one
 //! program is ever resident (see `arch/mmu.rs`'s reasoning), so `reset_for_launch` simply refills
 //! it with the three standard entries before each launch, and `end_launch` empties it again once
 //! that program exits or faults. `0`/`1`/`2` are always `Keyboard`/`Console`/`Console` right after
@@ -22,7 +24,7 @@ use crate::drivers::virtio::gpu;
 use crate::fs;
 use crate::fs::blkio::BlkIo;
 use crate::keyboard::queue;
-use abi::{DIRENT_SIZE, NAME_MAX, O_RDONLY, O_WRONLY};
+use abi::{DIRENT_SIZE, NAME_MAX, O_RDONLY, O_WRONLY, STAT_SIZE};
 
 /// This project's own error convention so far -- a negative value, not yet the real negated-errno
 /// convention `plans/USERSPACE_PLAN.md` settles on for the full syscall set (no `errno` constants
@@ -179,7 +181,17 @@ impl FileDescriptor {
 /// Bounds-checks `ptr`/`len` against the user window before trusting them: the MMU's `USER`
 /// attribute bit gates *EL0's* access, not EL1's, so a buggy or malicious pointer aimed at kernel
 /// memory is otherwise still readable/writable by the kernel and must be rejected in software.
+/// `len == 0` is always valid regardless of `ptr`: a zero-length access touches no memory, and
+/// Rust's own empty `&str`/`&[u8]` values carry a dangling sentinel pointer by convention (e.g.
+/// `""`'s), not a real address inside the user window at all -- an empty path (`ls`'s own "use the
+/// working directory" default) would otherwise fail this check before ever reaching `fs::cwd`.
 fn validate(ptr: usize, len: usize) -> bool {
+    if len == 0 {
+        // Still reject a literal null: `core::slice::from_raw_parts` requires a non-null pointer
+        // even for a zero-length slice, unlike the dangling-but-non-null one Rust's own empty
+        // `&str`/`&[u8]` values carry.
+        return ptr != 0;
+    }
     let Some(end) = ptr.checked_add(len) else {
         return false;
     };
@@ -230,9 +242,10 @@ pub fn getdents(fd: usize, ptr: usize, len: usize) -> isize {
     }
 }
 
-/// Opens the file or directory at the user-space path `ptr`/`len` on `system.img` (blk0 -- no
-/// path/mount resolution across volumes yet, see `fs::path`'s own doc comment), returning the
-/// lowest free fd number (never one of the standard three) or `-1`. `O_RDONLY` also opens a
+/// Opens the file or directory at the user-space path `ptr`/`len` (resolved against the working
+/// directory first, `fs::cwd::absolute`) on `system.img` (blk0 -- no path/mount resolution across
+/// volumes yet, see `fs::path`'s own doc comment), returning the lowest free fd number (never one
+/// of the standard three) or `-1`. `O_RDONLY` also opens a
 /// directory (the root included, for `""`/`"/"`), for `getdents` rather than `read`/`write`.
 /// `O_WRONLY` creates the file if it's missing, or truncates it to empty if it already exists as
 /// a plain file (a directory is refused); no read-only-bit check, since nothing sets that bit yet
@@ -254,13 +267,14 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
     let Ok(path) = core::str::from_utf8(bytes) else {
         return EBADF;
     };
+    let path = fs::cwd::absolute(path);
 
     let Some(vol) = fs::volume::get(0) else {
         return EBADF;
     };
 
     let descriptor = if flags == O_WRONLY {
-        let Ok((parent, leaf)) = fs::path::split(vol, path) else {
+        let Ok((parent, leaf)) = fs::path::split(vol, &path) else {
             return EBADF;
         };
         let entry = match fs::path::find_entry(&parent, leaf) {
@@ -277,7 +291,7 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
             return EBADF;
         };
         FileDescriptor::FileWrite(writer)
-    } else if let Ok(dir) = fs::path::resolve_dir(vol, path) {
+    } else if let Ok(dir) = fs::path::resolve_dir(vol, &path) {
         // Tried first: a path through directories only (the empty/root path included) opens for
         // `getdents`. If it fails, the same path is tried as an ordinary file below --
         // `resolve_dir` and `resolve` walk identically up to the last component, so this only
@@ -288,7 +302,7 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
             next: 0,
         }
     } else {
-        let Ok(entry) = fs::path::resolve(vol, path) else {
+        let Ok(entry) = fs::path::resolve(vol, &path) else {
             return EBADF;
         };
         let Ok(reader) = vol.read_file(&entry) else {
@@ -326,9 +340,9 @@ pub fn close(fd: usize) -> isize {
     }
 }
 
-/// Creates an empty directory at the user-space path `ptr`/`len`. `-1` if the path's parent
-/// doesn't exist or isn't a directory, if something already exists at that name, or if `path` has
-/// no components at all (the root always exists).
+/// Creates an empty directory at the user-space path `ptr`/`len` (resolved against the working
+/// directory first). `-1` if the path's parent doesn't exist or isn't a directory, if something
+/// already exists at that name, or if `path` has no components at all (the root always exists).
 pub fn mkdir(ptr: usize, len: usize) -> isize {
     if !validate(ptr, len) {
         return EBADF;
@@ -339,10 +353,11 @@ pub fn mkdir(ptr: usize, len: usize) -> isize {
     let Ok(path) = core::str::from_utf8(bytes) else {
         return EBADF;
     };
+    let path = fs::cwd::absolute(path);
     let Some(vol) = fs::volume::get(0) else {
         return EBADF;
     };
-    let Ok((parent, leaf)) = fs::path::split(vol, path) else {
+    let Ok((parent, leaf)) = fs::path::split(vol, &path) else {
         return EBADF;
     };
     match vol.create_dir(&parent, leaf) {
@@ -351,10 +366,10 @@ pub fn mkdir(ptr: usize, len: usize) -> isize {
     }
 }
 
-/// Removes the file, or empty directory, at the user-space path `ptr`/`len` -- one call for both
-/// (`hadris_fat::FatVolume::delete`'s own behavior; no `AT_REMOVEDIR` flag to distinguish them,
-/// unlike Linux's real `unlinkat`), refusing only a *non-empty* directory. `-1` for a missing path
-/// or a non-empty directory.
+/// Removes the file, or empty directory, at the user-space path `ptr`/`len` (resolved against the
+/// working directory first) -- one call for both (`hadris_fat::FatVolume::delete`'s own behavior;
+/// no `AT_REMOVEDIR` flag to distinguish them, unlike Linux's real `unlinkat`), refusing only a
+/// *non-empty* directory. `-1` for a missing path or a non-empty directory.
 pub fn unlink(ptr: usize, len: usize) -> isize {
     if !validate(ptr, len) {
         return EBADF;
@@ -365,10 +380,11 @@ pub fn unlink(ptr: usize, len: usize) -> isize {
     let Ok(path) = core::str::from_utf8(bytes) else {
         return EBADF;
     };
+    let path = fs::cwd::absolute(path);
     let Some(vol) = fs::volume::get(0) else {
         return EBADF;
     };
-    let Ok(entry) = fs::path::resolve(vol, path) else {
+    let Ok(entry) = fs::path::resolve(vol, &path) else {
         return EBADF;
     };
     match vol.delete(&entry) {
@@ -377,10 +393,11 @@ pub fn unlink(ptr: usize, len: usize) -> isize {
     }
 }
 
-/// Renames or moves the entry at the user-space path `old_ptr`/`old_len` to `new_ptr`/`new_len`,
-/// within the same volume -- a thin wrap of `hadris_fat::FatVolume::rename`, which refuses if
-/// `new` already names something (whatever type it is) and refuses moving a directory into its
-/// own descendant. `-1` for any of those, or if either path fails to resolve.
+/// Renames or moves the entry at the user-space path `old_ptr`/`old_len` to `new_ptr`/`new_len`
+/// (each resolved against the working directory first), within the same volume -- a thin wrap of
+/// `hadris_fat::FatVolume::rename`, which refuses if `new` already names something (whatever type
+/// it is) and refuses moving a directory into its own descendant. `-1` for any of those, or if
+/// either path fails to resolve.
 pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) -> isize {
     if !validate(old_ptr, old_len) || !validate(new_ptr, new_len) {
         return EBADF;
@@ -395,19 +412,78 @@ pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) ->
     ) else {
         return EBADF;
     };
+    let old_path = fs::cwd::absolute(old_path);
+    let new_path = fs::cwd::absolute(new_path);
     let Some(vol) = fs::volume::get(0) else {
         return EBADF;
     };
-    let Ok(old_entry) = fs::path::resolve(vol, old_path) else {
+    let Ok(old_entry) = fs::path::resolve(vol, &old_path) else {
         return EBADF;
     };
-    let Ok((new_parent, new_leaf)) = fs::path::split(vol, new_path) else {
+    let Ok((new_parent, new_leaf)) = fs::path::split(vol, &new_path) else {
         return EBADF;
     };
     match vol.rename(&old_entry, &new_parent, new_leaf) {
         Ok(_) => 0,
         Err(_) => EBADF,
     }
+}
+
+/// Copies the working directory's absolute path into the user buffer `ptr`/`len` (no terminating
+/// NUL). Returns its length, or `-1` if `buf` is too small.
+pub fn getcwd(ptr: usize, len: usize) -> isize {
+    if !validate(ptr, len) {
+        return EBADF;
+    }
+    let _user = mmu::user_access();
+    let cwd = fs::cwd::get();
+    if cwd.len() > len {
+        return EBADF;
+    }
+    // SAFETY: validated above to lie entirely within the user window, and `cwd.len() <= len`.
+    let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, cwd.len()) };
+    buf.copy_from_slice(cwd.as_bytes());
+    cwd.len() as isize
+}
+
+/// Writes the size and type (file or directory) of the user-space path `ptr`/`len` (resolved
+/// against the working directory first) into the `STAT_SIZE`-byte buffer at `out_ptr`: `size: u32`
+/// (little-endian), then `is_dir: u8` (`0`/`1`) -- see `abi::STAT_SIZE`'s own doc comment for why
+/// nothing else is reported yet. `-1` if the path doesn't resolve, or if `out_ptr`/`STAT_SIZE`
+/// isn't valid user memory.
+pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
+    if !validate(ptr, len) || !validate(out_ptr, STAT_SIZE) {
+        return EBADF;
+    }
+    let _user = mmu::user_access();
+    // SAFETY: validated above to lie entirely within the user window.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return EBADF;
+    };
+    let path = fs::cwd::absolute(path);
+    let Some(vol) = fs::volume::get(0) else {
+        return EBADF;
+    };
+
+    // Same "try as a directory first" order `open` already uses, and for the same reason: a path
+    // that resolves as a directory here would otherwise also resolve via `resolve` below (as a
+    // `FileEntry` `.is_directory()` doesn't distinguish), but the root has no `FileEntry` of its
+    // own to hand back, so it has to be handled before falling through.
+    let (size, is_dir): (u32, u8) = if fs::path::resolve_dir(vol, &path).is_ok() {
+        (0, 1)
+    } else {
+        let Ok(entry) = fs::path::resolve(vol, &path) else {
+            return EBADF;
+        };
+        (entry.len() as u32, 0)
+    };
+
+    // SAFETY: validated above to lie entirely within the user window.
+    let out = unsafe { core::slice::from_raw_parts_mut(out_ptr as *mut u8, STAT_SIZE) };
+    out[0..4].copy_from_slice(&size.to_le_bytes());
+    out[4] = is_dir;
+    0
 }
 
 /// Clears the console -- both the graphical one (if a GPU device exists) and, via an ANSI escape

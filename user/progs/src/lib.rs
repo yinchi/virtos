@@ -47,3 +47,14 @@ pub fn help(usage: &str, flags: &[(&str, &str)]) -> ExitCode {
     }
     ExitCode(0)
 }
+
+/// The text after the last `/` in `path` (or all of it if there is none), after trimming one
+/// trailing `/` first so a directory operand's own name is returned rather than an empty string.
+/// Used by `cp`/`mv`'s directory-destination case (`dst/basename(src)`).
+pub fn basename(path: &str) -> &str {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    match path.rfind('/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
