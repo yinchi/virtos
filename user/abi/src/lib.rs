@@ -9,6 +9,20 @@
 pub const SYS_READ: usize = 63;
 pub const SYS_WRITE: usize = 64;
 pub const SYS_EXIT: usize = 93;
+pub const SYS_REBOOT: usize = 142;
+
+/// Not a real Linux syscall -- Linux clears a terminal through an `ioctl` a userspace tool
+/// interprets itself (writing ANSI escapes), and this project has no generic `ioctl` mechanism yet
+/// (`plans/USERSPACE_PLAN.md`'s divergence #5). A dedicated syscall is the smaller thing to build
+/// for the one thing that needs it today; revisit if/when a real `ioctl` exists for other reasons
+/// and this turns out to be one more request code on top of it, not a syscall of its own.
+pub const SYS_CLEAR: usize = 1000;
+
+/// `reboot`'s `cmd` values -- Linux's real magic numbers, borrowed for familiarity (no two-magic-
+/// number safety dance like Linux's own `reboot(2)`; this project has no multi-user safety concern
+/// that convention exists for).
+pub const LINUX_REBOOT_CMD_RESTART: u32 = 0x0123_4567;
+pub const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321_FEDC;
 
 /// The fixed userspace heap's lowest address, and its size. No `brk` syscall exists to discover
 /// this at runtime (`plans/USERSPACE_PLAN.md`'s divergence #6: a fixed heap needs no syscall

@@ -125,32 +125,39 @@ reseed-home:
     mv {{HOME_IMG}} {{HOME_IMG}}.bak
     just seed-home
 
-# Every `user/*` crate that builds an actual EL0 program -- one per `src/main.rs` found, so a new
-# one needs no justfile edit. `abi`/`userlib` are library crates (`src/lib.rs`, no `[[bin]]`) that
-# every program depends on rather than programs themselves, so they're deliberately excluded here
-# -- they'd fail this recipe's `strip` step (no binary to strip) if they weren't -- but still get
-# formatted/linted like any other crate via `OTHER_CRATES` below. Each program wants the kernel's
-# own bare-metal default target (see `OTHER_CRATES`'s comment), inherited from the repo root's
-# `.cargo/config.toml`.
-USER_CRATES := `find user -mindepth 3 -maxdepth 3 -name main.rs 2>/dev/null | sed 's|/src/main\.rs$||'`
-
-# Builds every user/* crate (release) and strips the result into disks/system/usr/bin/<name> --
-# what `mkimage` (`build-mkimage`) marks executable (`ATTR_EXEC`) when `system` below packages it.
-# `strip -o` rather than stripping in place: the unstripped binary stays in that crate's own
-# `target/` for a debugger to use, only the copy actually shipped in the image is stripped.
+# Builds every user/* crate's EL0 programs (release) and strips each into
+# disks/system/usr/bin/<name> -- what `mkimage` (`build-mkimage`) marks executable (`ATTR_EXEC`)
+# when `system` below packages it. Each crate directory is built exactly once (a plain
+# `cargo build --release`, no `--bin`, builds every binary target the crate has in one invocation --
+# both `src/main.rs` and any number of `src/bin/*.rs`), then every binary it produced is stripped in
+# turn -- so a crate with several programs (e.g. `user/progs`) isn't rebuilt once per program. A
+# crate with neither layout (`abi`/`userlib`: plain libraries, `src/lib.rs`, no `[[bin]]`) is
+# skipped -- there's nothing to strip. `strip -o` rather than stripping in place: the unstripped
+# binary stays in that crate's own `target/` for a debugger to use, only the copy actually shipped
+# in the image is stripped. No justfile edit needed for a new crate or a new program within one.
 build-user:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p disks/system/usr/bin
-    # `while read` rather than `for crate in` USER_CRATES directly: it contains newlines if there's
-    # more than one crate; IFS parses the quoted variable and iterates over the crates correctly.
-    while IFS= read -r crate; do
-        [ -n "$crate" ] || continue
-        name=$(basename "$crate")
+    for crate in user/*/; do
+        crate="${crate%/}"
+        bins=()
+        if [ -d "$crate/src/bin" ]; then
+            for f in "$crate"/src/bin/*.rs; do
+                [ -e "$f" ] || continue
+                bins+=("$(basename "$f" .rs)")
+            done
+        fi
+        if [ -f "$crate/src/main.rs" ]; then
+            bins+=("$(basename "$crate")")
+        fi
+        [ ${#bins[@]} -gt 0 ] || continue
         (cd "$crate" && cargo build --release)
-        aarch64-linux-gnu-strip -o disks/system/usr/bin/"$name" \
-            "$crate/target/aarch64-unknown-none-softfloat/release/$name"
-    done <<< "{{USER_CRATES}}"
+        for name in "${bins[@]}"; do
+            aarch64-linux-gnu-strip -o disks/system/usr/bin/"$name" \
+                "$crate/target/aarch64-unknown-none-softfloat/release/$name"
+        done
+    done
 
 # Build the system image
 system: build-mkimage build-user

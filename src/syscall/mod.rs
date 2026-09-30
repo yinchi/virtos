@@ -1,17 +1,17 @@
 //! `SVC`-based syscalls and the fault path, both reached from `sync_el0_64` (`vectors.s`) via
 //! `sync_el0_handler`.
 //!
-//! `exit`, `read` and `write` -- the lab's own smallest working syscall set
-//! (`plans/USERSPACE_PLAN.md`'s step 5). Everything else still returns `-1` (see `fd`'s own doc
-//! comment on why that's not yet a real negated-errno convention).
+//! `exit`, `read`, `write`, `clear` and `reboot` so far. Everything else still returns `-1` (see
+//! `fd`'s own doc comment on why that's not yet a real negated-errno convention).
 
 pub mod fd;
+mod power;
 
 use arm_sysregs::el1::accessors::{read_esr_el1, read_far_el1};
 use core::fmt::Write;
 
 use crate::exec::process;
-use abi::{SYS_EXIT, SYS_READ, SYS_WRITE};
+use abi::{SYS_CLEAR, SYS_EXIT, SYS_READ, SYS_REBOOT, SYS_WRITE};
 
 // The ESR_EL1 EC field values this handler decodes -- see `sync_el0_handler` for what each one
 // means here.
@@ -49,6 +49,8 @@ extern "C" fn sync_el0_handler(regs: *mut TrapFrame) {
             match nr {
                 SYS_READ => regs.x[0] = fd::read(a0, a1, a2) as u64,
                 SYS_WRITE => regs.x[0] = fd::write(a0, a1, a2) as u64,
+                SYS_CLEAR => regs.x[0] = fd::clear() as u64,
+                SYS_REBOOT => regs.x[0] = power::reboot(a0) as u64,
                 SYS_EXIT => {
                     // Never returns to kernel_exit's normal eret-back-to-EL0 path --
                     // resume_kernel (context.s) restores the register set enter_el0

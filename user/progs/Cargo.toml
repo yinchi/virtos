@@ -1,0 +1,25 @@
+[package]
+name = "progs"
+version = "0.1.0"
+edition = "2024"
+
+# Every ordinary EL0 utility program, one `[[bin]]` per `src/bin/*.rs` file (Cargo's own default
+# for that layout -- no explicit `[[bin]]` entries needed). Consolidated into one crate rather than
+# one crate per program (the pattern `hello`/`echo`/`scratch` started with, migrated here) because
+# every program shares the exact same `link.ld`/`build.rs`/target regardless -- they're never
+# resident at the same time, so there was never a reason for each to carry its own copy of files
+# that would always be identical anyway. A `src/lib.rs` can hold helpers shared across programs
+# (argument parsing, error reporting, ...) once more than one program actually needs the same one;
+# nothing does yet, so it doesn't exist yet either. A sibling crate to the kernel, never a Cargo
+# workspace member of it (see the kernel's own `Cargo.toml`/`tools/mkimage`'s "Repo organization"
+# note in `plans/PORTING.md`): it wants the same bare-metal target as the kernel, inherited from the
+# repo root's `.cargo/config.toml`, but its own `link.ld` gives it a completely different load
+# address and layout.
+
+[dependencies]
+userlib = { path = "../userlib" }
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

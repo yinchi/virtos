@@ -1,7 +1,7 @@
 //! Not a real program -- a throwaway EL0 test harness, rewritten freely to exercise whatever
-//! kernel-side feature is being tested next, so `user/hello`/`user/echo` and their future siblings
-//! never have to be bent out of shape to prove something new works. Its behavior carries no
-//! stability contract; check git history (or `git blame`) for what it last tested if that matters.
+//! kernel-side feature is being tested next, so `hello.rs`/`echo.rs` and their siblings never have
+//! to be bent out of shape to prove something new works. Its behavior carries no stability
+//! contract; check git history (or `git blame`) for what it last tested if that matters.
 //!
 //! Currently exercises: a non-blocking `read` (proving the syscall doesn't fault even though
 //! nothing produces input yet), then a `write`, then `exit(0)`.

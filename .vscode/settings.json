@@ -3,9 +3,7 @@
     "rust-analyzer.linkedProjects": [
         "${workspaceFolder}/Cargo.toml",
         "${workspaceFolder}/user/abi/Cargo.toml",
-        "${workspaceFolder}/user/echo/Cargo.toml",
-        "${workspaceFolder}/user/hello/Cargo.toml",
-        "${workspaceFolder}/user/scratch/Cargo.toml",
+        "${workspaceFolder}/user/progs/Cargo.toml",
         "${workspaceFolder}/user/userlib/Cargo.toml"
     ],
     "rust-analyzer.cargo.target": "aarch64-unknown-none-softfloat",

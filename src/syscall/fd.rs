@@ -115,3 +115,19 @@ pub fn read(fd: usize, ptr: usize, len: usize) -> isize {
     let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
     fd.read(buf)
 }
+
+/// Clears the console -- both the graphical one (if a GPU device exists) and, via an ANSI escape
+/// sequence (cursor home, erase display), whatever real terminal is watching the UART, the serial
+/// counterpart of clearing the console. No fd argument: there's only ever one console, so there's
+/// nothing to look up (unlike `read`/`write`, which are addressing one of several fds).
+pub fn clear() -> isize {
+    if let Some(con) = console::get() {
+        con.clear(console::DEFAULT_BG);
+        if let Some(gpu_dev) = gpu::get() {
+            gpu_dev.flush();
+        }
+    }
+    let mut uart = crate::bare_metal::get_uart();
+    let _ = uart.write_str("\x1b[H\x1b[2J");
+    0
+}

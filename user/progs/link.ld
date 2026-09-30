@@ -1,10 +1,11 @@
-/* Load address must match the kernel's own `arch::mmu::USER_BASE`. `.text`/`.rodata` are read+exec
- * only; `.data`/`.bss` (now that `userlib`'s global allocator state needs some) get their own
- * page-aligned, read-write region after them -- the kernel's `mmu::enable` sets SCTLR_EL1.WXN, so
- * a single output section spanning both would come out non-executable in practice (the linker
- * unions its input sections' flags into one segment) even where only the `.text` part needs exec,
- * and `exec::elfparse` refuses two segments with different permissions sharing a page regardless,
- * hence the explicit `ALIGN`. */
+/* Load address must match the kernel's own `arch::mmu::USER_BASE`. Shared by every binary in this
+ * crate: they're never resident at the same time, so there's exactly one layout to describe, not
+ * one per program. `.text`/`.rodata` are read+exec only; `.data`/`.bss` (`userlib`'s global
+ * allocator state needs some) get their own page-aligned, read-write region after them -- the
+ * kernel's `mmu::enable` sets SCTLR_EL1.WXN, so a single output section spanning both would come
+ * out non-executable in practice (the linker unions its input sections' flags into one segment)
+ * even where only the `.text` part needs exec, and `exec::elfparse` refuses two segments with
+ * different permissions sharing a page regardless, hence the explicit `ALIGN`. */
 ENTRY(_start)
 
 SECTIONS
