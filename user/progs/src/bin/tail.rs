@@ -1,4 +1,5 @@
-//! Prints the last N lines (`-n`/`--lines`, default 10) of each named file, in order.
+//! Prints the last N lines (`-n`/`--lines`, default 10) of each named file, in order. No
+//! operand, or a lone `-` as one, reads stdin (`progs::read_operand`'s own doc comment).
 #![no_std]
 #![no_main]
 
@@ -39,17 +40,16 @@ fn tail_lines(data: &[u8], n: usize) -> &[u8] {
 }
 
 fn run(args: Args) -> ExitCode {
-    let (n, paths) = match progs::cli::line_count("tail", USAGE, FLAGS, args, DEFAULT_LINES) {
+    let (n, mut paths) = match progs::cli::line_count("tail", USAGE, FLAGS, args, DEFAULT_LINES) {
         Ok(v) => v,
         Err(status) => return status,
     };
     if paths.is_empty() {
-        userlib::write(2, b"tail: missing file operand\n");
-        return ExitCode(1);
+        paths.push("-");
     }
     let mut ok = true;
     for path in paths {
-        let Some(data) = progs::read_file(path) else {
+        let Some(data) = progs::read_operand(path) else {
             userlib::write(2, b"tail: ");
             userlib::write(2, path.as_bytes());
             userlib::write(2, b": cannot open\n");

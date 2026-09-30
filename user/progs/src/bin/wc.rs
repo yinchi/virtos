@@ -1,5 +1,8 @@
 //! Prints the line, word, and byte counts of each named file, plus a total if more than one is
-//! given -- an ordinary `wc`'s default output, no `-l`/`-w`/`-c` flag to print just one of them yet.
+//! given -- an ordinary `wc`'s default output, no `-l`/`-w`/`-c` flag to print just one of them
+//! yet. No operand reads stdin, printing counts with no trailing name (GNU's own convention --
+//! there's no path to show); an explicit `-` operand reads stdin too, but *does* print `-` as its
+//! name, the same as any other operand.
 #![no_std]
 #![no_main]
 
@@ -43,15 +46,15 @@ fn run(args: Args) -> ExitCode {
         }
         paths.push(arg);
     }
-    if paths.is_empty() {
-        userlib::write(2, b"wc: missing file operand\n");
-        return ExitCode(1);
+    let implicit_stdin = paths.is_empty();
+    if implicit_stdin {
+        paths.push("-");
     }
 
     let mut ok = true;
     let (mut total_lines, mut total_words, mut total_bytes) = (0, 0, 0);
     for &path in &paths {
-        let Some(data) = progs::read_file(path) else {
+        let Some(data) = progs::read_operand(path) else {
             userlib::write(2, b"wc: ");
             userlib::write(2, path.as_bytes());
             userlib::write(2, b": cannot open\n");
@@ -62,7 +65,12 @@ fn run(args: Args) -> ExitCode {
         total_lines += lines;
         total_words += words;
         total_bytes += bytes;
-        userlib::write(1, format!("{lines} {words} {bytes} {path}\n").as_bytes());
+        let line = if implicit_stdin {
+            format!("{lines} {words} {bytes}\n")
+        } else {
+            format!("{lines} {words} {bytes} {path}\n")
+        };
+        userlib::write(1, line.as_bytes());
     }
     if paths.len() > 1 {
         let line = format!("{total_lines} {total_words} {total_bytes} total\n");

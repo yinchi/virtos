@@ -3,7 +3,8 @@
 //! (`.` for anything not printable), and a closing line with the final offset (matching real
 //! `hexdump -C`'s own convention -- printed even for an empty file, whose only output is that one
 //! line, and even when the file's length is an exact multiple of 16, where it's not implied by any
-//! partial row).
+//! partial row). No operand, or a lone `-` as one, reads stdin (`progs::read_operand`'s own doc
+//! comment).
 #![no_std]
 #![no_main]
 
@@ -52,7 +53,7 @@ fn run(args: Args) -> ExitCode {
             return progs::help(USAGE, FLAGS);
         }
         any = true;
-        let Some(data) = progs::read_file(path) else {
+        let Some(data) = progs::read_operand(path) else {
             userlib::write(2, b"hexdump: ");
             userlib::write(2, path.as_bytes());
             userlib::write(2, b": cannot open\n");
@@ -62,8 +63,8 @@ fn run(args: Args) -> ExitCode {
         dump(&data);
     }
     if !any {
-        userlib::write(2, b"hexdump: missing file operand\n");
-        return ExitCode(1);
+        let data = progs::read_operand("-").expect("stdin never fails to open");
+        dump(&data);
     }
     if ok { ExitCode(0) } else { ExitCode(1) }
 }

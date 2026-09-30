@@ -1,11 +1,13 @@
 //! A kernel-side line-reading REPL: type a name, press Enter, run it. Living at EL1
 //! (`crate::shell`, the same place the lab's own real shell lives) specifically so it needs
 //! neither `userlib` nor argv/envp to exist first. `lexer`/`syntax` give it a real grammar --
-//! quoting, escaping, pipes, redirection -- but `run` (below) only *executes* a single command
-//! with no redirection for now; a pipeline or a redirection parses correctly but is reported as
-//! not yet supported rather than run, one build-order step at a time (`plans/USERSPACE_PLAN.md`'s
-//! step 10). `cd` is its one builtin (`fs::cwd`'s own doc comment explains why it has to be):
-//! everything else is looked up under `usr/bin/` and run as a real EL0 program.
+//! quoting, escaping, pipes, redirection; `run` (below) now executes a single command's
+//! redirections for real (`syscall::fd::bind_stdio`, for a program; `apply_redirects_standalone`
+//! here, for `cd` or a segment with no command at all) -- only a *pipeline* (more than one
+//! `|`-separated stage) still parses correctly but is reported as not yet supported rather than
+//! run, one build-order step at a time (`plans/USERSPACE_PLAN.md`'s step 10). `cd` is its one
+//! builtin (`fs::cwd`'s own doc comment explains why it has to be): everything else is looked up
+//! under `usr/bin/` and run as a real EL0 program.
 //!
 //! `lexer`/`syntax` are pure logic, no hardware dependency: built and host-tested under both
 //! targets, like `fs::sector`/`exec::elfparse`. Everything below them touches the console,
@@ -24,6 +26,8 @@ use crate::exec;
 use crate::fs;
 #[cfg(target_os = "none")]
 use crate::keyboard;
+#[cfg(target_os = "none")]
+use crate::syscall::fd::{self, StdioRedirect};
 #[cfg(target_os = "none")]
 use alloc::format;
 #[cfg(target_os = "none")]
@@ -73,6 +77,75 @@ fn cd(uart: &mut Uart, argv: &[String]) {
     fs::cwd::set(absolute);
 }
 
+/// Applies `redirs` with no program to run afterward -- `cd`, and a segment with no command at
+/// all (only redirections, e.g. `> f` -- POSIX still creates the file), both land here rather
+/// than through `syscall::fd::bind_stdio`/`run_program`: there is no process, and no fd table to
+/// bind into. Each redirect's real side effect still happens -- `In` still errors if its target
+/// is missing even though nothing reads it; `Out`/`Append` still creates or truncates its target
+/// even though nothing writes to it -- just opened and, for `Out`/`Append`, immediately finished,
+/// since there is nothing here to hand the open file to. `Dup` has nothing to alias without a
+/// real fd table, so it is a genuine no-op.
+///
+/// Applied by `run` (this function's only caller) *before* whatever follows -- `cd`'s own
+/// `fs::cwd::set`, if any -- touches anything, so a relative path in a redirect resolves against
+/// the working directory as it was *before* that: `cd foo > bar` creates `bar` relative to where
+/// the shell started, not `foo`, matching a real shell. This falls out of the calling order
+/// alone; nothing here needs to know which directory is "the right one" itself.
+#[cfg(target_os = "none")]
+fn apply_redirects_standalone(redirs: &[syntax::Redirection]) -> Result<(), String> {
+    let Some(vol) = fs::volume::get(0) else {
+        return Err("system.img not mounted".into());
+    };
+    for redir in redirs {
+        match redir {
+            syntax::Redirection::In(path) => {
+                let absolute = fs::cwd::absolute(path);
+                if fd::open_for_read(vol, &absolute).is_err() {
+                    return Err(format!("{path}: not found"));
+                }
+            }
+            syntax::Redirection::Out { path, append, .. } => {
+                let absolute = fs::cwd::absolute(path);
+                let Ok(writer) = fd::open_for_write(vol, &absolute, *append) else {
+                    return Err(format!("{path}: cannot create"));
+                };
+                if writer.finish().is_err() {
+                    return Err(format!("{path}: cannot create"));
+                }
+            }
+            syntax::Redirection::Dup { .. } => {} // nothing to alias without a real fd table
+        }
+    }
+    Ok(())
+}
+
+/// Builds `syscall::fd::bind_stdio`'s override array from `redirs` -- each `Redirection` names
+/// the fd it binds (`In` always fd 0; `Out`/`Dup` carry their own, defaulted to 1 by `syntax`'s
+/// own parsing), so this is a plain sort into array slots, in order (a later redirection of the
+/// same fd overwrites an earlier one in the same slot -- see `bind_stdio`'s own doc comment for
+/// what that means for `Dup`).
+#[cfg(target_os = "none")]
+fn build_overrides(redirs: &[syntax::Redirection]) -> [Option<StdioRedirect>; 3] {
+    let mut overrides: [Option<StdioRedirect>; 3] = [None, None, None];
+    for redir in redirs {
+        match redir {
+            syntax::Redirection::In(path) => {
+                overrides[0] = Some(StdioRedirect::In(path.clone()));
+            }
+            syntax::Redirection::Out { fd, path, append } => {
+                overrides[*fd as usize] = Some(StdioRedirect::Out {
+                    path: path.clone(),
+                    append: *append,
+                });
+            }
+            syntax::Redirection::Dup { fd, target } => {
+                overrides[*fd as usize] = Some(StdioRedirect::Dup(*target));
+            }
+        }
+    }
+    overrides
+}
+
 /// Describes a `syntax::SyntaxError` for `report` -- never called with `EmptyCommand`, which
 /// `run` (this function's only caller) already treats as "nothing to do" before reaching here.
 #[cfg(target_os = "none")]
@@ -97,12 +170,16 @@ fn describe_syntax_error(err: syntax::SyntaxError) -> String {
 /// Lexes and parses `line` (`syntax::parse`), then either runs it or reports why it can't be,
 /// yet. A blank or comment-only line (`SyntaxError::EmptyCommand`) is silently ignored, matching
 /// a real shell's own response to pressing Enter on nothing; every other parse failure is
-/// reported the same way a failed launch already is. `cd` stays a builtin; anything else looks
-/// up `usr/bin/<argv[0]>` on `system.img` (blk0) and runs it at EL0 to completion, with an empty
-/// environment (nothing produces real environment variables yet). More than one pipeline segment,
-/// or any redirection at all, is reported as not yet supported rather than partially executed --
-/// see `plans/USERSPACE_PLAN.md`'s step 10. Any other failure -- not mounted, not found, bad ELF,
-/// argv too large -- is reported and swallowed; one bad command shouldn't take the REPL down.
+/// reported the same way a failed launch already is. More than one pipeline segment is reported
+/// as not yet supported rather than partially executed -- see `plans/USERSPACE_PLAN.md`'s step
+/// 10. For a single segment: redirections are applied first, uniformly, before whatever follows
+/// -- `cd`, an external program, or nothing at all, for an empty-argv segment of only
+/// redirections -- the same ordering a real shell uses, and the reason `cd foo > bar` creates
+/// `bar` relative to where the shell started rather than `foo` (`apply_redirects_standalone`'s
+/// own doc comment). `cd` stays a builtin; anything else looks up `usr/bin/<argv[0]>` on
+/// `system.img` (blk0) and runs it at EL0 to completion, with an empty environment (nothing
+/// produces real environment variables yet). Any other failure -- not mounted, not found, bad
+/// ELF, argv too large -- is reported and swallowed; one bad command shouldn't take the REPL down.
 #[cfg(target_os = "none")]
 fn run(uart: &mut Uart, line: &str) {
     let pipeline = match syntax::parse(line) {
@@ -121,12 +198,24 @@ fn run(uart: &mut Uart, line: &str) {
     // `pipeline` always has at least one segment -- `syntax::parse` never returns an empty one
     // (a pipeline with nothing in it is `SyntaxError::EmptyCommand`, handled above).
     let segment = &pipeline[0];
-    if !segment.redirs.is_empty() {
-        report(uart, "redirection is not supported yet");
+    let argv = &segment.argv;
+    // `cd` never reaches `run_program`, so it never reaches `bind_stdio` either -- same for an
+    // empty-argv segment, which has no program to launch at all. Both apply their redirections
+    // here instead, directly; anything else still gets its redirections (if any) via
+    // `build_overrides`/`bind_stdio`, below, once it actually launches.
+    let launches_program = !argv.is_empty() && argv[0] != "cd";
+
+    if !segment.redirs.is_empty()
+        && !launches_program
+        && let Err(msg) = apply_redirects_standalone(&segment.redirs)
+    {
+        report(uart, &msg);
         return;
     }
 
-    let argv = &segment.argv;
+    if argv.is_empty() {
+        return; // a bare `> f` -- POSIX creates the file, runs nothing
+    }
     let name = argv[0].as_str();
 
     if name == "cd" {
@@ -153,7 +242,8 @@ fn run(uart: &mut Uart, line: &str) {
     };
 
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    if let Err(e) = exec::process::run_program(&program, &argv_refs, &[]) {
+    let stdio = build_overrides(&segment.redirs);
+    if let Err(e) = exec::process::run_program(&program, &argv_refs, &[], stdio) {
         report(uart, &format!("{name}: {e:?}"));
     }
 }

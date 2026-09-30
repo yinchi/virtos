@@ -1,7 +1,10 @@
 //! Prints each named file's content to stdout, in order. The first real consumer of `open`/
 //! `close`, proving that round trip the same way `hello` proved `exit` and `echo` proved `argv`.
-//! No flags, no stdin fallback when no file is named (an ordinary `cat` reads stdin then) -- just
-//! enough to exercise the new syscalls; real behavior gets filled in if something needs it.
+//! No operand, or a lone `-` as one, reads fd 0 instead (GNU's own convention: `cat a - b` reads
+//! `a`, then stdin, then `b`) -- works for a redirected or piped stdin (a real, blocking
+//! `FileReader`/pipe-stage fd); typed bare at the interactive prompt it still reads as empty,
+//! since the `Keyboard` fd is non-blocking with nothing to block on yet (`plans/PROGS.md`'s
+//! conventions section).
 #![no_std]
 #![no_main]
 
@@ -15,6 +18,35 @@ const BUF_SIZE: usize = 512;
 const USAGE: &str = "cat [file...]";
 const FLAGS: &[(&str, &str)] = &[];
 
+/// Streams `path`'s content to stdout -- fd 0 directly if `path` is `-`, otherwise `open`ed and
+/// `close`d here. `false` (after reporting it) if `path` names a real file that fails to open.
+fn cat_one(path: &str) -> bool {
+    let fd = if path == "-" {
+        0
+    } else {
+        let fd = userlib::open(path, O_RDONLY);
+        if fd < 0 {
+            userlib::write(2, b"cat: ");
+            userlib::write(2, path.as_bytes());
+            userlib::write(2, b": cannot open\n");
+            return false;
+        }
+        fd as usize
+    };
+    let mut buf = [0u8; BUF_SIZE];
+    loop {
+        let n = userlib::read(fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        userlib::write(1, &buf[..n as usize]);
+    }
+    if path != "-" {
+        userlib::close(fd);
+    }
+    true
+}
+
 fn run(args: Args) -> ExitCode {
     let mut any = false;
     let mut ok = true;
@@ -23,28 +55,12 @@ fn run(args: Args) -> ExitCode {
             return progs::help(USAGE, FLAGS);
         }
         any = true;
-        let fd = userlib::open(path, O_RDONLY);
-        if fd < 0 {
-            userlib::write(2, b"cat: ");
-            userlib::write(2, path.as_bytes());
-            userlib::write(2, b": cannot open\n");
+        if !cat_one(path) {
             ok = false;
-            continue;
         }
-        let fd = fd as usize;
-        let mut buf = [0u8; BUF_SIZE];
-        loop {
-            let n = userlib::read(fd, &mut buf);
-            if n <= 0 {
-                break;
-            }
-            userlib::write(1, &buf[..n as usize]);
-        }
-        userlib::close(fd);
     }
     if !any {
-        userlib::write(2, b"cat: missing file operand\n");
-        return ExitCode(1);
+        cat_one("-");
     }
     if ok { ExitCode(0) } else { ExitCode(1) }
 }

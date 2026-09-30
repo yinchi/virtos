@@ -13,15 +13,10 @@ use alloc::format;
 use alloc::vec::Vec;
 use userlib::{ExitCode, O_RDONLY};
 
-/// Reads the file at `path` into a freshly allocated `Vec<u8>`. `None` if it can't be opened.
-/// Simplicity over streaming efficiency: fine for this project's small test files, revisit if a
-/// program ever needs to handle one too large to comfortably fit the fixed heap at once.
-pub fn read_file(path: &str) -> Option<Vec<u8>> {
-    let fd = userlib::open(path, O_RDONLY);
-    if fd < 0 {
-        return None;
-    }
-    let fd = fd as usize;
+/// Reads every remaining byte off `fd` into a freshly allocated `Vec<u8>` -- just the read loop,
+/// no open/close, so it works equally for an already-open fd (stdin's `0`, or a `-` operand) and
+/// for `read_file`'s own "open a path, read it whole" case below.
+pub fn read_fd(fd: usize) -> Vec<u8> {
     let mut data = Vec::new();
     let mut buf = [0u8; 512];
     loop {
@@ -31,8 +26,34 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         }
         data.extend_from_slice(&buf[..n as usize]);
     }
+    data
+}
+
+/// Reads the file at `path` into a freshly allocated `Vec<u8>`. `None` if it can't be opened.
+/// Simplicity over streaming efficiency: fine for this project's small test files, revisit if a
+/// program ever needs to handle one too large to comfortably fit the fixed heap at once.
+pub fn read_file(path: &str) -> Option<Vec<u8>> {
+    let fd = userlib::open(path, O_RDONLY);
+    if fd < 0 {
+        return None;
+    }
+    let fd = fd as usize;
+    let data = read_fd(fd);
     userlib::close(fd);
     Some(data)
+}
+
+/// `read_file(path)`, except a lone `-` means stdin (`read_fd(0)`, GNU's own convention) --
+/// shared by every program (`head`/`tail`/`wc`/`hexdump`) that reads a list of path operands
+/// whole rather than streaming them the way `cat` does. `None` only for a real path that fails
+/// to open; `-` always succeeds (an empty read is a real, if unlikely, possibility, not a
+/// failure).
+pub fn read_operand(path: &str) -> Option<Vec<u8>> {
+    if path == "-" {
+        Some(read_fd(0))
+    } else {
+        read_file(path)
+    }
 }
 
 /// Prints a `--help` synopsis to stdout: `usage: <usage>`, then one `  <flag>  <description>` line

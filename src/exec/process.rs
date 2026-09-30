@@ -29,6 +29,8 @@ pub enum LaunchError {
     Elf(ElfError),
     /// `args` and `env` together don't fit in `ARG_MAX`.
     ArgsTooBig,
+    /// A `stdio` redirection couldn't be bound -- see `syscall::fd::bind_stdio`.
+    BadRedirect,
 }
 
 impl From<ElfError> for LaunchError {
@@ -175,15 +177,24 @@ fn map_and_zero(start: usize, end: usize) -> Result<(), ElfError> {
 }
 
 /// Loads `elf_bytes`, gives it a fresh stack and heap with `args` as its `argv` and `env`
-/// (`NAME=VALUE` strings) as its `envp`, and runs it at EL0 to completion, then returns normally --
-/// `elf::load` maps the program's own segments; this additionally maps its stack and heap, writes
-/// `args`/`env` onto the stack (`push_strings`), and calls `enter`.
+/// (`NAME=VALUE` strings) as its `envp`, binds `stdio`'s redirections (if any) onto fd 0/1/2, and
+/// runs it at EL0 to completion, then returns normally -- `elf::load` maps the program's own
+/// segments; this additionally maps its stack and heap, writes `args`/`env` onto the stack
+/// (`push_strings`), and calls `enter`. `stdio[i]` is `None` for "leave fd `i` at whatever
+/// `reset_for_launch` set it to" (`Keyboard`/`Console`/`Console`) -- `shell`'s own launch code is
+/// the only caller that ever passes anything else.
 ///
 /// # Errors
 /// Returns `Err` without entering EL0 at all if the ELF is invalid (`LaunchError::Elf`), if
-/// `args`/`env` together don't fit in `ARG_MAX` (`LaunchError::ArgsTooBig`), or if mapping the
-/// stack or heap fails (`LaunchError::Elf(ElfError::MapFailed)`).
-pub fn run_program(elf_bytes: &[u8], args: &[&str], env: &[&str]) -> Result<(), LaunchError> {
+/// `args`/`env` together don't fit in `ARG_MAX` (`LaunchError::ArgsTooBig`), if mapping the stack
+/// or heap fails (`LaunchError::Elf(ElfError::MapFailed)`), or if a `stdio` redirection couldn't
+/// be bound (`LaunchError::BadRedirect`).
+pub fn run_program(
+    elf_bytes: &[u8],
+    args: &[&str],
+    env: &[&str],
+    stdio: [Option<crate::syscall::fd::StdioRedirect>; 3],
+) -> Result<(), LaunchError> {
     let floor = USER_STACK_TOP - ARG_MAX;
 
     // Dry run first: a list that can't fit must not cost a load.
@@ -209,10 +220,13 @@ pub fn run_program(elf_bytes: &[u8], args: &[&str], env: &[&str]) -> Result<(), 
         unsafe { push_strings(USER_STACK_TOP, floor, args, env) }.ok_or(LaunchError::ArgsTooBig)?
     };
 
-    // Last, so nothing above can fail after a program is already considered launched: the standard
-    // three fds, nothing left over from whatever ran before (already dropped by `enter`'s own
-    // `end_launch` call once that program returned).
+    // The standard three fds first, nothing left over from whatever ran before (already dropped
+    // by `enter`'s own `end_launch` call once that program returned); `bind_stdio` right after
+    // then overrides whichever of those `stdio` actually names, before anything below can fail --
+    // once this returns `Ok`, the program is considered launched, so nothing after this point may
+    // fail either.
     crate::syscall::fd::reset_for_launch();
+    crate::syscall::fd::bind_stdio(stdio).map_err(|()| LaunchError::BadRedirect)?;
 
     // SAFETY: `entry` came from `elf::load`, which only ever returns an address inside a segment
     // it just mapped EL0-executable; `argv`/`envp` came from `push_strings`, which wrote them (and

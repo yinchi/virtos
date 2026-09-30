@@ -4,18 +4,20 @@
 //! `fs::path`. One fd table, not one per program: at most one
 //! program is ever resident (see `arch/mmu.rs`'s reasoning), so `reset_for_launch` simply refills
 //! it with the three standard entries before each launch, and `end_launch` empties it again once
-//! that program exits or faults. `0`/`1`/`2` are always `Keyboard`/`Console`/`Console` right after
-//! a reset; everything above them is handed out by `open` and returned by `close`. No redirection
-//! yet (`>`/`<`, `2>&1`), so unlike the mature reference's reference-counted `FileRef` (several
-//! fds sharing one open file), each fd here exclusively owns its own.
+//! that program exits or faults. `0`/`1`/`2` are always `Keyboard`/`Console`/`Console` right
+//! after a reset, unless `bind_stdio` (called right after `reset_for_launch`, from
+//! `exec::process::run_program`) overrides one or more with the shell's own redirections --
+//! everything above them is handed out by `open` and returned by `close`, same as before.
 
+use core::cell::RefCell;
 use core::fmt::Write;
 
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use hadris_fat::sync::read::FileReader;
 use hadris_fat::sync::write::FileWriter;
-use hadris_fat::sync::{DirectoryEntry, FatDir};
+use hadris_fat::sync::{DirectoryEntry, FatDir, FatVolume};
 use hadris_fat::{FatVolumeReadExt, FatVolumeWriteExt};
 
 use crate::arch::mmu::{self, USER_BASE, USER_STACK_TOP};
@@ -42,12 +44,20 @@ enum FileDescriptor {
     /// An open file, read-only.
     File(FileReader<'static, BlkIo>),
     /// An open file, write-only (`abi::O_WRONLY`) -- created fresh or truncated to empty at open
-    /// time (`open`'s own doc comment); `close` is what commits its final size to disk
-    /// (`FileWriter::finish`'s own contract), so a program that never calls it, or that faults
-    /// before doing so, leaves the entry's size wrong even though the bytes it did write already
-    /// reached disk. A known, deliberate gap -- no process model exists yet to guarantee cleanup
-    /// runs on every exit path the way a real OS's `close`-on-exit would.
-    FileWrite(FileWriter<'static, BlkIo>),
+    /// time (`open`'s own doc comment), or opened positioned at its current end for `>>`
+    /// (`open_for_write`). `Rc<RefCell<_>>`, not owned outright, so `bind_stdio`'s `Dup` (`>&`)
+    /// can give a second fd the *same* writer (`hadris_fat`'s `FileWriter` allows only one per
+    /// directory entry, so two independently-opened writers against the same path would be
+    /// rejected outright) rather than a plain index onto the first -- that would leave the second
+    /// fd broken the moment the first is closed, which a real `dup`'d fd never is: each of the
+    /// two clones owns the writer independently, so either can be closed first, in any order,
+    /// with the other still fully working. `close` finishes it -- via `Rc::try_unwrap`, only once
+    /// every clone (both closed, or `end_launch` reclaiming any left open at program exit) has let
+    /// go, not on the first -- committing its final size to disk (`FileWriter::finish`'s own
+    /// contract); a program that never calls `close` on it, or that faults first, still gets this
+    /// from `end_launch`, so a redirected stdout/stderr is never left with the wrong size for the
+    /// next reader (a pipeline stage, or a later `cat`) to find.
+    FileWrite(Rc<RefCell<FileWriter<'static, BlkIo>>>),
     /// An open directory: `names` captured whole when it was opened (unlike a file, FAT gives no
     /// way to resume a directory walk at an arbitrary byte offset), `next` is how many `getdents`
     /// has already returned.
@@ -97,12 +107,24 @@ pub fn reset_for_launch() {
     table[2] = Some(FileDescriptor::Console);
 }
 
-/// Drops every fd the program that just ended still had open. Cleanup, not a save -- nothing an
-/// open file buffers in memory is written out (moot today, read-only; matters once `open` supports
-/// writing). Called from `exec::process::enter`, right after the program returns control (`exit`,
-/// or a caught fault), on every path.
+/// Drops every fd the program that just ended still had open. Called from
+/// `exec::process::enter`, right after the program returns control (`exit`, or a caught fault),
+/// on every path. Finishes any `FileWrite` found along the way rather than bare-dropping it --
+/// the program's own `close` normally does this (`FileWrite`'s own doc comment), but a program
+/// that never calls it, or that faults first, would otherwise leave its redirected stdout/stderr
+/// committed with the wrong size for whatever reads it next (a pipeline's next stage, or a later
+/// `cat`) to find. Two fds can hold clones of the same `FileWrite` (`bind_stdio`'s `Dup`), so
+/// `Rc::try_unwrap` only finishes it once the *last* clone is reclaimed -- if another is still
+/// in an earlier or later slot of the same table, this leaves it be, and that slot's own turn
+/// through this loop finishes it instead once it, in turn, is the last one left.
 pub fn end_launch() {
-    *table() = [const { None }; MAX_FDS];
+    for slot in table().iter_mut() {
+        if let Some(FileDescriptor::FileWrite(writer)) = slot.take()
+            && let Ok(writer) = Rc::try_unwrap(writer)
+        {
+            let _ = writer.into_inner().finish();
+        }
+    }
 }
 
 impl FileDescriptor {
@@ -125,7 +147,10 @@ impl FileDescriptor {
                 let _ = uart.write_str(text);
                 bytes.len() as isize
             }
-            Self::FileWrite(writer) => writer.write(bytes).map_or(EBADF, |n| n as isize),
+            Self::FileWrite(writer) => writer
+                .borrow_mut()
+                .write(bytes)
+                .map_or(EBADF, |n| n as isize),
             Self::Keyboard | Self::File(_) | Self::Dir { .. } => EBADF,
         }
     }
@@ -242,6 +267,104 @@ pub fn getdents(fd: usize, ptr: usize, len: usize) -> isize {
     }
 }
 
+/// Opens `path` (already absolute) for reading -- an ordinary file only, never a directory (a
+/// redirected stdin can't be one either). Shared by `open`'s `O_RDONLY` path, `bind_stdio`'s
+/// `In`, and `shell`'s own standalone redirect application (`cd`/an empty-argv segment).
+pub(crate) fn open_for_read(
+    vol: &'static FatVolume<BlkIo>,
+    path: &str,
+) -> Result<FileReader<'static, BlkIo>, ()> {
+    let entry = fs::path::resolve(vol, path).map_err(|_| ())?;
+    vol.read_file(&entry).map_err(|_| ())
+}
+
+/// Opens `path` (already absolute) for writing: creates it if missing, or truncates it to empty
+/// unless `append` -- in which case an existing file is instead opened positioned at its current
+/// end (`FileWriter::new_append`, not wrapped by `FatVolumeWriteExt`'s own convenience method,
+/// which is always create-or-truncate; a missing file with `append` set is still created fresh,
+/// since there is nothing yet to append to). A directory at `path` is refused either way. Shared
+/// by `open`'s `O_WRONLY` path (never `append`, since nothing exposes that flag yet),
+/// `bind_stdio`'s `Out`, and `shell`'s own standalone redirect application (`cd`/an empty-argv
+/// segment).
+pub(crate) fn open_for_write(
+    vol: &'static FatVolume<BlkIo>,
+    path: &str,
+    append: bool,
+) -> Result<FileWriter<'static, BlkIo>, ()> {
+    let (parent, leaf) = fs::path::split(vol, path).map_err(|_| ())?;
+    let entry = match fs::path::find_entry(&parent, leaf) {
+        Some(entry) if entry.is_directory() => return Err(()),
+        Some(entry) => entry,
+        None => vol.create_file(&parent, leaf).map_err(|_| ())?,
+    };
+    if append {
+        FileWriter::new_append(vol, &entry).map_err(|_| ())
+    } else {
+        vol.write_file(&entry).map_err(|_| ())
+    }
+}
+
+/// One redirection to apply to a program's stdio before it starts -- built by `shell`'s own
+/// launch code from `shell::syntax::Redirection`, with the fd it binds carried separately (the
+/// array position in `bind_stdio`'s own parameter), not stored here.
+pub enum StdioRedirect {
+    In(String),
+    Out {
+        path: String,
+        append: bool,
+    },
+    /// Make this fd a second owner of whatever `target` (1 or 2) already names (`>&`) -- see
+    /// `bind_stdio`'s own handling of this case, and `FileDescriptor::FileWrite`'s doc comment
+    /// for why that's a clone, not an index onto `target`.
+    Dup(u8),
+}
+
+/// Binds `overrides[i]`, when present, onto fd `i` for `i` in `0..3` -- called by
+/// `exec::process::run_program` right after `reset_for_launch()` and before `enter()`, so a
+/// redirected program's very first `read`/`write` already sees the right fd. Processed in array
+/// order (0, then 1, then 2) regardless of which redirection the shell line actually wrote first
+/// -- building `overrides` from a `Segment`'s redirections already collapses that ordering (a
+/// later redirection of the same fd simply overwrites an earlier one in the same array slot), so
+/// a `Dup` at index 2 sees whatever index 1 was *already* set to by this same call, not
+/// necessarily what fd 1 held before this line ran. This is a known, intentionally accepted
+/// divergence from a real shell's snapshot-at-the-time semantics for the less common
+/// `cmd 2>&1 > f` ordering (a real shell leaves fd 2 on the original target; this always ends up
+/// cloning fd 1 onto `f` instead, the same as `cmd > f 2>&1`) -- not fixed here, since it needs
+/// tracking *when* each redirection was written, which nothing before this point keeps.
+///
+/// `Dup`'s target must already be `Console`, `Keyboard`, or `FileWrite` by the time this runs --
+/// the only things `In`/`Out`/a fresh launch's own reset ever put at fd 1/2 -- so this itself
+/// never opens anything for it, only clones whichever of those `overrides[target]`'s own
+/// processing (if any) already left in place, or the slot's `reset_for_launch` default otherwise.
+///
+/// `Err` (already reported by the caller) if any `In`/`Out` fails to resolve or open, or a `Dup`'s
+/// target doesn't hold one of the three expected kinds; nothing already bound earlier in the same
+/// call is undone, since the caller never launches the program at all on `Err`.
+pub fn bind_stdio(overrides: [Option<StdioRedirect>; 3]) -> Result<(), ()> {
+    let vol = fs::volume::get(0).ok_or(())?;
+    for (fd, redirect) in overrides.into_iter().enumerate() {
+        let Some(redirect) = redirect else { continue };
+        let descriptor = match redirect {
+            StdioRedirect::In(path) => {
+                FileDescriptor::File(open_for_read(vol, &fs::cwd::absolute(&path))?)
+            }
+            StdioRedirect::Out { path, append } => FileDescriptor::FileWrite(Rc::new(
+                RefCell::new(open_for_write(vol, &fs::cwd::absolute(&path), append)?),
+            )),
+            StdioRedirect::Dup(target) => match table().get(target as usize) {
+                Some(Some(FileDescriptor::Console)) => FileDescriptor::Console,
+                Some(Some(FileDescriptor::Keyboard)) => FileDescriptor::Keyboard,
+                Some(Some(FileDescriptor::FileWrite(writer))) => {
+                    FileDescriptor::FileWrite(writer.clone())
+                }
+                _ => return Err(()),
+            },
+        };
+        table()[fd] = Some(descriptor);
+    }
+    Ok(())
+}
+
 /// Opens the file or directory at the user-space path `ptr`/`len` (resolved against the working
 /// directory first, `fs::cwd::absolute`) on `system.img` (blk0 -- no path/mount resolution across
 /// volumes yet, see `fs::path`'s own doc comment), returning the lowest free fd number (never one
@@ -274,23 +397,10 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
     };
 
     let descriptor = if flags == O_WRONLY {
-        let Ok((parent, leaf)) = fs::path::split(vol, &path) else {
+        let Ok(writer) = open_for_write(vol, &path, false) else {
             return EBADF;
         };
-        let entry = match fs::path::find_entry(&parent, leaf) {
-            Some(entry) if entry.is_directory() => return EBADF,
-            Some(entry) => entry,
-            None => {
-                let Ok(entry) = vol.create_file(&parent, leaf) else {
-                    return EBADF;
-                };
-                entry
-            }
-        };
-        let Ok(writer) = vol.write_file(&entry) else {
-            return EBADF;
-        };
-        FileDescriptor::FileWrite(writer)
+        FileDescriptor::FileWrite(Rc::new(RefCell::new(writer)))
     } else if let Ok(dir) = fs::path::resolve_dir(vol, &path) {
         // Tried first: a path through directories only (the empty/root path included) opens for
         // `getdents`. If it fails, the same path is tried as an ordinary file below --
@@ -324,16 +434,21 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
     fd as isize
 }
 
-/// Closes `fd`: the slot is emptied, dropping whatever it held. For a `FileWrite`, this is also
-/// what commits its final size to disk (`FileWriter::finish`), so a failure here is a failed
-/// write, not just bookkeeping. `-1` for an already-closed or never-opened fd, or a `finish` that
-/// failed; closing a standard fd (0/1/2) is allowed, same as a real `close` -- it's just gone for
-/// the rest of this program's run.
+/// Closes `fd`: the slot is emptied, dropping whatever it held. For a `FileWrite`, this also
+/// commits its final size to disk (`FileWriter::finish`) -- but only once every fd sharing it
+/// (`bind_stdio`'s `Dup`) has been closed, this one included; while another still holds it, this
+/// just lets go of *this* fd's own clone, leaving the other fully usable (`FileDescriptor::
+/// FileWrite`'s own doc comment). `-1` for an already-closed or never-opened fd, or a `finish`
+/// that failed; closing a standard fd (0/1/2) is allowed, same as a real `close` -- it's just
+/// gone for the rest of this program's run.
 pub fn close(fd: usize) -> isize {
     match table().get_mut(fd).and_then(Option::take) {
-        Some(FileDescriptor::FileWrite(writer)) => match writer.finish() {
-            Ok(()) => 0,
-            Err(_) => EBADF,
+        Some(FileDescriptor::FileWrite(writer)) => match Rc::try_unwrap(writer) {
+            Ok(writer) => match writer.into_inner().finish() {
+                Ok(()) => 0,
+                Err(_) => EBADF,
+            },
+            Err(_) => 0, // another fd still shares it; that one's own close finishes it
         },
         Some(_) => 0,
         None => EBADF,
