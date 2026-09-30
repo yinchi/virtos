@@ -11,6 +11,9 @@ use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
 
+const USAGE: &str = "wc [file...]";
+const FLAGS: &[(&str, &str)] = &[];
+
 /// `(lines, words, bytes)`. Lines are counted by `\n` bytes -- not `head`/`tail`'s notion of
 /// "lines", which also counts a final unterminated one; a real `wc` doesn't. Words are maximal
 /// runs of non-whitespace bytes.
@@ -33,7 +36,13 @@ fn counts(data: &[u8]) -> (usize, usize, usize) {
 }
 
 fn run(args: Args) -> ExitCode {
-    let paths: Vec<&str> = args.skip(1).collect();
+    let mut paths: Vec<&str> = Vec::new();
+    for arg in args.skip(1) {
+        if arg == "--help" {
+            return progs::help(USAGE, FLAGS);
+        }
+        paths.push(arg);
+    }
     if paths.is_empty() {
         userlib::write(2, b"wc: missing file operand\n");
         return ExitCode(1);

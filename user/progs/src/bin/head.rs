@@ -7,6 +7,8 @@ use userlib::{Args, ExitCode};
 userlib::entry_with_args!(run);
 
 const DEFAULT_LINES: usize = 10;
+const USAGE: &str = "head [-n N] [file...]";
+const FLAGS: &[(&str, &str)] = &[("-n N, --lines N", "print the first N lines (default 10)")];
 
 /// The first `n` lines of `data` -- up through and including the `n`th `\n`, or the whole slice if
 /// it has fewer than `n` newlines at all (matches a real `head`: a short file just prints whole).
@@ -28,7 +30,7 @@ fn head_lines(data: &[u8], n: usize) -> &[u8] {
 }
 
 fn run(args: Args) -> ExitCode {
-    let (n, paths) = match progs::cli::line_count("head", args, DEFAULT_LINES) {
+    let (n, paths) = match progs::cli::line_count("head", USAGE, FLAGS, args, DEFAULT_LINES) {
         Ok(v) => v,
         Err(status) => return status,
     };

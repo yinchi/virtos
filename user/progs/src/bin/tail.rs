@@ -7,6 +7,8 @@ use userlib::{Args, ExitCode};
 userlib::entry_with_args!(run);
 
 const DEFAULT_LINES: usize = 10;
+const USAGE: &str = "tail [-n N] [file...]";
+const FLAGS: &[(&str, &str)] = &[("-n N, --lines N", "print the last N lines (default 10)")];
 
 /// The number of lines in `data`: one per `\n`, plus one more if the last byte isn't one (an
 /// unterminated final line still counts).
@@ -37,7 +39,7 @@ fn tail_lines(data: &[u8], n: usize) -> &[u8] {
 }
 
 fn run(args: Args) -> ExitCode {
-    let (n, paths) = match progs::cli::line_count("tail", args, DEFAULT_LINES) {
+    let (n, paths) = match progs::cli::line_count("tail", USAGE, FLAGS, args, DEFAULT_LINES) {
         Ok(v) => v,
         Err(status) => return status,
     };

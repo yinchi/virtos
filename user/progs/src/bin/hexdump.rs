@@ -19,6 +19,8 @@ const ROW: usize = 16;
 /// Width of the hex column for a full row: 16 `"xx "` triples, plus one extra space at the
 /// midpoint -- a short final row is padded out to this so the `|ASCII|` column still lines up.
 const HEX_COLUMN_WIDTH: usize = ROW * 3 + 1;
+const USAGE: &str = "hexdump [file...]";
+const FLAGS: &[(&str, &str)] = &[];
 
 fn dump(data: &[u8]) {
     for (row_index, chunk) in data.chunks(ROW).enumerate() {
@@ -46,6 +48,9 @@ fn run(args: Args) -> ExitCode {
     let mut any = false;
     let mut ok = true;
     for path in args.skip(1) {
+        if path == "--help" {
+            return progs::help(USAGE, FLAGS);
+        }
         any = true;
         let Some(data) = progs::read_file(path) else {
             userlib::write(2, b"hexdump: ");

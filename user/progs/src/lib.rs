@@ -9,8 +9,9 @@ extern crate alloc;
 
 pub mod cli;
 
+use alloc::format;
 use alloc::vec::Vec;
-use userlib::O_RDONLY;
+use userlib::{ExitCode, O_RDONLY};
 
 /// Reads the file at `path` into a freshly allocated `Vec<u8>`. `None` if it can't be opened.
 /// Simplicity over streaming efficiency: fine for this project's small test files, revisit if a
@@ -32,4 +33,17 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
     }
     userlib::close(fd);
     Some(data)
+}
+
+/// Prints a `--help` synopsis to stdout: `usage: <usage>`, then one `  <flag>  <description>` line
+/// per entry in `flags`, and exits `0` -- every program checks for `--help` before anything else in
+/// its own argument handling and returns this directly. `-h` is deliberately not an alias: like GNU
+/// coreutils' own `--help`, this is long-form only, since `-h` already means something else in some
+/// programs this project will eventually have (`ls -h`, `cp -h`).
+pub fn help(usage: &str, flags: &[(&str, &str)]) -> ExitCode {
+    userlib::write(1, format!("usage: {usage}\n").as_bytes());
+    for (flag, desc) in flags {
+        userlib::write(1, format!("  {flag}  {desc}\n").as_bytes());
+    }
+    ExitCode(0)
 }

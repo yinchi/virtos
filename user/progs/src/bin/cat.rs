@@ -12,11 +12,16 @@ userlib::entry_with_args!(run);
 /// Read in fixed chunks off the stack -- no reason to reach for the heap just to copy bytes
 /// through unmodified.
 const BUF_SIZE: usize = 512;
+const USAGE: &str = "cat [file...]";
+const FLAGS: &[(&str, &str)] = &[];
 
 fn run(args: Args) -> ExitCode {
     let mut any = false;
     let mut ok = true;
     for path in args.skip(1) {
+        if path == "--help" {
+            return progs::help(USAGE, FLAGS);
+        }
         any = true;
         let fd = userlib::open(path, O_RDONLY);
         if fd < 0 {

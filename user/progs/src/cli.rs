@@ -25,13 +25,14 @@ fn report(prog: &str, msg: &str) {
 
 /// Parses `head`/`tail`'s shared shape: an optional `-n`/`--lines COUNT` (attached or separate,
 /// `-n5`/`-n 5`/`--lines=5`/`--lines 5` all work -- `getargs` handles that uniformly), defaulting
-/// to `default` if absent, followed by the remaining positional arguments (the file list). Prints
-/// a GNU-worded error to stderr and returns the exit status to use (always `1`) on an unrecognized
-/// flag, a `-n`/`--lines` with no value, or a value that isn't a valid count -- already reported,
-/// so the caller only needs to propagate it, the same shape the reference lab's own `cli::status`
-/// gives its callers.
+/// to `default` if absent, followed by the remaining positional arguments (the file list). `Err` is
+/// the exit status to return, already reported (or, for `--help`, already printed to stdout via
+/// `progs::help(usage, flags)`, exit `0`) -- the caller only needs to propagate it, the same shape
+/// the reference lab's own `cli::status` gives its callers.
 pub fn line_count(
     prog: &str,
+    usage: &str,
+    flags: &[(&str, &str)],
     args: Args,
     default: usize,
 ) -> Result<(usize, Vec<&'static str>), ExitCode> {
@@ -39,6 +40,7 @@ pub fn line_count(
     let mut count = default;
     loop {
         match opts.next_opt() {
+            Ok(Some(Opt::Long("help"))) => return Err(crate::help(usage, flags)),
             Ok(Some(Opt::Short('n') | Opt::Long("lines"))) => {
                 let Ok(value) = opts.value() else {
                     report(prog, "option requires an argument -- 'n'");
