@@ -1,20 +1,40 @@
-//! A minimal, kernel-side line-reading REPL: type a name, press Enter, run it. A stopgap for
-//! `plans/USERSPACE_PLAN.md`'s step 6 -- no pipelines -- living at EL1 (`crate::shell`, the same
-//! place the lab's own, later, real shell lives) specifically so it needs neither `userlib` nor
-//! argv/envp to exist first. Gets replaced outright by step 9's PEG-grammar shell, not grown into
-//! one in place. `cd` is its one builtin (`fs::cwd`'s own doc comment explains why it has to be):
+//! A kernel-side line-reading REPL: type a name, press Enter, run it. Living at EL1
+//! (`crate::shell`, the same place the lab's own real shell lives) specifically so it needs
+//! neither `userlib` nor argv/envp to exist first. `lexer`/`syntax` give it a real grammar --
+//! quoting, escaping, pipes, redirection -- but `run` (below) only *executes* a single command
+//! with no redirection for now; a pipeline or a redirection parses correctly but is reported as
+//! not yet supported rather than run, one build-order step at a time (`plans/USERSPACE_PLAN.md`'s
+//! step 10). `cd` is its one builtin (`fs::cwd`'s own doc comment explains why it has to be):
 //! everything else is looked up under `usr/bin/` and run as a real EL0 program.
+//!
+//! `lexer`/`syntax` are pure logic, no hardware dependency: built and host-tested under both
+//! targets, like `fs::sector`/`exec::elfparse`. Everything below them touches the console,
+//! keyboard, or filesystem, so it's bare-metal-only, like `exec::process`.
 
+mod lexer;
+mod syntax;
+
+#[cfg(target_os = "none")]
 use crate::console::{self, DEFAULT_BG as BG, DEFAULT_FG as FG};
+#[cfg(target_os = "none")]
 use crate::drivers::virtio::{gpu, input};
+#[cfg(target_os = "none")]
 use crate::exec;
+#[cfg(target_os = "none")]
 use crate::fs;
+#[cfg(target_os = "none")]
 use crate::keyboard;
+#[cfg(target_os = "none")]
 use alloc::format;
+#[cfg(target_os = "none")]
 use alloc::string::String;
+#[cfg(target_os = "none")]
 use alloc::vec::Vec;
+#[cfg(target_os = "none")]
 use arm_pl011_uart::Uart;
+#[cfg(target_os = "none")]
 use core::fmt::Write;
+#[cfg(target_os = "none")]
 use hadris_fat::FatVolumeReadExt;
 
 /// Prints `msg` to both UART and the console -- so a typo'd command is visible on screen, not
@@ -23,6 +43,7 @@ use hadris_fat::FatVolumeReadExt;
 /// instant it's needed: `run` (this function's only caller) calls this again right after
 /// `run_program`, whose EL0 program may itself have called `console::get()` via `syscall::fd`'s
 /// `write` -- holding a `&mut Console` across that call would alias with it.
+#[cfg(target_os = "none")]
 fn report(uart: &mut Uart, msg: &str) {
     writeln!(uart, "{msg}").ok();
     if let Some(console) = console::get() {
@@ -37,8 +58,9 @@ fn report(uart: &mut Uart, msg: &str) {
 /// visible to the shell that launched it (real Unix's `cd` is a shell builtin for exactly this
 /// reason), and there's only one working directory to begin with here -- the shell's own, since
 /// at most one program is ever resident (`fs::cwd`'s own doc comment).
-fn cd(uart: &mut Uart, argv: &[&str]) {
-    let target = argv.get(1).copied().unwrap_or("/");
+#[cfg(target_os = "none")]
+fn cd(uart: &mut Uart, argv: &[String]) {
+    let target = argv.get(1).map_or("/", String::as_str);
     let Some(vol) = fs::volume::get(0) else {
         report(uart, "system.img not mounted");
         return;
@@ -51,20 +73,64 @@ fn cd(uart: &mut Uart, argv: &[&str]) {
     fs::cwd::set(absolute);
 }
 
-/// `cd`, or looks up `usr/bin/<argv[0]>` on `system.img` (blk0) and runs it at EL0 to completion,
-/// passing `line` split on whitespace as its `argv` (no quoting/escaping -- that's the real
-/// shell's job, step 9) and an empty environment (nothing produces real environment variables
-/// yet). Any failure -- not mounted, not found, bad ELF, argv too large -- is reported and
-/// swallowed; one bad command shouldn't take the REPL down with it.
-///
-/// # Panics
-/// If `line` is empty or all whitespace -- callers must check `!line.trim().is_empty()` first.
+/// Describes a `syntax::SyntaxError` for `report` -- never called with `EmptyCommand`, which
+/// `run` (this function's only caller) already treats as "nothing to do" before reaching here.
+#[cfg(target_os = "none")]
+fn describe_syntax_error(err: syntax::SyntaxError) -> String {
+    match err {
+        syntax::SyntaxError::Lex(lexer::LexError::Unterminated(what)) => {
+            format!("unterminated {what}")
+        }
+        syntax::SyntaxError::Lex(lexer::LexError::Unsupported(op)) => {
+            format!("'{op}' is not supported yet")
+        }
+        syntax::SyntaxError::MissingTarget(op) => {
+            format!("no file name after '{op}'")
+        }
+        syntax::SyntaxError::BadDupTarget => "a '>&' target must be 1 or 2".into(),
+        syntax::SyntaxError::EmptyCommand => {
+            unreachable!("run() handles this before calling describe_syntax_error")
+        }
+    }
+}
+
+/// Lexes and parses `line` (`syntax::parse`), then either runs it or reports why it can't be,
+/// yet. A blank or comment-only line (`SyntaxError::EmptyCommand`) is silently ignored, matching
+/// a real shell's own response to pressing Enter on nothing; every other parse failure is
+/// reported the same way a failed launch already is. `cd` stays a builtin; anything else looks
+/// up `usr/bin/<argv[0]>` on `system.img` (blk0) and runs it at EL0 to completion, with an empty
+/// environment (nothing produces real environment variables yet). More than one pipeline segment,
+/// or any redirection at all, is reported as not yet supported rather than partially executed --
+/// see `plans/USERSPACE_PLAN.md`'s step 10. Any other failure -- not mounted, not found, bad ELF,
+/// argv too large -- is reported and swallowed; one bad command shouldn't take the REPL down.
+#[cfg(target_os = "none")]
 fn run(uart: &mut Uart, line: &str) {
-    let argv: Vec<&str> = line.split_whitespace().collect();
-    let name = argv[0];
+    let pipeline = match syntax::parse(line) {
+        Ok(pipeline) => pipeline,
+        Err(syntax::SyntaxError::EmptyCommand) => return,
+        Err(e) => {
+            report(uart, &describe_syntax_error(e));
+            return;
+        }
+    };
+
+    if pipeline.len() > 1 {
+        report(uart, "pipes are not supported yet");
+        return;
+    }
+    // `pipeline` always has at least one segment -- `syntax::parse` never returns an empty one
+    // (a pipeline with nothing in it is `SyntaxError::EmptyCommand`, handled above).
+    let segment = &pipeline[0];
+    if !segment.redirs.is_empty() {
+        report(uart, "redirection is not supported yet");
+        return;
+    }
+
+    let argv = &segment.argv;
+    let name = argv[0].as_str();
 
     if name == "cd" {
-        cd(uart, &argv);
+        cd(uart, argv);
         return;
     }
 
@@ -86,7 +152,8 @@ fn run(uart: &mut Uart, line: &str) {
         return;
     };
 
-    if let Err(e) = exec::process::run_program(&program, &argv, &[]) {
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    if let Err(e) = exec::process::run_program(&program, &argv_refs, &[]) {
         report(uart, &format!("{name}: {e:?}"));
     }
 }
@@ -99,6 +166,7 @@ fn run(uart: &mut Uart, line: &str) {
 /// Requires a console, GPU and keyboard to all be present -- without a display there's nothing
 /// to run an interactive shell on, so this idles forever instead (`main.rs`'s own prior
 /// behavior for the "no display" case).
+#[cfg(target_os = "none")]
 pub fn run_forever(uart: &mut Uart) -> ! {
     if console::get().is_none() || gpu::get().is_none() || input::get().is_none() {
         writeln!(uart, "No virtio-gpu or virtio-keyboard device found").ok();

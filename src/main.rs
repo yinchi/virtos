@@ -16,18 +16,18 @@ mod arch;
 #[cfg(target_os = "none")]
 mod drivers;
 #[cfg(target_os = "none")]
-mod shell;
-#[cfg(target_os = "none")]
 mod syscall;
 
 // Pure logic, no hardware dependency: builds and runs under both targets.
 mod console;
 mod keyboard;
 
-// Mixed: each has a pure part (`fs::sector`, `exec::elfparse`) and a hardware-only part
-// (`fs::blkio`, `exec::elf`/`exec::process`) -- see their own `mod.rs` for the split.
+// Mixed: each has a pure part (`fs::sector`, `exec::elfparse`, `shell::lexer`/`shell::syntax`) and
+// a hardware-only part (`fs::blkio`, `exec::elf`/`exec::process`, `shell::run`/`run_forever`) --
+// see their own `mod.rs` for the split.
 mod exec;
 mod fs;
+mod shell;
 
 // `pub(crate)` (not private) so `syscall::sync_el0_handler`'s fault path can grab a UART via
 // `bare_metal::get_uart` too, the same way `panic` and `unexpected_exception` below do.
