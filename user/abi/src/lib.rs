@@ -8,14 +8,27 @@
 /// own, not verified against Linux's).
 pub const SYS_OPEN: usize = 56; // Linux's `openat`, but plain-path: no dirfd, no relative-path base
 pub const SYS_CLOSE: usize = 57;
+pub const SYS_GETDENTS: usize = 61; // Linux's `getdents64`
 pub const SYS_READ: usize = 63;
 pub const SYS_WRITE: usize = 64;
 pub const SYS_EXIT: usize = 93;
 pub const SYS_REBOOT: usize = 142;
 
 /// `open`'s `flags` -- Linux's real value for `O_RDONLY` (the only mode accepted so far; writing
-/// a file is a later step, see `plans/USERSPACE_PLAN.md`'s build order).
+/// a file is a later step, see `plans/USERSPACE_PLAN.md`'s build order). Also what opens a
+/// directory, for `getdents`.
 pub const O_RDONLY: usize = 0;
+
+/// Longest name one directory entry can carry -- FAT's own long-filename limit, not a number this
+/// project picked itself.
+pub const NAME_MAX: usize = 255;
+
+/// Size of one record `getdents` fills in: a `name_len: u8`, then `NAME_MAX` bytes of name,
+/// NUL-padded. No size or attribute fields yet -- nothing reads a directory listing for anything
+/// but names so far (`ls` takes no flags yet); grow this the same way `-n` was added to `head`/
+/// `tail`, once a flag that actually needs one (`ls -l`'s size, `-F`'s directory bit) is being
+/// built, not ahead of that.
+pub const DIRENT_SIZE: usize = 1 + NAME_MAX;
 
 /// Not a real Linux syscall -- Linux clears a terminal through an `ioctl` a userspace tool
 /// interprets itself (writing ANSI escapes), and this project has no generic `ioctl` mechanism yet

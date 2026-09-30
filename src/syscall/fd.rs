@@ -1,4 +1,4 @@
-//! File descriptor dispatch for `open`/`close`/`read`/`write`. One fd table, not one per program:
+//! File descriptor dispatch for `open`/`close`/`read`/`write`/`getdents`. One fd table, not one per program:
 //! at most one program is ever resident (see `arch/mmu.rs`'s reasoning), so `reset_for_launch`
 //! simply refills it with the three standard entries before each launch, and `end_launch` empties
 //! it again once that program exits or faults. `0`/`1`/`2` are always `Keyboard`/`Console`/
@@ -8,8 +8,11 @@
 
 use core::fmt::Write;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use hadris_fat::FatVolumeReadExt;
 use hadris_fat::sync::read::FileReader;
+use hadris_fat::sync::{DirectoryEntry, FatDir};
 
 use crate::arch::mmu::{self, USER_BASE, USER_STACK_TOP};
 use crate::console;
@@ -17,7 +20,7 @@ use crate::drivers::virtio::gpu;
 use crate::fs;
 use crate::fs::blkio::BlkIo;
 use crate::keyboard::queue;
-use abi::O_RDONLY;
+use abi::{DIRENT_SIZE, NAME_MAX, O_RDONLY};
 
 /// This project's own error convention so far -- a negative value, not yet the real negated-errno
 /// convention `plans/USERSPACE_PLAN.md` settles on for the full syscall set (no `errno` constants
@@ -34,6 +37,32 @@ enum FileDescriptor {
     Console,
     /// An open file, read-only -- no write support yet (`abi::O_RDONLY`'s own doc comment).
     File(FileReader<'static, BlkIo>),
+    /// An open directory: `names` captured whole when it was opened (unlike a file, FAT gives no
+    /// way to resume a directory walk at an arbitrary byte offset), `next` is how many `getdents`
+    /// has already returned.
+    Dir {
+        names: Vec<String>,
+        next: usize,
+    },
+}
+
+/// Snapshots `dir`'s entries into plain names for `getdents`, skipping `.`/`..` (real subdirectory
+/// entries, unlike the root, which has neither) and any volume-label entry -- neither is a name a
+/// program should ever see listed.
+fn list_dir(dir: &FatDir<'static, BlkIo>) -> Vec<String> {
+    let mut names = Vec::new();
+    for entry in dir.entries() {
+        let DirectoryEntry::Entry(entry) = entry.expect("directory entry read failed");
+        let name = entry.name();
+        if name.as_ref() == "."
+            || name.as_ref() == ".."
+            || entry.attributes().is_volume_label_entry()
+        {
+            continue;
+        }
+        names.push(String::from(name.as_ref()));
+    }
+    names
 }
 
 /// SAFETY (every access, via `table`): single core, and every syscall runs with IRQs masked
@@ -85,7 +114,7 @@ impl FileDescriptor {
                 let _ = uart.write_str(text);
                 bytes.len() as isize
             }
-            Self::Keyboard | Self::File(_) => EBADF,
+            Self::Keyboard | Self::File(_) | Self::Dir { .. } => EBADF,
         }
     }
 
@@ -105,9 +134,34 @@ impl FileDescriptor {
                 }
                 n as isize
             }
-            Self::Console => EBADF,
+            Self::Console | Self::Dir { .. } => EBADF,
             Self::File(reader) => reader.read(buf).map_or(EBADF, |n| n as isize),
         }
+    }
+
+    /// Fills `buf` with as many whole `DIRENT_SIZE` records as fit, picking up where the last call
+    /// left off; `0` once every entry has been returned. Rejected (`EBADF`) for anything but a
+    /// directory, and if `buf` can't even hold one record -- otherwise the `0` that means "buffer
+    /// too small" couldn't be told apart from "listing exhausted".
+    fn getdents(&mut self, buf: &mut [u8]) -> isize {
+        let Self::Dir { names, next } = self else {
+            return EBADF;
+        };
+        if buf.len() < DIRENT_SIZE {
+            return EBADF;
+        }
+        let mut off = 0;
+        while *next < names.len() && off + DIRENT_SIZE <= buf.len() {
+            let name = names[*next].as_bytes();
+            let n = name.len().min(NAME_MAX);
+            let out = &mut buf[off..off + DIRENT_SIZE];
+            out[0] = n as u8;
+            out[1..1 + n].copy_from_slice(&name[..n]);
+            out[1 + n..].fill(0);
+            off += DIRENT_SIZE;
+            *next += 1;
+        }
+        off as isize
     }
 }
 
@@ -150,11 +204,27 @@ pub fn read(fd: usize, ptr: usize, len: usize) -> isize {
     }
 }
 
-/// Opens the file at the user-space path `ptr`/`len` on `system.img` (blk0 -- no path/mount
-/// resolution across volumes yet, see `fs::path`'s own doc comment) for reading, returning the
+/// `getdents` on `fd`, into the user-space buffer `ptr`/`len` -- see `FileDescriptor::getdents`.
+pub fn getdents(fd: usize, ptr: usize, len: usize) -> isize {
+    if !validate(ptr, len) {
+        return EBADF;
+    }
+    // The write below touches a page marked USER, which PAN would otherwise forbid.
+    let _user = mmu::user_access();
+    // SAFETY: as in `write`.
+    let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+    match table().get_mut(fd).and_then(Option::as_mut) {
+        Some(fd) => fd.getdents(buf),
+        None => EBADF,
+    }
+}
+
+/// Opens the file or directory at the user-space path `ptr`/`len` on `system.img` (blk0 -- no
+/// path/mount resolution across volumes yet, see `fs::path`'s own doc comment), returning the
 /// lowest free fd number (never one of the standard three) or `-1`. Only `O_RDONLY` is accepted --
-/// writing a file is a later step. Also `-1` if the path is missing, names a directory (opening
-/// one for `getdents` is a later step too), isn't valid UTF-8, or every fd slot is already in use.
+/// writing a file is a later step. A directory (the root included, for `""`/`"/"`) opens for
+/// `getdents`, not `read`/`write`; a plain file opens for `read` as before. Also `-1` if the path
+/// is missing, isn't valid UTF-8, or every fd slot is already in use.
 pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
     if flags != O_RDONLY {
         return EBADF;
@@ -174,14 +244,25 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
     let Some(vol) = fs::volume::get(0) else {
         return EBADF;
     };
-    let Ok(entry) = fs::path::resolve(vol, path) else {
-        return EBADF;
-    };
-    if entry.is_directory() {
-        return EBADF;
-    }
-    let Ok(reader) = vol.read_file(&entry) else {
-        return EBADF;
+
+    // Tried first: a path through directories only (the empty/root path included) opens for
+    // `getdents`. If it fails, the same path is tried as an ordinary file below -- `resolve_dir`
+    // and `resolve` walk identically up to the last component, so this only succeeds here for a
+    // path `resolve` would otherwise have resolved to a directory entry it doesn't know what to do
+    // with.
+    let descriptor = if let Ok(dir) = fs::path::resolve_dir(vol, path) {
+        FileDescriptor::Dir {
+            names: list_dir(&dir),
+            next: 0,
+        }
+    } else {
+        let Ok(entry) = fs::path::resolve(vol, path) else {
+            return EBADF;
+        };
+        let Ok(reader) = vol.read_file(&entry) else {
+            return EBADF;
+        };
+        FileDescriptor::File(reader)
     };
 
     let table = table();
@@ -193,7 +274,7 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
     else {
         return EBADF;
     };
-    table[fd] = Some(FileDescriptor::File(reader));
+    table[fd] = Some(descriptor);
     fd as isize
 }
 

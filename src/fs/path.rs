@@ -38,3 +38,20 @@ pub fn resolve(vol: &FatVolume<BlkIo>, path: &str) -> Result<FileEntry, ()> {
         dir = dir.open_entry(&entry).map_err(|_| ())?;
     }
 }
+
+/// Resolves `path` to the `FatDir` it names, one component at a time from `vol`'s root -- the root
+/// itself if `path` has no components at all (`""` or `"/"`), unlike `resolve` above, which has no
+/// entry to return for that case. `Err(())` if any component is missing, or any component
+/// (including the last) isn't a directory -- so a path naming an ordinary file always fails here,
+/// not just a path through one.
+pub fn resolve_dir<'a>(vol: &'a FatVolume<BlkIo>, path: &str) -> Result<FatDir<'a, BlkIo>, ()> {
+    let mut dir = vol.root_dir();
+    for name in path.split('/').filter(|c| !c.is_empty()) {
+        let entry = find_entry(&dir, name).ok_or(())?;
+        if !entry.is_directory() {
+            return Err(());
+        }
+        dir = dir.open_entry(&entry).map_err(|_| ())?;
+    }
+    Ok(dir)
+}
