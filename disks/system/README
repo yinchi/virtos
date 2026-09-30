@@ -1,0 +1,3 @@
+This disk is rebuilt from the `disks/system/` directory on the host system every time `just
+system` runs (see `tools/mkimage`) -- nothing written here at runtime survives a rebuild. Anything
+meant to persist across rebuilds belongs on `home.img` (`disks/home_seed/`) instead.

@@ -8,7 +8,6 @@ use crate::console::{self, DEFAULT_BG as BG, DEFAULT_FG as FG};
 use crate::drivers::virtio::{gpu, input};
 use crate::exec;
 use crate::fs;
-use crate::fs::blkio::BlkIo;
 use crate::keyboard;
 use alloc::format;
 use alloc::string::String;
@@ -16,21 +15,6 @@ use alloc::vec::Vec;
 use arm_pl011_uart::Uart;
 use core::fmt::Write;
 use hadris_fat::FatVolumeReadExt;
-use hadris_fat::sync::{DirectoryEntry, FatDir, FileEntry};
-
-/// The entry named `name` directly inside `dir`, if there is one. Case-insensitive, matching
-/// FAT's own short-name semantics. `None` on a miss, never a panic: unlike the boot-time smoke
-/// test this replaces, every name here comes from whatever the user just typed, and a typo is an
-/// ordinary, expected outcome to report -- not a kernel bug.
-fn find_entry(dir: &FatDir<'_, BlkIo>, name: &str) -> Option<FileEntry> {
-    for entry in dir.entries() {
-        let DirectoryEntry::Entry(entry) = entry.expect("directory entry read failed");
-        if entry.name().eq_ignore_ascii_case(name) {
-            return Some(entry);
-        }
-    }
-    None
-}
 
 /// Prints `msg` to both UART and the console -- so a typo'd command is visible on screen, not
 /// only in a UART log the user may not have open (matches `r10_repl`'s own `report`). Fetches the
@@ -62,18 +46,7 @@ fn run(uart: &mut Uart, line: &str) {
         report(uart, "system.img not mounted");
         return;
     };
-    let root = vol.root_dir();
-    let Some(usr) = find_entry(&root, "usr") else {
-        report(uart, "usr/ not found on system.img");
-        return;
-    };
-    let usr_dir = root.open_entry(&usr).expect("failed to open usr");
-    let Some(bin) = find_entry(&usr_dir, "bin") else {
-        report(uart, "usr/bin not found on system.img");
-        return;
-    };
-    let bin_dir = usr_dir.open_entry(&bin).expect("failed to open usr/bin");
-    let Some(entry) = find_entry(&bin_dir, name) else {
+    let Ok(entry) = fs::path::resolve(vol, &format!("usr/bin/{name}")) else {
         report(uart, &format!("{name}: not found"));
         return;
     };

@@ -11,3 +11,8 @@ pub mod blkio;
 /// path/namespace concept; see `volume`'s own doc comment for the layering.
 #[cfg(target_os = "none")]
 pub mod volume;
+
+/// Resolving a `/`-separated path against one volume's root directory -- no mount table, no
+/// working directory yet.
+#[cfg(target_os = "none")]
+pub mod path;

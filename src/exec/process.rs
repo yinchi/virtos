@@ -101,6 +101,10 @@ pub unsafe fn enter(entry: usize, argc: usize, argv: usize, envp: usize) {
         );
     }
 
+    // Back from the program: drop whatever fds it still had open (its `write`/`read`'s own table,
+    // untouched by the longjmp above) before anything else can look at fd numbers again.
+    crate::syscall::fd::end_launch();
+
     // Back from the program (its `exit` or a fault, both taken as exceptions, so IRQs are masked
     // again regardless of what the program itself last had them set to) -- unmask unconditionally
     // so the kernel resumes normal operation, exactly as if this had been an ordinary call.
@@ -204,6 +208,11 @@ pub fn run_program(elf_bytes: &[u8], args: &[&str], env: &[&str]) -> Result<(), 
         // above; nothing else touches it until `enter` below runs the program.
         unsafe { push_strings(USER_STACK_TOP, floor, args, env) }.ok_or(LaunchError::ArgsTooBig)?
     };
+
+    // Last, so nothing above can fail after a program is already considered launched: the standard
+    // three fds, nothing left over from whatever ran before (already dropped by `enter`'s own
+    // `end_launch` call once that program returned).
+    crate::syscall::fd::reset_for_launch();
 
     // SAFETY: `entry` came from `elf::load`, which only ever returns an address inside a segment
     // it just mapped EL0-executable; `argv`/`envp` came from `push_strings`, which wrote them (and
