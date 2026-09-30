@@ -125,19 +125,22 @@ reseed-home:
     mv {{HOME_IMG}} {{HOME_IMG}}.bak
     just seed-home
 
-# Builds every user/* crate's EL0 programs (release) and strips each into
-# disks/system/usr/bin/<name> -- what `mkimage` (`build-mkimage`) marks executable (`ATTR_EXEC`)
-# when `system` below packages it. Each crate directory is built exactly once (a plain
-# `cargo build --release`, no `--bin`, builds every binary target the crate has in one invocation --
-# both `src/main.rs` and any number of `src/bin/*.rs`), then every binary it produced is stripped in
-# turn -- so a crate with several programs (e.g. `user/progs`) isn't rebuilt once per program. A
-# crate with neither layout (`abi`/`userlib`: plain libraries, `src/lib.rs`, no `[[bin]]`) is
-# skipped -- there's nothing to strip. `strip -o` rather than stripping in place: the unstripped
-# binary stays in that crate's own `target/` for a debugger to use, only the copy actually shipped
-# in the image is stripped. No justfile edit needed for a new crate or a new program within one.
+# Starts by wiping disks/system/usr/bin/ rather than just adding to whatever's already there:
+# otherwise a program whose src/bin/*.rs got deleted leaves its old binary behind forever, stale
+# but still shipped in every future image, since nothing else would ever remove it. Each crate
+# directory is built exactly once (a plain `cargo build --release`, no `--bin`, builds every binary
+# target the crate has in one invocation -- both `src/main.rs` and any number of `src/bin/*.rs`),
+# then every binary it produced is stripped in turn -- so a crate with several programs (e.g.
+# `user/progs`) isn't rebuilt once per program. A crate with neither layout (`abi`/`userlib`: plain
+# libraries, `src/lib.rs`, no `[[bin]]`) is skipped -- there's nothing to strip. `strip -o` rather
+# than stripping in place: the unstripped binary stays in that crate's own `target/` for a debugger
+# to use, only the copy actually shipped in the image is stripped. No justfile edit needed for a
+# new crate or a new program within one.
+# Builds every user/* crate's EL0 programs and strips each into disks/system/usr/bin/<name>.
 build-user:
     #!/usr/bin/env bash
     set -euo pipefail
+    rm -rf disks/system/usr/bin
     mkdir -p disks/system/usr/bin
     for crate in user/*/; do
         crate="${crate%/}"
