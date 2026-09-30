@@ -70,11 +70,11 @@ pub const USER_BASE: usize = 0x4400_0000;
 pub const USER_SIZE: usize = 0x0200_0000; // 32 MiB
 
 // The window's layout, from the bottom: the program image (its segments, wherever it links them,
-// page-aligned), a gap, an unmapped guard, then the stack up to the top of the window. Only the
-// pages a program's segments and stack actually need are ever mapped (`exec::elf`) -- the gap
-// after the image (where a heap would grow, once one exists) and the guard stay unmapped, so a
-// stack overflow or a wild pointer into the gap faults instead of silently running into the
-// program's own data.
+// page-aligned), an unmapped gap, the fixed heap (below), an unmapped guard, then the stack up to
+// the top of the window. Only the pages a program's segments/heap/stack actually need are ever
+// mapped (`exec::elf`/`exec::process`) -- the rest of the gap below the heap and the guard above it
+// stay unmapped, so a stack overflow or a wild pointer into either faults instead of silently
+// running into the program's own data.
 /// The stack's size: generous, per the project's own rule of thumb for MiB-scale stacks/buffers.
 pub const USER_STACK_SIZE: usize = 0x0010_0000; // 1 MiB
 /// The unmapped guard below the stack -- larger than any single frame a sane program has, so one
@@ -86,6 +86,22 @@ pub const USER_STACK_TOP: usize = USER_BASE + USER_SIZE;
 pub const USER_STACK_BOTTOM: usize = USER_STACK_TOP - USER_STACK_SIZE;
 /// The highest address (exclusive) a program's own segments may occupy.
 pub const USER_IMAGE_END: usize = USER_STACK_BOTTOM - USER_GUARD_SIZE;
+
+/// The fixed userspace heap: `abi` is the single source of truth for its address/size (`userlib`'s
+/// global allocator needs the exact same numbers, with no syscall to discover them at runtime --
+/// see `plans/USERSPACE_PLAN.md`'s divergence #6), so this just re-derives `USER_HEAP_TOP` and
+/// asserts the result actually fits in the gap between the image and the guard/stack -- a build
+/// failure here means `abi`'s numbers and this module's own layout have drifted apart.
+pub const USER_HEAP_BOTTOM: usize = abi::USER_HEAP_BOTTOM;
+pub const USER_HEAP_TOP: usize = USER_HEAP_BOTTOM + abi::USER_HEAP_SIZE;
+const _: () = assert!(
+    USER_HEAP_BOTTOM >= USER_BASE,
+    "fixed heap starts before the user window"
+);
+const _: () = assert!(
+    USER_HEAP_TOP <= USER_IMAGE_END,
+    "fixed heap doesn't fit before the image end"
+);
 
 /// The page table `enable` builds and activates, and every later `map_device` call extends.
 /// Locked rather than a bare `static mut`: `map_device` only ever needs the table for one

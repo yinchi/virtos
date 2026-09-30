@@ -11,12 +11,7 @@ use arm_sysregs::el1::accessors::{read_esr_el1, read_far_el1};
 use core::fmt::Write;
 
 use crate::exec::process;
-
-// Linux's real aarch64 syscall numbers (see the future `userlib`'s own copy of these same
-// constants for why: borrowed for familiarity, no other Linux-ABI-compatibility claim).
-const SYS_READ: usize = 63;
-const SYS_WRITE: usize = 64;
-const SYS_EXIT: usize = 93;
+use abi::{SYS_EXIT, SYS_READ, SYS_WRITE};
 
 // The ESR_EL1 EC field values this handler decodes -- see `sync_el0_handler` for what each one
 // means here.

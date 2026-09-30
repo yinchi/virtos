@@ -14,7 +14,7 @@ use super::argplan;
 use super::elf;
 use super::elfparse::ElfError;
 use crate::arch::irq;
-use crate::arch::mmu::{self, USER_STACK_BOTTOM, USER_STACK_TOP};
+use crate::arch::mmu::{self, USER_HEAP_BOTTOM, USER_HEAP_TOP, USER_STACK_BOTTOM, USER_STACK_TOP};
 
 /// The most stack a program's initial `argv` and `envp` together (strings plus pointer arrays)
 /// may take -- far more than a typed line and a sensible environment can ever produce, and an
@@ -154,15 +154,31 @@ fn lens(items: &[&str]) -> Vec<usize> {
     items.iter().map(|s| s.len()).collect()
 }
 
-/// Loads `elf_bytes`, gives it a fresh stack with `args` as its `argv` and `env` (`NAME=VALUE`
-/// strings) as its `envp`, and runs it at EL0 to completion, then returns normally -- `elf::load`
-/// maps the program's own segments; this additionally maps its stack, writes `args`/`env` onto it
-/// (`push_strings`), and calls `enter`.
+/// Maps `start..end` read/write (never executable -- `elf::data_attributes`) and zeroes it. Used
+/// for both the stack and the fixed heap: neither gets a segment's "final, more restrictive" pass
+/// the way `elf::load`'s own mappings do, since both stay read/write for as long as the program
+/// runs.
+fn map_and_zero(start: usize, end: usize) -> Result<(), ElfError> {
+    mmu::set_user_pages(start, end, Some(elf::data_attributes()))
+        .map_err(|_| ElfError::MapFailed)?;
+    // The write below touches a page marked USER, which PAN would otherwise forbid -- `elf::load`
+    // took its own guard for the same reason, but that one already dropped when it returned to
+    // this function's caller.
+    let _user = mmu::user_access();
+    // SAFETY: just mapped writable, and nothing else uses this range while a program loads.
+    unsafe { core::ptr::write_bytes(start as *mut u8, 0, end - start) };
+    Ok(())
+}
+
+/// Loads `elf_bytes`, gives it a fresh stack and heap with `args` as its `argv` and `env`
+/// (`NAME=VALUE` strings) as its `envp`, and runs it at EL0 to completion, then returns normally --
+/// `elf::load` maps the program's own segments; this additionally maps its stack and heap, writes
+/// `args`/`env` onto the stack (`push_strings`), and calls `enter`.
 ///
 /// # Errors
 /// Returns `Err` without entering EL0 at all if the ELF is invalid (`LaunchError::Elf`), if
 /// `args`/`env` together don't fit in `ARG_MAX` (`LaunchError::ArgsTooBig`), or if mapping the
-/// stack itself fails (`LaunchError::Elf(ElfError::MapFailed)`).
+/// stack or heap fails (`LaunchError::Elf(ElfError::MapFailed)`).
 pub fn run_program(elf_bytes: &[u8], args: &[&str], env: &[&str]) -> Result<(), LaunchError> {
     let floor = USER_STACK_TOP - ARG_MAX;
 
@@ -171,29 +187,14 @@ pub fn run_program(elf_bytes: &[u8], args: &[&str], env: &[&str]) -> Result<(), 
 
     let entry = elf::load(elf_bytes)?;
 
-    // The stack, mapped and zeroed the same way a segment is while being filled -- see
-    // `elf::data_attributes`. Not locked down afterward the way a segment is: a stack is always
-    // read/write, never executable, for as long as the program runs.
-    mmu::set_user_pages(
-        USER_STACK_BOTTOM,
-        USER_STACK_TOP,
-        Some(elf::data_attributes()),
-    )
-    .map_err(|_| ElfError::MapFailed)?;
-    {
-        // The write below touches a page marked USER, which PAN would otherwise forbid --
-        // `elf::load` took its own guard for the same reason, but that one already dropped when
-        // it returned above.
-        let _user = mmu::user_access();
-        // SAFETY: just mapped writable, and nothing else uses this range while a program loads.
-        unsafe {
-            core::ptr::write_bytes(
-                USER_STACK_BOTTOM as *mut u8,
-                0,
-                USER_STACK_TOP - USER_STACK_BOTTOM,
-            );
-        }
-    }
+    // The stack and the fixed heap, mapped and zeroed the same way a segment is while being
+    // filled -- see `elf::data_attributes`. Neither is locked down afterward the way a segment is:
+    // both are always read/write, never executable, for as long as the program runs. The heap has
+    // nothing in it yet (`userlib`'s allocator starts empty and only ever grows into it), but
+    // zeroing it anyway costs nothing and means a program can never read a previous program's
+    // leftover heap bytes if it somehow reads before writing.
+    map_and_zero(USER_STACK_BOTTOM, USER_STACK_TOP)?;
+    map_and_zero(USER_HEAP_BOTTOM, USER_HEAP_TOP)?;
 
     let (argv, envp) = {
         // The writes inside `push_strings` touch pages marked USER, which PAN would otherwise

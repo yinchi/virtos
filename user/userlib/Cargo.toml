@@ -1,0 +1,22 @@
+[package]
+name = "userlib"
+version = "0.1.0"
+edition = "2024"
+
+# Shared `no_std` runtime for every EL0 binary from here on: `_start`, syscall wrappers, `argv`
+# decoding, `exit`, and a global allocator over a fixed heap -- see this crate's own `src/lib.rs`
+# doc comment. A sibling crate to the kernel, never a Cargo workspace member of it or of the
+# programs that depend on it (see the kernel's own `Cargo.toml`/`tools/mkimage`'s "Repo
+# organization" note in `plans/PORTING.md`): every `user/*` program depends on this one via a path
+# dependency (`userlib = { path = "../userlib" }`), and this crate in turn depends on `abi` the
+# same way. A plain library crate (no `[[bin]]`): `justfile`'s `USER_CRATES` only looks for a
+# `src/main.rs`, so this is never mistaken for a program to build into `disks/system/usr/bin/`.
+
+[dependencies]
+abi = { path = "../abi" }
+linked_list_allocator = "0.10.6"
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

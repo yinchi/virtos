@@ -125,10 +125,14 @@ reseed-home:
     mv {{HOME_IMG}} {{HOME_IMG}}.bak
     just seed-home
 
-# Every `user/*` crate -- one EL0 program per directory, found the same way `OTHER_CRATES` is, so
-# a new one needs no justfile edit. Each wants the kernel's own bare-metal default target (see
-# `OTHER_CRATES`'s comment), inherited from the repo root's `.cargo/config.toml`.
-USER_CRATES := `find user -mindepth 1 -maxdepth 1 -type d 2>/dev/null`
+# Every `user/*` crate that builds an actual EL0 program -- one per `src/main.rs` found, so a new
+# one needs no justfile edit. `abi`/`userlib` are library crates (`src/lib.rs`, no `[[bin]]`) that
+# every program depends on rather than programs themselves, so they're deliberately excluded here
+# -- they'd fail this recipe's `strip` step (no binary to strip) if they weren't -- but still get
+# formatted/linted like any other crate via `OTHER_CRATES` below. Each program wants the kernel's
+# own bare-metal default target (see `OTHER_CRATES`'s comment), inherited from the repo root's
+# `.cargo/config.toml`.
+USER_CRATES := `find user -mindepth 3 -maxdepth 3 -name main.rs 2>/dev/null | sed 's|/src/main\.rs$||'`
 
 # Builds every user/* crate (release) and strips the result into disks/system/usr/bin/<name> --
 # what `mkimage` (`build-mkimage`) marks executable (`ATTR_EXEC`) when `system` below packages it.

@@ -17,6 +17,7 @@ unifont = "1.1.0"
 # needing QEMU. See `just test-host`.
 [target.'cfg(target_os = "none")'.dependencies]
 aarch64-paging = "0.12.1"
+abi = { path = "user/abi" }
 arm-gic = "0.10.0"
 arm-pl011-uart = { version = "0.5.1", features = ["embedded-io"] }
 arm-sysregs = { version = "0.5.1", features = ["el1"] }

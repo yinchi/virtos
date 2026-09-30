@@ -5,12 +5,15 @@ edition = "2024"
 
 # The first real program to consume its own `argv` -- not ported from the reference lab (it never
 # built one as a standalone program; virtos adds it directly to prove `argv`/`envp` end to end with
-# something genuinely useful, not just a throwaway harness). No `userlib` yet
-# (`plans/USERSPACE_PLAN.md`'s step 8) -- just enough inline asm for one syscall, same as `hello`.
+# something genuinely useful, not just a throwaway harness). Built against `userlib`
+# (`plans/USERSPACE_PLAN.md`'s step 8) for `_start`/`write`/`exit`/`argv` decoding.
 # A sibling crate to the kernel, never a Cargo workspace member of it (see the kernel's own
 # `Cargo.toml`/`tools/mkimage`'s "Repo organization" note in `plans/PORTING.md`): it wants the same
 # bare-metal target as the kernel, inherited from the repo root's `.cargo/config.toml`, but its own
 # `link.ld` (in this directory) gives it a completely different load address and layout.
+
+[dependencies]
+userlib = { path = "../userlib" }
 
 [profile.dev]
 panic = "abort"

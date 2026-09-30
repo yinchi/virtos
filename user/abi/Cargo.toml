@@ -1,0 +1,12 @@
+[package]
+name = "abi"
+version = "0.1.0"
+edition = "2024"
+
+# Shared constants between the kernel and every `user/*` binary: syscall numbers and the fixed
+# userspace heap's address (`plans/USERSPACE_PLAN.md`'s divergence #6). A path dependency from
+# both sides (`abi = { path = "../abi" }` from `user/userlib`, `abi = { path = "user/abi" }` from
+# the kernel's own root `Cargo.toml`), never a Cargo workspace member of either -- see the kernel's
+# own `Cargo.toml`/`tools/mkimage`'s "Repo organization" note in `plans/PORTING.md`. A plain library
+# crate (no `[[bin]]`): `justfile`'s `USER_CRATES` only looks for a `src/main.rs`, so this is never
+# mistaken for a program to build into `disks/system/usr/bin/`.

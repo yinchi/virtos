@@ -13,6 +13,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "abi"
+version = "0.1.0"
+
+[[package]]
 name = "arm-gic"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -568,6 +572,7 @@ name = "virtos"
 version = "0.1.0"
 dependencies = [
  "aarch64-paging",
+ "abi",
  "arm-gic",
  "arm-pl011-uart",
  "arm-sysregs",
