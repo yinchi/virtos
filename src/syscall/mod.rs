@@ -1,9 +1,9 @@
 //! `SVC`-based syscalls and the fault path, both reached from `sync_el0_64` (`vectors.s`) via
 //! `sync_el0_handler`.
 //!
-//! `exit`, `read`, `write`, `open`, `close`, `getdents`, `clear` and `reboot` so far. Everything
-//! else still returns `-1` (see `fd`'s own doc comment on why that's not yet a real negated-errno
-//! convention).
+//! `exit`, `read`, `write`, `open`, `close`, `getdents`, `mkdir`, `unlink`, `rename`, `clear` and
+//! `reboot` so far. Everything else still returns `-1` (see `fd`'s own doc comment on why that's
+//! not yet a real negated-errno convention).
 
 pub mod fd;
 mod power;
@@ -13,7 +13,8 @@ use core::fmt::Write;
 
 use crate::exec::process;
 use abi::{
-    SYS_CLEAR, SYS_CLOSE, SYS_EXIT, SYS_GETDENTS, SYS_OPEN, SYS_READ, SYS_REBOOT, SYS_WRITE,
+    SYS_CLEAR, SYS_CLOSE, SYS_EXIT, SYS_GETDENTS, SYS_MKDIRAT, SYS_OPEN, SYS_READ, SYS_REBOOT,
+    SYS_RENAMEAT, SYS_UNLINKAT, SYS_WRITE,
 };
 
 // The ESR_EL1 EC field values this handler decodes -- see `sync_el0_handler` for what each one
@@ -48,13 +49,21 @@ extern "C" fn sync_el0_handler(regs: *mut TrapFrame) {
             // exception stack -- sole access to it here.
             let regs = unsafe { &mut *regs };
             let nr = regs.x[8] as usize; // syscall number
-            let (a0, a1, a2) = (regs.x[0] as usize, regs.x[1] as usize, regs.x[2] as usize);
+            let (a0, a1, a2, a3) = (
+                regs.x[0] as usize,
+                regs.x[1] as usize,
+                regs.x[2] as usize,
+                regs.x[3] as usize,
+            );
             match nr {
                 SYS_READ => regs.x[0] = fd::read(a0, a1, a2) as u64,
                 SYS_WRITE => regs.x[0] = fd::write(a0, a1, a2) as u64,
                 SYS_OPEN => regs.x[0] = fd::open(a0, a1, a2) as u64,
                 SYS_CLOSE => regs.x[0] = fd::close(a0) as u64,
                 SYS_GETDENTS => regs.x[0] = fd::getdents(a0, a1, a2) as u64,
+                SYS_MKDIRAT => regs.x[0] = fd::mkdir(a0, a1) as u64,
+                SYS_UNLINKAT => regs.x[0] = fd::unlink(a0, a1) as u64,
+                SYS_RENAMEAT => regs.x[0] = fd::rename(a0, a1, a2, a3) as u64,
                 SYS_CLEAR => regs.x[0] = fd::clear() as u64,
                 SYS_REBOOT => regs.x[0] = power::reboot(a0) as u64,
                 SYS_EXIT => {

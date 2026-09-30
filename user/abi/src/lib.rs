@@ -6,6 +6,9 @@
 /// Syscall numbers. Linux's real aarch64 numbers -- borrowed for familiarity, no other Linux-ABI-
 /// compatibility claim beyond that (the calling convention and argument order are this project's
 /// own, not verified against Linux's).
+pub const SYS_MKDIRAT: usize = 34; // Linux's `mkdirat`, but plain-path: no dirfd, no mode
+pub const SYS_UNLINKAT: usize = 35; // Linux's `unlinkat`, but plain-path and no `AT_REMOVEDIR`
+pub const SYS_RENAMEAT: usize = 38; // Linux's `renameat`, but plain-path on both sides
 pub const SYS_OPEN: usize = 56; // Linux's `openat`, but plain-path: no dirfd, no relative-path base
 pub const SYS_CLOSE: usize = 57;
 pub const SYS_GETDENTS: usize = 61; // Linux's `getdents64`
@@ -14,10 +17,11 @@ pub const SYS_WRITE: usize = 64;
 pub const SYS_EXIT: usize = 93;
 pub const SYS_REBOOT: usize = 142;
 
-/// `open`'s `flags` -- Linux's real value for `O_RDONLY` (the only mode accepted so far; writing
-/// a file is a later step, see `plans/USERSPACE_PLAN.md`'s build order). Also what opens a
-/// directory, for `getdents`.
+// `open`'s `flags` -- Linux's real values. `O_RDONLY` also opens a directory, for `getdents`.
+// `O_WRONLY` creates the file if it doesn't exist, and always starts it empty (no append mode
+// yet -- nothing needs one until `>>`/`tee -a` do).
 pub const O_RDONLY: usize = 0;
+pub const O_WRONLY: usize = 1;
 
 /// Longest name one directory entry can carry -- FAT's own long-filename limit, not a number this
 /// project picked itself.

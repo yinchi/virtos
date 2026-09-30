@@ -1,18 +1,20 @@
-//! File descriptor dispatch for `open`/`close`/`read`/`write`/`getdents`. One fd table, not one per program:
-//! at most one program is ever resident (see `arch/mmu.rs`'s reasoning), so `reset_for_launch`
-//! simply refills it with the three standard entries before each launch, and `end_launch` empties
-//! it again once that program exits or faults. `0`/`1`/`2` are always `Keyboard`/`Console`/
-//! `Console` right after a reset; everything above them is handed out by `open` and returned by
-//! `close`. No redirection yet (`>`/`<`, `2>&1`), so unlike the mature reference's reference-
-//! counted `FileRef` (several fds sharing one open file), each fd here exclusively owns its own.
+//! File descriptor dispatch for `open`/`close`/`read`/`write`/`getdents`, plus the path-only
+//! (no fd involved) `mkdir`/`unlink`/`rename`. One fd table, not one per program: at most one
+//! program is ever resident (see `arch/mmu.rs`'s reasoning), so `reset_for_launch` simply refills
+//! it with the three standard entries before each launch, and `end_launch` empties it again once
+//! that program exits or faults. `0`/`1`/`2` are always `Keyboard`/`Console`/`Console` right after
+//! a reset; everything above them is handed out by `open` and returned by `close`. No redirection
+//! yet (`>`/`<`, `2>&1`), so unlike the mature reference's reference-counted `FileRef` (several
+//! fds sharing one open file), each fd here exclusively owns its own.
 
 use core::fmt::Write;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use hadris_fat::FatVolumeReadExt;
 use hadris_fat::sync::read::FileReader;
+use hadris_fat::sync::write::FileWriter;
 use hadris_fat::sync::{DirectoryEntry, FatDir};
+use hadris_fat::{FatVolumeReadExt, FatVolumeWriteExt};
 
 use crate::arch::mmu::{self, USER_BASE, USER_STACK_TOP};
 use crate::console;
@@ -20,7 +22,7 @@ use crate::drivers::virtio::gpu;
 use crate::fs;
 use crate::fs::blkio::BlkIo;
 use crate::keyboard::queue;
-use abi::{DIRENT_SIZE, NAME_MAX, O_RDONLY};
+use abi::{DIRENT_SIZE, NAME_MAX, O_RDONLY, O_WRONLY};
 
 /// This project's own error convention so far -- a negative value, not yet the real negated-errno
 /// convention `plans/USERSPACE_PLAN.md` settles on for the full syscall set (no `errno` constants
@@ -35,8 +37,15 @@ const MAX_FDS: usize = 3 + 8;
 enum FileDescriptor {
     Keyboard,
     Console,
-    /// An open file, read-only -- no write support yet (`abi::O_RDONLY`'s own doc comment).
+    /// An open file, read-only.
     File(FileReader<'static, BlkIo>),
+    /// An open file, write-only (`abi::O_WRONLY`) -- created fresh or truncated to empty at open
+    /// time (`open`'s own doc comment); `close` is what commits its final size to disk
+    /// (`FileWriter::finish`'s own contract), so a program that never calls it, or that faults
+    /// before doing so, leaves the entry's size wrong even though the bytes it did write already
+    /// reached disk. A known, deliberate gap -- no process model exists yet to guarantee cleanup
+    /// runs on every exit path the way a real OS's `close`-on-exit would.
+    FileWrite(FileWriter<'static, BlkIo>),
     /// An open directory: `names` captured whole when it was opened (unlike a file, FAT gives no
     /// way to resume a directory walk at an arbitrary byte offset), `next` is how many `getdents`
     /// has already returned.
@@ -95,11 +104,9 @@ pub fn end_launch() {
 }
 
 impl FileDescriptor {
-    /// Writes to the console -- both the GPU text console (if `console::set` ran, i.e. a GPU
-    /// device exists) and the UART, the same dual visibility every diagnostic print in this
-    /// project already has. Writing to `Keyboard` or a `File` is rejected outright, not silently
-    /// accepted as a no-op: a mixed-up fd number should be visible as an error, not hidden behind
-    /// output that simply never appears.
+    /// Writes to the console or a write-only file. Writing to `Keyboard`, a read-only `File`, or a
+    /// `Dir` is rejected outright, not silently accepted as a no-op: a mixed-up fd number should
+    /// be visible as an error, not hidden behind output that simply never appears.
     fn write(&mut self, bytes: &[u8]) -> isize {
         match self {
             Self::Console => {
@@ -110,10 +117,13 @@ impl FileDescriptor {
                         gpu_dev.flush();
                     }
                 }
+                // Also the UART, the same dual visibility every diagnostic print in this project
+                // already has.
                 let mut uart = crate::bare_metal::get_uart();
                 let _ = uart.write_str(text);
                 bytes.len() as isize
             }
+            Self::FileWrite(writer) => writer.write(bytes).map_or(EBADF, |n| n as isize),
             Self::Keyboard | Self::File(_) | Self::Dir { .. } => EBADF,
         }
     }
@@ -121,7 +131,8 @@ impl FileDescriptor {
     /// Reads from a file descriptor: the keyboard queue (non-blocking: no process model exists to
     /// block *on*, so an empty queue returns `0` immediately rather than waiting for a key that
     /// might never come), or an open file's next bytes (`0` at end of file). Reading from
-    /// `Console` is rejected, same reasoning as writing to `Keyboard`.
+    /// `Console`, a write-only `FileWrite`, or a `Dir` is rejected, same reasoning as writing to
+    /// `Keyboard`.
     fn read(&mut self, buf: &mut [u8]) -> isize {
         match self {
             Self::Keyboard => {
@@ -134,7 +145,7 @@ impl FileDescriptor {
                 }
                 n as isize
             }
-            Self::Console | Self::Dir { .. } => EBADF,
+            Self::Console | Self::FileWrite(_) | Self::Dir { .. } => EBADF,
             Self::File(reader) => reader.read(buf).map_or(EBADF, |n| n as isize),
         }
     }
@@ -221,12 +232,15 @@ pub fn getdents(fd: usize, ptr: usize, len: usize) -> isize {
 
 /// Opens the file or directory at the user-space path `ptr`/`len` on `system.img` (blk0 -- no
 /// path/mount resolution across volumes yet, see `fs::path`'s own doc comment), returning the
-/// lowest free fd number (never one of the standard three) or `-1`. Only `O_RDONLY` is accepted --
-/// writing a file is a later step. A directory (the root included, for `""`/`"/"`) opens for
-/// `getdents`, not `read`/`write`; a plain file opens for `read` as before. Also `-1` if the path
-/// is missing, isn't valid UTF-8, or every fd slot is already in use.
+/// lowest free fd number (never one of the standard three) or `-1`. `O_RDONLY` also opens a
+/// directory (the root included, for `""`/`"/"`), for `getdents` rather than `read`/`write`.
+/// `O_WRONLY` creates the file if it's missing, or truncates it to empty if it already exists as
+/// a plain file (a directory is refused); no read-only-bit check, since nothing sets that bit yet
+/// (`chmod` doesn't exist). Also `-1` for any other `flags` value, a missing path (`O_RDONLY`
+/// only -- `O_WRONLY` creates it instead), a path that isn't valid UTF-8, or every fd slot already
+/// in use.
 pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
-    if flags != O_RDONLY {
+    if flags != O_RDONLY && flags != O_WRONLY {
         return EBADF;
     }
     if !validate(ptr, len) {
@@ -245,12 +259,30 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
         return EBADF;
     };
 
-    // Tried first: a path through directories only (the empty/root path included) opens for
-    // `getdents`. If it fails, the same path is tried as an ordinary file below -- `resolve_dir`
-    // and `resolve` walk identically up to the last component, so this only succeeds here for a
-    // path `resolve` would otherwise have resolved to a directory entry it doesn't know what to do
-    // with.
-    let descriptor = if let Ok(dir) = fs::path::resolve_dir(vol, path) {
+    let descriptor = if flags == O_WRONLY {
+        let Ok((parent, leaf)) = fs::path::split(vol, path) else {
+            return EBADF;
+        };
+        let entry = match fs::path::find_entry(&parent, leaf) {
+            Some(entry) if entry.is_directory() => return EBADF,
+            Some(entry) => entry,
+            None => {
+                let Ok(entry) = vol.create_file(&parent, leaf) else {
+                    return EBADF;
+                };
+                entry
+            }
+        };
+        let Ok(writer) = vol.write_file(&entry) else {
+            return EBADF;
+        };
+        FileDescriptor::FileWrite(writer)
+    } else if let Ok(dir) = fs::path::resolve_dir(vol, path) {
+        // Tried first: a path through directories only (the empty/root path included) opens for
+        // `getdents`. If it fails, the same path is tried as an ordinary file below --
+        // `resolve_dir` and `resolve` walk identically up to the last component, so this only
+        // succeeds here for a path `resolve` would otherwise have resolved to a directory entry
+        // it doesn't know what to do with.
         FileDescriptor::Dir {
             names: list_dir(&dir),
             next: 0,
@@ -278,13 +310,103 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
     fd as isize
 }
 
-/// Closes `fd`: the slot is emptied, dropping whatever it held. `-1` for an already-closed or
-/// never-opened fd; closing a standard fd (0/1/2) is allowed, same as a real `close` -- it's just
-/// gone for the rest of this program's run.
+/// Closes `fd`: the slot is emptied, dropping whatever it held. For a `FileWrite`, this is also
+/// what commits its final size to disk (`FileWriter::finish`), so a failure here is a failed
+/// write, not just bookkeeping. `-1` for an already-closed or never-opened fd, or a `finish` that
+/// failed; closing a standard fd (0/1/2) is allowed, same as a real `close` -- it's just gone for
+/// the rest of this program's run.
 pub fn close(fd: usize) -> isize {
     match table().get_mut(fd).and_then(Option::take) {
+        Some(FileDescriptor::FileWrite(writer)) => match writer.finish() {
+            Ok(()) => 0,
+            Err(_) => EBADF,
+        },
         Some(_) => 0,
         None => EBADF,
+    }
+}
+
+/// Creates an empty directory at the user-space path `ptr`/`len`. `-1` if the path's parent
+/// doesn't exist or isn't a directory, if something already exists at that name, or if `path` has
+/// no components at all (the root always exists).
+pub fn mkdir(ptr: usize, len: usize) -> isize {
+    if !validate(ptr, len) {
+        return EBADF;
+    }
+    let _user = mmu::user_access();
+    // SAFETY: validated above to lie entirely within the user window.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return EBADF;
+    };
+    let Some(vol) = fs::volume::get(0) else {
+        return EBADF;
+    };
+    let Ok((parent, leaf)) = fs::path::split(vol, path) else {
+        return EBADF;
+    };
+    match vol.create_dir(&parent, leaf) {
+        Ok(_) => 0,
+        Err(_) => EBADF,
+    }
+}
+
+/// Removes the file, or empty directory, at the user-space path `ptr`/`len` -- one call for both
+/// (`hadris_fat::FatVolume::delete`'s own behavior; no `AT_REMOVEDIR` flag to distinguish them,
+/// unlike Linux's real `unlinkat`), refusing only a *non-empty* directory. `-1` for a missing path
+/// or a non-empty directory.
+pub fn unlink(ptr: usize, len: usize) -> isize {
+    if !validate(ptr, len) {
+        return EBADF;
+    }
+    let _user = mmu::user_access();
+    // SAFETY: validated above to lie entirely within the user window.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return EBADF;
+    };
+    let Some(vol) = fs::volume::get(0) else {
+        return EBADF;
+    };
+    let Ok(entry) = fs::path::resolve(vol, path) else {
+        return EBADF;
+    };
+    match vol.delete(&entry) {
+        Ok(()) => 0,
+        Err(_) => EBADF,
+    }
+}
+
+/// Renames or moves the entry at the user-space path `old_ptr`/`old_len` to `new_ptr`/`new_len`,
+/// within the same volume -- a thin wrap of `hadris_fat::FatVolume::rename`, which refuses if
+/// `new` already names something (whatever type it is) and refuses moving a directory into its
+/// own descendant. `-1` for any of those, or if either path fails to resolve.
+pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) -> isize {
+    if !validate(old_ptr, old_len) || !validate(new_ptr, new_len) {
+        return EBADF;
+    }
+    let _user = mmu::user_access();
+    // SAFETY: both ranges validated above to lie entirely within the user window.
+    let old_bytes = unsafe { core::slice::from_raw_parts(old_ptr as *const u8, old_len) };
+    let new_bytes = unsafe { core::slice::from_raw_parts(new_ptr as *const u8, new_len) };
+    let (Ok(old_path), Ok(new_path)) = (
+        core::str::from_utf8(old_bytes),
+        core::str::from_utf8(new_bytes),
+    ) else {
+        return EBADF;
+    };
+    let Some(vol) = fs::volume::get(0) else {
+        return EBADF;
+    };
+    let Ok(old_entry) = fs::path::resolve(vol, old_path) else {
+        return EBADF;
+    };
+    let Ok((new_parent, new_leaf)) = fs::path::split(vol, new_path) else {
+        return EBADF;
+    };
+    match vol.rename(&old_entry, &new_parent, new_leaf) {
+        Ok(_) => 0,
+        Err(_) => EBADF,
     }
 }
 

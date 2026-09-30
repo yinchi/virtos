@@ -1,20 +1,24 @@
-//! Everything a program does with a file descriptor, plus the console: `open`, `close`, `read`,
-//! `write`, `getdents`, `clear`. Each is a thin wrapper over one syscall (see `syscall.rs`) -- no
-//! stdout buffering yet (every call is its own `write` syscall); revisit if that ever shows up as
-//! an actual cost, not preemptively.
+//! Everything a program does with a file descriptor, plus the console and the path-only (no fd)
+//! `mkdir`/`unlink`/`rename`: `open`, `close`, `read`, `write`, `getdents`, `mkdir`, `unlink`,
+//! `rename`, `clear`. Each is a thin wrapper over one syscall (see `syscall.rs`) -- no stdout
+//! buffering yet (every call is its own `write` syscall); revisit if that ever shows up as an
+//! actual cost, not preemptively.
 
-use abi::{SYS_CLEAR, SYS_CLOSE, SYS_GETDENTS, SYS_OPEN, SYS_READ, SYS_WRITE};
+use abi::{
+    SYS_CLEAR, SYS_CLOSE, SYS_GETDENTS, SYS_MKDIRAT, SYS_OPEN, SYS_READ, SYS_RENAMEAT,
+    SYS_UNLINKAT, SYS_WRITE,
+};
 
-/// `open`'s `flags` -- re-exported so a program writes `userlib::O_RDONLY`.
-pub use abi::O_RDONLY;
+/// `open`'s `flags` -- re-exported so a program writes `userlib::O_RDONLY`/`userlib::O_WRONLY`.
+pub use abi::{O_RDONLY, O_WRONLY};
 
 /// `getdents`'s record layout -- re-exported so a program writes `userlib::DIRENT_SIZE`/
 /// `userlib::NAME_MAX`.
 pub use abi::{DIRENT_SIZE, NAME_MAX};
 
-/// Opens the file at `path` (read-only -- `flags` must be `O_RDONLY`, the only mode this project
-/// supports so far). Returns the new file descriptor, or a negative value on error (see the
-/// kernel's `syscall::fd::open` for what can fail and why).
+/// Opens the file or directory at `path` (`flags` is `O_RDONLY` or `O_WRONLY`). Returns the new
+/// file descriptor, or a negative value on error (see the kernel's `syscall::fd::open` for what
+/// can fail and why).
 pub fn open(path: &str, flags: usize) -> isize {
     syscall!(SYS_OPEN, path.as_ptr() as usize, path.len(), flags)
 }
@@ -58,6 +62,31 @@ impl<'a> DirEnt<'a> {
             name: core::str::from_utf8(&raw[1..1 + name_len]).ok()?,
         })
     }
+}
+
+/// Creates an empty directory at `path`. Returns `0`, or a negative value on error (a missing or
+/// non-directory parent, or an existing entry already at that name).
+pub fn mkdir(path: &str) -> isize {
+    syscall!(SYS_MKDIRAT, path.as_ptr() as usize, path.len())
+}
+
+/// Removes the file, or empty directory, at `path` -- one call for both (see the kernel's
+/// `syscall::fd::unlink`). Returns `0`, or a negative value on error (a missing path, or a
+/// non-empty directory).
+pub fn unlink(path: &str) -> isize {
+    syscall!(SYS_UNLINKAT, path.as_ptr() as usize, path.len())
+}
+
+/// Renames or moves the entry at `old` to `new`. Returns `0`, or a negative value on error (either
+/// path fails to resolve, or `new` already names something).
+pub fn rename(old: &str, new: &str) -> isize {
+    syscall!(
+        SYS_RENAMEAT,
+        old.as_ptr() as usize,
+        old.len(),
+        new.as_ptr() as usize,
+        new.len()
+    )
 }
 
 /// Clears the console (and, via an ANSI escape sequence, whatever real terminal is watching the

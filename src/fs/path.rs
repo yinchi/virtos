@@ -55,3 +55,22 @@ pub fn resolve_dir<'a>(vol: &'a FatVolume<BlkIo>, path: &str) -> Result<FatDir<'
     }
     Ok(dir)
 }
+
+/// Splits `path` into the `FatDir` holding its final component and that component's own name --
+/// what `mkdir`, a fresh `open(O_WRONLY)`, and the destination side of `rename` all need (a place
+/// to create an entry, and the name to give it), where `resolve`/`resolve_dir` only ever hand back
+/// something that already exists. Built on `resolve_dir` directly (via `rsplit_once`, not a second
+/// component walker) rather than duplicating its loop. `Err(())` if `path` has no components at
+/// all (the root itself has no parent to split off), or any component up to the parent isn't a
+/// directory.
+pub fn split<'a>(
+    vol: &'a FatVolume<BlkIo>,
+    path: &'a str,
+) -> Result<(FatDir<'a, BlkIo>, &'a str), ()> {
+    let trimmed = path.trim_matches('/');
+    let (parent, leaf) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+    if leaf.is_empty() {
+        return Err(());
+    }
+    Ok((resolve_dir(vol, parent)?, leaf))
+}
