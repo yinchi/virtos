@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod cli;
 
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use userlib::{ExitCode, O_RDONLY};
 
@@ -78,4 +79,11 @@ pub fn basename(path: &str) -> &str {
         Some(i) => &path[i + 1..],
         None => path,
     }
+}
+
+/// Joins `parent` and `child` with a `/`, trimming one trailing `/` off `parent` first so it
+/// never ends up doubled. Used by every directory-walking recursion (`chmod -R`, `rm -r`,
+/// `cp -r`) to build a child's full path from a `getdents` record's own (relative) name.
+pub fn join(parent: &str, child: &str) -> String {
+    format!("{}/{}", parent.trim_end_matches('/'), child)
 }

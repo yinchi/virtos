@@ -7,7 +7,6 @@
 
 extern crate alloc;
 
-use alloc::format;
 use userlib::{ATTR_DIRECTORY, Args, DIRENT_SIZE, DirEnt, ExitCode, O_RDONLY};
 
 userlib::entry_with_args!(run);
@@ -64,7 +63,7 @@ fn chmod_recursive(path: &str, set: u8, clear: u8) -> bool {
             let Some(ent) = DirEnt::parse(raw) else {
                 continue;
             };
-            let child = format!("{}/{}", path.trim_end_matches('/'), ent.name);
+            let child = progs::join(path, ent.name);
             if ent.attrs & ATTR_DIRECTORY != 0 && !chmod_recursive(&child, set, clear) {
                 ok = false;
             }
