@@ -1,5 +1,5 @@
 //! File descriptor dispatch for `open`/`close`/`read`/`write`/`getdents`, plus the path-only
-//! (no fd involved) `mkdir`/`unlink`/`rename`/`getcwd`/`stat`. Every path a program supplies is
+//! (no fd involved) `mkdir`/`unlink`/`rename`/`getcwd`/`stat`/`chmod`. Every path a program supplies is
 //! resolved against the working directory first (`fs::cwd::absolute`) before it ever reaches
 //! `fs::path`. One fd table, not one per program: at most one
 //! program is ever resident (see `arch/mmu.rs`'s reasoning), so `reset_for_launch` simply refills
@@ -15,9 +15,11 @@ use core::fmt::Write;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use hadris_fat::raw::DirEntryAttrFlags;
 use hadris_fat::sync::read::FileReader;
 use hadris_fat::sync::write::FileWriter;
 use hadris_fat::sync::{DirectoryEntry, FatDir, FatVolume};
+use hadris_fat::time::FatDateTime;
 use hadris_fat::{FatVolumeReadExt, FatVolumeWriteExt};
 
 use crate::arch::mmu::{self, USER_BASE, USER_STACK_TOP};
@@ -26,7 +28,10 @@ use crate::drivers::virtio::gpu;
 use crate::fs;
 use crate::fs::blkio::BlkIo;
 use crate::keyboard::queue;
-use abi::{DIRENT_SIZE, NAME_MAX, O_RDONLY, O_WRONLY, STAT_SIZE};
+use abi::{
+    ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, DIRENT_SIZE, NAME_MAX, O_APPEND, O_RDONLY, O_WRONLY,
+    STAT_SIZE,
+};
 
 /// This project's own error convention so far -- a negative value, not yet the real negated-errno
 /// convention `plans/USERSPACE_PLAN.md` settles on for the full syscall set (no `errno` constants
@@ -58,20 +63,22 @@ enum FileDescriptor {
     /// from `end_launch`, so a redirected stdout/stderr is never left with the wrong size for the
     /// next reader (a pipeline stage, or a later `cat`) to find.
     FileWrite(Rc<RefCell<FileWriter<'static, BlkIo>>>),
-    /// An open directory: `names` captured whole when it was opened (unlike a file, FAT gives no
-    /// way to resume a directory walk at an arbitrary byte offset), `next` is how many `getdents`
-    /// has already returned.
+    /// An open directory: `entries` captured whole when it was opened (unlike a file, FAT gives no
+    /// way to resume a directory walk at an arbitrary byte offset) -- each entry's name, size, and
+    /// attribute byte, so `getdents` can hand a child's type back to a caller (`chmod -R`'s own
+    /// recursion, eventually `ls -l`/`-F`) without it needing a separate `stat` call per entry.
+    /// `next` is how many `getdents` has already returned.
     Dir {
-        names: Vec<String>,
+        entries: Vec<(String, u32, u8)>,
         next: usize,
     },
 }
 
-/// Snapshots `dir`'s entries into plain names for `getdents`, skipping `.`/`..` (real subdirectory
-/// entries, unlike the root, which has neither) and any volume-label entry -- neither is a name a
-/// program should ever see listed.
-fn list_dir(dir: &FatDir<'static, BlkIo>) -> Vec<String> {
-    let mut names = Vec::new();
+/// Snapshots `dir`'s entries -- name, size, attribute byte -- for `getdents`, skipping `.`/`..`
+/// (real subdirectory entries, unlike the root, which has neither) and any volume-label entry --
+/// none of the three is something a program should ever see listed.
+fn list_dir(dir: &FatDir<'static, BlkIo>) -> Vec<(String, u32, u8)> {
+    let mut entries = Vec::new();
     for entry in dir.entries() {
         let DirectoryEntry::Entry(entry) = entry.expect("directory entry read failed");
         let name = entry.name();
@@ -81,9 +88,13 @@ fn list_dir(dir: &FatDir<'static, BlkIo>) -> Vec<String> {
         {
             continue;
         }
-        names.push(String::from(name.as_ref()));
+        entries.push((
+            String::from(name.as_ref()),
+            entry.len() as u32,
+            entry.attributes().bits(),
+        ));
     }
-    names
+    entries
 }
 
 /// SAFETY (every access, via `table`): single core, and every syscall runs with IRQs masked
@@ -182,20 +193,23 @@ impl FileDescriptor {
     /// directory, and if `buf` can't even hold one record -- otherwise the `0` that means "buffer
     /// too small" couldn't be told apart from "listing exhausted".
     fn getdents(&mut self, buf: &mut [u8]) -> isize {
-        let Self::Dir { names, next } = self else {
+        let Self::Dir { entries, next } = self else {
             return EBADF;
         };
         if buf.len() < DIRENT_SIZE {
             return EBADF;
         }
         let mut off = 0;
-        while *next < names.len() && off + DIRENT_SIZE <= buf.len() {
-            let name = names[*next].as_bytes();
+        while *next < entries.len() && off + DIRENT_SIZE <= buf.len() {
+            let (name, size, attrs) = &entries[*next];
+            let name = name.as_bytes();
             let n = name.len().min(NAME_MAX);
             let out = &mut buf[off..off + DIRENT_SIZE];
-            out[0] = n as u8;
-            out[1..1 + n].copy_from_slice(&name[..n]);
-            out[1 + n..].fill(0);
+            out[0..4].copy_from_slice(&size.to_le_bytes());
+            out[4] = *attrs;
+            out[5] = n as u8;
+            out[6..6 + n].copy_from_slice(&name[..n]);
+            out[6 + n..].fill(0);
             off += DIRENT_SIZE;
             *next += 1;
         }
@@ -371,12 +385,15 @@ pub fn bind_stdio(overrides: [Option<StdioRedirect>; 3]) -> Result<(), ()> {
 /// of the standard three) or `-1`. `O_RDONLY` also opens a
 /// directory (the root included, for `""`/`"/"`), for `getdents` rather than `read`/`write`.
 /// `O_WRONLY` creates the file if it's missing, or truncates it to empty if it already exists as
-/// a plain file (a directory is refused); no read-only-bit check, since nothing sets that bit yet
-/// (`chmod` doesn't exist). Also `-1` for any other `flags` value, a missing path (`O_RDONLY`
-/// only -- `O_WRONLY` creates it instead), a path that isn't valid UTF-8, or every fd slot already
-/// in use.
+/// a plain file (a directory is refused) -- or, combined with `O_APPEND`, opens it positioned at
+/// its current end instead (still creating it fresh if it didn't exist); no read-only-bit check
+/// yet (`chmod`'s own `ATTR_READ_ONLY` isn't consulted here). Also `-1` for any other `flags`
+/// value, a missing path (`O_RDONLY` only -- `O_WRONLY` creates it instead), a path that isn't
+/// valid UTF-8, or every fd slot already in use.
 pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
-    if flags != O_RDONLY && flags != O_WRONLY {
+    let append = flags & O_APPEND != 0;
+    let base = flags & !O_APPEND;
+    if base != O_RDONLY && base != O_WRONLY {
         return EBADF;
     }
     if !validate(ptr, len) {
@@ -396,8 +413,8 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
         return EBADF;
     };
 
-    let descriptor = if flags == O_WRONLY {
-        let Ok(writer) = open_for_write(vol, &path, false) else {
+    let descriptor = if base == O_WRONLY {
+        let Ok(writer) = open_for_write(vol, &path, append) else {
             return EBADF;
         };
         FileDescriptor::FileWrite(Rc::new(RefCell::new(writer)))
@@ -408,7 +425,7 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
         // succeeds here for a path `resolve` would otherwise have resolved to a directory entry
         // it doesn't know what to do with.
         FileDescriptor::Dir {
-            names: list_dir(&dir),
+            entries: list_dir(&dir),
             next: 0,
         }
     } else {
@@ -561,11 +578,16 @@ pub fn getcwd(ptr: usize, len: usize) -> isize {
     cwd.len() as isize
 }
 
-/// Writes the size and type (file or directory) of the user-space path `ptr`/`len` (resolved
-/// against the working directory first) into the `STAT_SIZE`-byte buffer at `out_ptr`: `size: u32`
-/// (little-endian), then `is_dir: u8` (`0`/`1`) -- see `abi::STAT_SIZE`'s own doc comment for why
-/// nothing else is reported yet. `-1` if the path doesn't resolve, or if `out_ptr`/`STAT_SIZE`
-/// isn't valid user memory.
+/// Writes every field a FAT directory entry actually stores for the user-space path `ptr`/`len`
+/// (resolved against the working directory first) into the `STAT_SIZE`-byte buffer at `out_ptr`
+/// -- see `abi::STAT_SIZE`'s own doc comment for the exact layout. `-1` if the path doesn't
+/// resolve, or if `out_ptr`/`STAT_SIZE` isn't valid user memory.
+///
+/// Unlike `open`, this doesn't need a "try as a directory first" branch: `fs::path::resolve`
+/// (unlike `resolve_dir`) already returns a real `FileEntry` for *any* named directory, not just
+/// a file -- it only refuses the bare root, which has no entry of its own to return at all (no
+/// parent directory lists it). That's the one case needing synthetic values; every other
+/// directory or file reads every field straight off the real entry.
 pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
     if !validate(ptr, len) || !validate(out_ptr, STAT_SIZE) {
         return EBADF;
@@ -581,24 +603,83 @@ pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
         return EBADF;
     };
 
-    // Same "try as a directory first" order `open` already uses, and for the same reason: a path
-    // that resolves as a directory here would otherwise also resolve via `resolve` below (as a
-    // `FileEntry` `.is_directory()` doesn't distinguish), but the root has no `FileEntry` of its
-    // own to hand back, so it has to be handled before falling through.
-    let (size, is_dir): (u32, u8) = if fs::path::resolve_dir(vol, &path).is_ok() {
-        (0, 1)
+    let (size, attrs, created, modified, accessed_date) = if path.trim_matches('/').is_empty() {
+        // The true root has no `FileEntry` of its own -- nothing lists it -- so there's nothing
+        // real to read; report it as an empty directory at the FAT epoch.
+        (
+            0u32,
+            ATTR_DIRECTORY,
+            FatDateTime::EPOCH,
+            FatDateTime::EPOCH,
+            FatDateTime::EPOCH.date,
+        )
     } else {
         let Ok(entry) = fs::path::resolve(vol, &path) else {
             return EBADF;
         };
-        (entry.len() as u32, 0)
+        (
+            entry.len() as u32,
+            entry.attributes().bits(),
+            entry.created(),
+            entry.modified(),
+            entry.accessed_date(),
+        )
     };
 
     // SAFETY: validated above to lie entirely within the user window.
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr as *mut u8, STAT_SIZE) };
     out[0..4].copy_from_slice(&size.to_le_bytes());
-    out[4] = is_dir;
+    out[4] = attrs;
+    out[5..7].copy_from_slice(&created.date.to_le_bytes());
+    out[7..9].copy_from_slice(&created.time.to_le_bytes());
+    out[9] = created.time_tenth;
+    out[10..12].copy_from_slice(&modified.date.to_le_bytes());
+    out[12..14].copy_from_slice(&modified.time.to_le_bytes());
+    out[14..16].copy_from_slice(&accessed_date.to_le_bytes());
     0
+}
+
+/// The only attribute bits a program may change via `chmod` -- `ATTR_DIRECTORY`/`VOLUME_ID`
+/// describe the kind of entry on disk, not a permission, and `set_attributes` itself already
+/// refuses flipping `DIRECTORY` (though not `VOLUME_ID`) -- checked here too, on both `set` and
+/// `clear`, so the rejection is uniform and immediate rather than depending on which bit the
+/// crate happens to guard.
+const CHMOD_BITS: u8 = ATTR_READ_ONLY | ATTR_EXEC;
+
+/// Sets `set`'s bits and clears `clear`'s bits of the user-space path `ptr`/`len`'s attribute
+/// byte (resolved against the working directory first). `-1` if `set`/`clear` name anything
+/// outside `CHMOD_BITS`, the path doesn't resolve (this also refuses the bare root, which
+/// `fs::path::resolve` already has no entry to return for -- no separate check needed), or the
+/// underlying `set_attributes` call fails.
+pub fn chmod(ptr: usize, len: usize, set: usize, clear: usize) -> isize {
+    if !validate(ptr, len) {
+        return EBADF;
+    }
+    if set > u8::MAX as usize || clear > u8::MAX as usize {
+        return EBADF;
+    }
+    let (set, clear) = (set as u8, clear as u8);
+    if (set | clear) & !CHMOD_BITS != 0 {
+        return EBADF;
+    }
+    let _user = mmu::user_access();
+    // SAFETY: validated above to lie entirely within the user window.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return EBADF;
+    };
+    let path = fs::cwd::absolute(path);
+    let Some(vol) = fs::volume::get(0) else {
+        return EBADF;
+    };
+    let Ok(entry) = fs::path::resolve(vol, &path) else {
+        return EBADF;
+    };
+    let attrs = (entry.attributes().bits() | set) & !clear;
+    match vol.set_attributes(&entry, DirEntryAttrFlags::from_bits_retain(attrs)) {
+        Ok(()) => 0,
+        Err(_) => EBADF,
+    }
 }
 
 /// Clears the console -- both the graphical one (if a GPU device exists) and, via an ANSI escape

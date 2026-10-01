@@ -21,33 +21,49 @@ pub const SYS_CLOCK_GETTIME: usize = 113; // Linux's `clock_gettime`, but no clo
 // (there's only one clock) and no `timespec` out-param (the RTC has second resolution, nothing to
 // put in `tv_nsec`) -- the Unix timestamp itself comes back directly in `x0`.
 pub const SYS_REBOOT: usize = 142;
+pub const SYS_CHMOD: usize = 53; // Linux's `fchmodat`, but plain-path: no dirfd, no flags
 
 /// Longest absolute path this project deals with (`getcwd`'s buffer, `pwd`'s/`stat`'s own stack
 /// buffers) -- an arbitrary but generous bound, not a number `hadris-fat`/FAT itself imposes.
 pub const PATH_MAX: usize = 4096;
 
-/// Size of the fixed payload `stat` writes: `size: u32` (little-endian), then `is_dir: u8`. No
-/// attributes or timestamps yet -- nothing reads them for anything currently built (no `chmod` to
-/// report, no `-l`/`-t` flag anywhere that would display a timestamp); grow this the same way
-/// `getdents`'s own record would, once something actually needs one of those fields.
-pub const STAT_SIZE: usize = 4 + 1;
+/// Size of the fixed payload `stat` writes: `size: u32` (LE), `attrs: u8`, `created_date: u16`
+/// (LE), `created_time: u16` (LE), `created_time_tenth: u8`, `modified_date: u16` (LE),
+/// `modified_time: u16` (LE), `accessed_date: u16` (LE) -- every field a FAT directory entry
+/// actually stores. Dates/times are FAT's own packed encoding, not calendar values -- unpacking
+/// them is left to whichever program displays them (`date`'s own `chrono` conversion is unrelated;
+/// FAT's packed format predates it and has nothing to do with Unix time).
+pub const STAT_SIZE: usize = 16;
 
 // `open`'s `flags` -- Linux's real values. `O_RDONLY` also opens a directory, for `getdents`.
-// `O_WRONLY` creates the file if it doesn't exist, and always starts it empty (no append mode
-// yet -- nothing needs one until `>>`/`tee -a` do).
+// `O_WRONLY` creates the file if it doesn't exist, and always starts it empty unless combined with
+// `O_APPEND` (`O_WRONLY | O_APPEND`), which instead starts writing at the file's current end --
+// creating it fresh too, if it didn't already exist, since there's nothing yet to append to.
 pub const O_RDONLY: usize = 0;
 pub const O_WRONLY: usize = 1;
+pub const O_APPEND: usize = 0o2000; // Linux's real value, kept clear of O_RDONLY/O_WRONLY's own bit
 
 /// Longest name one directory entry can carry -- FAT's own long-filename limit, not a number this
 /// project picked itself.
 pub const NAME_MAX: usize = 255;
 
-/// Size of one record `getdents` fills in: a `name_len: u8`, then `NAME_MAX` bytes of name,
-/// NUL-padded. No size or attribute fields yet -- nothing reads a directory listing for anything
-/// but names so far (`ls` takes no flags yet); grow this the same way `-n` was added to `head`/
-/// `tail`, once a flag that actually needs one (`ls -l`'s size, `-F`'s directory bit) is being
-/// built, not ahead of that.
-pub const DIRENT_SIZE: usize = 1 + NAME_MAX;
+/// Size of one record `getdents` fills in: `size: u32` (LE), `attrs: u8`, `name_len: u8`, then
+/// `NAME_MAX` bytes of name, NUL-padded.
+pub const DIRENT_SIZE: usize = 4 + 1 + 1 + NAME_MAX;
+
+// --- FAT attribute bits ---------------------------------------------------------------------
+// The bits `stat`/`chmod`/`getdents` all deal in, directly off (or onto) a FAT directory entry's
+// own attribute byte -- `chmod` may only set/clear `ATTR_READ_ONLY`/`ATTR_EXEC`, the other two
+// name the kind of entry on disk rather than a permission.
+
+/// FAT attribute: read-only.
+pub const ATTR_READ_ONLY: u8 = 0x01;
+/// FAT attribute: directory.
+pub const ATTR_DIRECTORY: u8 = 0x10;
+/// FAT attribute: executable. Not standard in FAT -- reuses a reserved bit (no existing meaning),
+/// this project's own convention (already set at build time by `tools/mkimage` on everything
+/// under `usr/bin/`).
+pub const ATTR_EXEC: u8 = 0x40;
 
 /// Not a real Linux syscall -- Linux clears a terminal through an `ioctl` a userspace tool
 /// interprets itself (writing ANSI escapes), and this project has no generic `ioctl` mechanism yet
@@ -71,3 +87,23 @@ pub const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321_FEDC;
 /// image, guard and stack (a compile-time assertion there keeps the two in sync).
 pub const USER_HEAP_BOTTOM: usize = 0x45DF_0000;
 pub const USER_HEAP_SIZE: usize = 0x0010_0000; // 1 MiB
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the literal values nothing else cross-checks at compile time -- kernel and
+    /// `userlib` each hold their own copy of what these mean (`fd.rs`'s `stat`/`chmod`/`getdents`,
+    /// `io.rs`'s matching decode), so a typo here would silently desync the two.
+    #[test]
+    fn values_match_what_fd_rs_and_io_rs_assume() {
+        assert_eq!(SYS_CHMOD, 53);
+        assert_eq!(O_APPEND, 0o2000);
+        assert_eq!(STAT_SIZE, 16);
+        assert_eq!(DIRENT_SIZE, 4 + 1 + 1 + NAME_MAX);
+        assert_eq!(
+            [ATTR_READ_ONLY, ATTR_DIRECTORY, ATTR_EXEC],
+            [0x01, 0x10, 0x40]
+        );
+    }
+}

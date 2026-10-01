@@ -1,16 +1,21 @@
 //! Everything a program does with a file descriptor, plus the console and the path-only (no fd)
-//! `mkdir`/`unlink`/`rename`/`getcwd`/`stat`: `open`, `close`, `read`, `write`, `getdents`,
-//! `mkdir`, `unlink`, `rename`, `getcwd`, `stat`, `clear`. Each is a thin wrapper over one syscall
-//! (see `syscall.rs`) -- no stdout buffering yet (every call is its own `write` syscall); revisit
-//! if that ever shows up as an actual cost, not preemptively.
+//! `mkdir`/`unlink`/`rename`/`getcwd`/`stat`/`chmod`: `open`, `close`, `read`, `write`,
+//! `getdents`, `mkdir`, `unlink`, `rename`, `getcwd`, `stat`, `chmod`, `clear`. Each is a thin
+//! wrapper over one syscall (see `syscall.rs`) -- no stdout buffering yet (every call is its own
+//! `write` syscall); revisit if that ever shows up as an actual cost, not preemptively.
 
 use abi::{
-    SYS_CLEAR, SYS_CLOSE, SYS_GETCWD, SYS_GETDENTS, SYS_MKDIRAT, SYS_NEWFSTATAT, SYS_OPEN,
-    SYS_READ, SYS_RENAMEAT, SYS_UNLINKAT, SYS_WRITE,
+    SYS_CHMOD, SYS_CLEAR, SYS_CLOSE, SYS_GETCWD, SYS_GETDENTS, SYS_MKDIRAT, SYS_NEWFSTATAT,
+    SYS_OPEN, SYS_READ, SYS_RENAMEAT, SYS_UNLINKAT, SYS_WRITE,
 };
 
-/// `open`'s `flags` -- re-exported so a program writes `userlib::O_RDONLY`/`userlib::O_WRONLY`.
-pub use abi::{O_RDONLY, O_WRONLY};
+/// `open`'s `flags` -- re-exported so a program writes `userlib::O_RDONLY`/`userlib::O_WRONLY`/
+/// `userlib::O_APPEND`.
+pub use abi::{O_APPEND, O_RDONLY, O_WRONLY};
+
+/// FAT attribute bits, as reported by `stat`/`getdents` and settable (`ATTR_READ_ONLY`/
+/// `ATTR_EXEC` only) via `chmod` -- re-exported so a program writes `userlib::ATTR_EXEC`, etc.
+pub use abi::{ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY};
 
 /// `getdents`'s record layout -- re-exported so a program writes `userlib::DIRENT_SIZE`/
 /// `userlib::NAME_MAX`.
@@ -53,6 +58,8 @@ pub fn getdents(fd: usize, buf: &mut [u8]) -> isize {
 
 /// One decoded `getdents` record.
 pub struct DirEnt<'a> {
+    pub size: u32,
+    pub attrs: u8,
     pub name: &'a str,
 }
 
@@ -60,9 +67,11 @@ impl<'a> DirEnt<'a> {
     /// Decodes the record in `raw`, which must be exactly `DIRENT_SIZE` bytes. `None` if the name
     /// isn't valid UTF-8.
     pub fn parse(raw: &'a [u8]) -> Option<Self> {
-        let name_len = raw[0] as usize;
+        let name_len = raw[5] as usize;
         Some(Self {
-            name: core::str::from_utf8(&raw[1..1 + name_len]).ok()?,
+            size: u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            attrs: raw[4],
+            name: core::str::from_utf8(&raw[6..6 + name_len]).ok()?,
         })
     }
 }
@@ -98,14 +107,25 @@ pub fn getcwd(buf: &mut [u8]) -> isize {
     syscall!(SYS_GETCWD, buf.as_mut_ptr() as usize, buf.len())
 }
 
-/// Every field this project's FAT layer reports for a path, via `stat`: its size, and whether
-/// it's a directory. No attributes or timestamps yet -- see `abi::STAT_SIZE`'s own doc comment.
+/// Every field this project's FAT layer reports for a path, via `stat`: its size, attribute
+/// byte, and the three timestamps FAT actually stores (packed date/time, FAT's own encoding --
+/// see `abi::STAT_SIZE`'s own doc comment; unpacking them is left to whichever program displays
+/// them). `is_dir` is derived from `attrs` (`attrs & ATTR_DIRECTORY != 0`), kept as its own field
+/// since most callers only ever want this one bit, not the full byte.
 pub struct Stat {
     pub size: u32,
+    pub attrs: u8,
     pub is_dir: bool,
+    pub created_date: u16,
+    pub created_time: u16,
+    pub created_time_tenth: u8,
+    pub modified_date: u16,
+    pub modified_time: u16,
+    pub accessed_date: u16,
 }
 
-/// Reads `path`'s size and type. `Err` carries the negative value the syscall returned.
+/// Reads `path`'s size, attributes and timestamps. `Err` carries the negative value the syscall
+/// returned.
 pub fn stat(path: &str) -> Result<Stat, isize> {
     let mut buf = [0u8; abi::STAT_SIZE];
     let r = syscall!(
@@ -117,10 +137,31 @@ pub fn stat(path: &str) -> Result<Stat, isize> {
     if r < 0 {
         return Err(r);
     }
+    let attrs = buf[4];
     Ok(Stat {
         size: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-        is_dir: buf[4] != 0,
+        attrs,
+        is_dir: attrs & abi::ATTR_DIRECTORY != 0,
+        created_date: u16::from_le_bytes([buf[5], buf[6]]),
+        created_time: u16::from_le_bytes([buf[7], buf[8]]),
+        created_time_tenth: buf[9],
+        modified_date: u16::from_le_bytes([buf[10], buf[11]]),
+        modified_time: u16::from_le_bytes([buf[12], buf[13]]),
+        accessed_date: u16::from_le_bytes([buf[14], buf[15]]),
     })
+}
+
+/// Sets `set`'s bits and clears `clear`'s bits of `path`'s attribute byte -- only
+/// `ATTR_READ_ONLY`/`ATTR_EXEC` may be named (the kernel rejects anything else). Returns `0`, or
+/// a negative value on error.
+pub fn chmod(path: &str, set: u8, clear: u8) -> isize {
+    syscall!(
+        SYS_CHMOD,
+        path.as_ptr() as usize,
+        path.len(),
+        set as usize,
+        clear as usize
+    )
 }
 
 /// Clears the console (and, via an ANSI escape sequence, whatever real terminal is watching the

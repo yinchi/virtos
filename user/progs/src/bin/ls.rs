@@ -17,7 +17,7 @@ const FLAGS: &[(&str, &str)] = &[];
 /// Buffer size for one `getdents` call -- fetches several records per syscall rather than one, the
 /// way the mature reference's own `ls.rs` does (its `BATCH = 8`), but sized to one memory page (4
 /// KiB), a conventional buffer size, rather than an arbitrary record count with no stated reason:
-/// exactly 16 records per call at `DIRENT_SIZE`'s current 256 bytes.
+/// 15 records per call at `DIRENT_SIZE`'s current 261 bytes.
 const GETDENTS_BUF_SIZE: usize = 4096;
 
 /// Lists one directory's entries to stdout. `false` if `dir` can't be opened, or opens but isn't
