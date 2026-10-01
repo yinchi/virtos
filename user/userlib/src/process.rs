@@ -157,3 +157,68 @@ macro_rules! entry_with_args {
         }
     };
 }
+
+/// One `"NAME=VALUE"` entry in an `Env` (envp decoding), still needing its own `split_once('=')`
+/// -- left to each caller, the same way `Args` hands back a raw `argv` entry rather than a
+/// pre-parsed `(flag, value)` pair.
+#[derive(Clone, Copy)]
+pub struct Env {
+    envp: *const *const u8,
+}
+
+impl Iterator for Env {
+    type Item = &'static str;
+
+    fn next(&mut self) -> Option<&'static str> {
+        // SAFETY: the only way to construct an `Env` is through `env`, so its contract already
+        // holds for every entry this reads, and a NULL entry (checked below) is how `envp`'s own
+        // array says "no more" -- there's no separate count the way `argc` gives `Args`.
+        unsafe {
+            let entry = *self.envp;
+            if entry.is_null() {
+                return None;
+            }
+            let mut len = 0;
+            while *entry.add(len) != 0 {
+                len += 1;
+            }
+            let bytes = core::slice::from_raw_parts(entry, len);
+            self.envp = self.envp.add(1);
+            // Same contract `Args::next` rests on: the kernel only ever writes these from its
+            // own UTF-8 `str`s.
+            Some(core::str::from_utf8(bytes).expect("envp entry was not valid UTF-8"))
+        }
+    }
+}
+
+/// Decodes the raw `envp` `_start` received (via `entry_with_env!`) into an `Env` iterator.
+///
+/// # Safety
+/// `envp` must be a NULL-terminated array of valid pointers, each to a NUL-terminated, UTF-8 byte
+/// sequence, all still mapped for as long as the returned `Env` is used -- true for whatever
+/// `_start` forwards directly from the kernel's own `eret`, never something a program should
+/// construct itself.
+pub unsafe fn env(envp: *const *const u8) -> Env {
+    Env { envp }
+}
+
+/// Like `entry_with_args!`, but for a program that also wants its environment: generates
+/// `#[no_mangle] extern "C" fn main(argc: usize, argv: *const *const u8, envp: *const *const u8)
+/// -> !` (forwarding `x0`-`x2` unchanged -- `_start`'s bare `bl main` never touches `x2`, so
+/// whatever the kernel's `eret` placed there is simply still there), and calls `$run` with both
+/// an `Args` and an `Env`.
+#[macro_export]
+macro_rules! entry_with_env {
+    ($run:path) => {
+        #[unsafe(no_mangle)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        pub extern "C" fn main(argc: usize, argv: *const *const u8, envp: *const *const u8) -> ! {
+            $crate::init_heap();
+            // SAFETY: as in `entry_with_args!`, both `args` and `env`'s contracts hold by
+            // construction for whatever `_start` forwards straight from the kernel's `eret`.
+            $crate::terminate($run(unsafe { $crate::args(argc, argv) }, unsafe {
+                $crate::env(envp)
+            }))
+        }
+    };
+}

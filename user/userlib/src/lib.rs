@@ -9,8 +9,8 @@
 //! - `heap`: an unconditional global allocator over the fixed heap
 //!   (`plans/USERSPACE_PLAN.md`'s divergence #6) -- `extern crate alloc` (`Vec`/`String`) just
 //!   works in any program built against this crate, from its very first version.
-//! - `process`: a program's own life -- entry stub and macros, `argc`/`argv`, `exit`, the panic
-//!   handler.
+//! - `process`: a program's own life -- entry stub and macros, `argc`/`argv`/`envp`, `exit`, the
+//!   panic handler.
 //! - `time`: `clock_gettime`, wrapped as `time()`.
 
 #![no_std]

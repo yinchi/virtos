@@ -1,18 +1,37 @@
-//! Splits a shell command line into tokens: words (honoring quoting and escaping), `|`, and
-//! redirection operators. `plans/USERSPACE_PLAN.md`'s step 10 note ("hand-roll the tokenizer;
-//! don't reach for `shlex`") is the actual lesson here: `shlex::split`-style tokenizing throws
-//! away whether a word was quoted or escaped, so `echo "|"` would misparse as a pipe and `a>b`
-//! would stay one word. Quoting/escaping is decided while scanning here instead (via a `peg`
-//! grammar, same as `syntax.rs`), so a quoted or escaped character is never mistaken for an
-//! operator -- not by post-hoc checking a `quoted` flag, but because the grammar itself only
-//! ever recognizes `|`/`<`/`>`/etc. as operators outside of any quote or escape in the first
-//! place.
+//! Splits a shell command line into tokens: words (honoring quoting, escaping, `$NAME`/`${NAME}`/
+//! `$?` expansion markers, and `NAME=...`-shaped assignment words), `|`, and redirection operators.
+//! `plans/USERSPACE_PLAN.md`'s step 10 note ("hand-roll the tokenizer; don't reach for `shlex`") is
+//! the actual lesson here: `shlex::split`-style tokenizing throws away whether a word was quoted or
+//! escaped, so `echo "|"` would misparse as a pipe and `a>b` would stay one word. Quoting/escaping
+//! is decided while scanning here instead (via a `peg` grammar, same as `syntax.rs`), so a quoted
+//! or escaped character is never mistaken for an operator -- not by post-hoc checking a flag, but
+//! because the grammar itself only ever recognizes `|`/`<`/`>`/etc. as operators outside of any
+//! quote or escape in the first place.
+//!
+//! A word doesn't resolve to a plain `String` here -- it's a [`Word`], a sequence of [`Part`]s
+//! (literal text, or a `$NAME`/`${NAME}`/`$?` reference, each knowing whether it came from inside
+//! double quotes) plus `assign`, the byte offset of `=` if this word is shaped like `NAME=...`
+//! (matches the reference lab's own `Word` exactly). Actually substituting a variable's value, and
+//! deciding whether a `NAME=...`-shaped word in *this* position really counts as an assignment
+//! (only a leading run of them does), are both jobs for later, higher layers (`shell::expand`,
+//! `shell::mod`'s own assignment-prefix handling) -- this module only recognizes the shape.
 //!
 //! The rules:
-//! - A word is what lies between blanks. Single quotes are fully literal. Inside double quotes
-//!   everything is literal except that a backslash escapes `"`, `\`, `$` and a backtick (so
-//!   `"\$"` is `$`); any other backslash there is itself. An unquoted backslash makes the next
-//!   character literal. Quoting or escaping any part of a word makes the whole word `quoted`.
+//! - A word is what lies between blanks. Single quotes are fully literal -- not just escaping, but
+//!   expansion too: `$x` inside single quotes is never a variable reference. Inside double quotes
+//!   everything is literal except that a backslash escapes `"`, `\`, `$` and a backtick (so `"\$"`
+//!   is a literal `$`, not the start of an expansion), and `$NAME`/`${NAME}`/`$?` are recognized.
+//!   An unquoted backslash makes the next character literal (so `\$` outside quotes is a literal
+//!   `$` too). Quoting or escaping any part of a word no longer marks the whole word in one flag
+//!   the way it used to -- that's now implicit per-expansion (`Part::Var`/`Status`'s own `quoted`).
+//! - Outside single quotes and escapes, `$NAME` (letters/digits/underscore, not starting with a
+//!   digit) and `${NAME}` are variable references; `$?`/`${?}` is the last line/pipeline's own
+//!   exit status. A `$` followed by anything else -- a digit, another `$`, end of input -- stays a
+//!   literal `$`: this project has no positional parameters or process ids to name (matches the
+//!   reference lab's own documented choice). `${` with no matching `NAME}` is
+//!   `LexError::BadSubstitution`.
+//! - A word whose text starts with a valid identifier followed by `=` (the identifier must be
+//!   literal -- an expansion can never supply the name half) is marked `assign: Some(offset)`.
 //! - `#` starts a comment only at the start of a word: `echo a#b` prints `a#b`, `echo a #b`
 //!   prints `a`.
 //! - `|`, `<`, `>`, `>>` and `>&` end a word and are operators. An unquoted, unescaped word that
@@ -21,14 +40,16 @@
 //!   are ordinary text (`a2>x` is the word `a2` and `>x`; `echo 2 >x` echoes `2`; a quoted
 //!   `"2">x` is a word; `3>x` is the word `3` and `>x`; `2<x`/`0>x` don't count either, since 2
 //!   isn't an input descriptor and 0 isn't an output one).
-//! - `$`, backtick, `*`, `?`, `~`, `{` and `}` are ordinary characters: nothing is expanded or
-//!   globbed yet.
+//! - Backtick, `*`, `?`, `~`, `{` and `}` (outside `${`) are still ordinary characters: command
+//!   substitution and globbing aren't implemented.
 //! - `;`, `&`, `(`, `)` and here-documents (`<<`, `<&`) are not supported, and are refused
 //!   rather than taken for text.
 
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+
+use super::frame_stack::is_valid_name;
 
 /// A redirection operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,14 +76,100 @@ impl RedirOp {
     }
 }
 
+/// One piece of a [`Word`]: literal text, or an expansion -- a `$NAME`/`${NAME}` variable
+/// reference, or `$?` (the last line/pipeline's own exit status). `Lit` carries no `quoted` flag
+/// of its own: blank-separated word-splitting already happened here, at lex time (that's the
+/// whole reason a `Word` is a sequence of parts rather than one string); only an *expansion's own
+/// result*, resolved later against live state, can still need splitting, which is exactly what
+/// each `Var`/`Status`'s own `quoted` decides (`shell::expand`'s own doc comment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    Lit(String),
+    Var { name: String, quoted: bool },
+    Status { quoted: bool },
+}
+
+/// A word: a run of adjacent [`Part`]s, in lexical order, plus `assign` -- the byte offset of `=`
+/// within `parts[0]` if this word's own text is shaped like `NAME=...` (`detect_assign`), `None`
+/// otherwise. Marked unconditionally, regardless of where the word sits in its segment: deciding
+/// whether that *counts* as a real assignment (only a leading run of such words does) is a later,
+/// higher layer's job, not this one's -- matches the reference lab's own `Word` exactly, including
+/// the division of labor.
+///
+/// `parts` is empty only for an explicitly empty quoted word (`""`/`''`) -- `unquoted()`'s own
+/// grammar rule can never match zero characters, so that's the only way this arises, and it always
+/// means "one empty field," never "nothing at all" (`shell::expand`'s own doc comment on the
+/// distinction).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Word {
+    pub parts: Vec<Part>,
+    /// Read by `assignment()` below -- `shell::split_assignments`'s own call, for a segment's
+    /// leading `NAME=...` words.
+    pub assign: Option<usize>,
+}
+
+impl Word {
+    /// Reconstructs this word as plain text, rendering a `Var`/`Status` part back as `$name`/`$?`
+    /// literally rather than expanding it. Used only by the two call sites that don't implement
+    /// expansion at all yet -- a redirect's own target, and `>&`'s dup-target check
+    /// (`syntax::grammar`) -- so `echo x > $FILE` stays unimplemented (`$FILE` taken as a literal
+    /// five-character name) rather than silently doing the wrong thing.
+    pub fn raw(&self) -> String {
+        let mut s = String::new();
+        for part in &self.parts {
+            match part {
+                Part::Lit(t) => s.push_str(t),
+                Part::Var { name, .. } => {
+                    s.push('$');
+                    s.push_str(name);
+                }
+                Part::Status { .. } => s.push_str("$?"),
+            }
+        }
+        s
+    }
+
+    /// If `assign` says this word is shaped like `NAME=VALUE`, splits it into the name and a new
+    /// `Word` for everything after the `=` (itself never `assign`-marked -- a value is never
+    /// re-examined for its own leading `NAME=`). `None` if `assign` is `None`.
+    pub fn assignment(&self) -> Option<(&str, Word)> {
+        let i = self.assign?;
+        let Some(Part::Lit(first)) = self.parts.first() else {
+            unreachable!("detect_assign only ever sets `assign` when parts[0] is a Lit")
+        };
+        let name = &first[..i];
+        let mut value_parts = Vec::with_capacity(self.parts.len());
+        let rest = &first[i + 1..];
+        if !rest.is_empty() {
+            value_parts.push(Part::Lit(rest.to_string()));
+        }
+        value_parts.extend(self.parts[1..].iter().cloned());
+        Some((
+            name,
+            Word {
+                parts: value_parts,
+                assign: None,
+            },
+        ))
+    }
+}
+
+/// `parts[0]`'s own text, if it's a `Lit` shaped like `NAME=...` with `NAME` a valid identifier --
+/// the byte offset of the `=`. A word starting with an expansion (`$FOO=bar`) is never an
+/// assignment: the name half must be literal, matching the reference lab's own rule (and simple
+/// common sense -- there's nothing to look up yet to decide what the name even is).
+fn detect_assign(parts: &[Part]) -> Option<usize> {
+    let Some(Part::Lit(text)) = parts.first() else {
+        return None;
+    };
+    let eq = text.find('=')?;
+    is_valid_name(&text[..eq]).then_some(eq)
+}
+
 /// One token `lex` produces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
-    /// A word: `quoted` is true if any part of it came from inside quotes or an escape.
-    Word {
-        text: String,
-        quoted: bool,
-    },
+    Word(Word),
     Pipe,
     /// A redirection operator and the descriptor number typed right before it, if any.
     Redir {
@@ -78,6 +185,134 @@ pub enum LexError {
     Unterminated(&'static str),
     /// A real shell operator this project doesn't implement: `;`, `&`, `(`, `)`, `<<`, `<&`.
     Unsupported(&'static str),
+    /// `${` with no matching `NAME}` (or `${?}`'s own `?`) -- bash's own "bad substitution".
+    BadSubstitution,
+}
+
+/// Scans already-matched text -- from inside unquoted or double-quoted context; single-quoted and
+/// escaped text never reach this at all, so a `$` there is never special in the first place -- for
+/// `$NAME`, `${NAME}`/`${?}` and `$?`, returning the resulting parts in order. A `$` followed by
+/// anything else (a digit, another `$`, end of input) stays a literal `$`: this project has no
+/// positional parameters or `$$` to name (matches the reference lab's own documented choice).
+/// `${` with no matching `NAME}` is `LexError::BadSubstitution`.
+fn scan_expansions(text: &str, quoted: bool) -> Result<Vec<Part>, LexError> {
+    let mut parts = Vec::new();
+    let mut lit = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            lit.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('?') => {
+                chars.next();
+                if !lit.is_empty() {
+                    parts.push(Part::Lit(core::mem::take(&mut lit)));
+                }
+                parts.push(Part::Status { quoted });
+            }
+            Some('{') => {
+                chars.next();
+                let mut name = String::new();
+                let mut closed = false;
+                for c2 in chars.by_ref() {
+                    if c2 == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(c2);
+                }
+                if !closed {
+                    return Err(LexError::BadSubstitution);
+                }
+                if !lit.is_empty() {
+                    parts.push(Part::Lit(core::mem::take(&mut lit)));
+                }
+                if name == "?" {
+                    parts.push(Part::Status { quoted });
+                } else if is_valid_name(&name) {
+                    parts.push(Part::Var { name, quoted });
+                } else {
+                    return Err(LexError::BadSubstitution);
+                }
+            }
+            Some(c2) if c2.is_ascii_alphabetic() || c2 == '_' => {
+                let mut name = String::new();
+                while let Some(&c3) = chars.peek() {
+                    if c3.is_ascii_alphanumeric() || c3 == '_' {
+                        name.push(c3);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if !lit.is_empty() {
+                    parts.push(Part::Lit(core::mem::take(&mut lit)));
+                }
+                parts.push(Part::Var { name, quoted });
+            }
+            _ => lit.push('$'), // not followed by anything expansion-eligible -- literal `$`
+        }
+    }
+    if !lit.is_empty() {
+        parts.push(Part::Lit(lit));
+    }
+    Ok(parts)
+}
+
+/// Merges adjacent `Part::Lit` entries (which arise constantly -- e.g. a word with no expansion in
+/// it at all is just one `Lit` after this, not one per grammar sub-rule that happened to
+/// contribute to it) -- cosmetic only, `expand`'s own output is identical either way, but a
+/// `Word` with the fewest parts that still means the same thing is easier to read in a test
+/// failure or a debug print, and is what `detect_assign` expects (`parts[0]` must be one whole
+/// `Lit` up to its own `=`, not split across several).
+fn merge_lits(parts: Vec<Part>) -> Vec<Part> {
+    let mut merged: Vec<Part> = Vec::with_capacity(parts.len());
+    for part in parts {
+        if let (Some(Part::Lit(prev)), Part::Lit(next)) = (merged.last_mut(), &part) {
+            prev.push_str(next);
+        } else {
+            merged.push(part);
+        }
+    }
+    merged
+}
+
+/// One escaped-or-raw character from inside a double-quoted string -- kept distinct until the
+/// whole quoted span is assembled (`assemble_dquoted`) specifically so an *escaped* `$` (from
+/// `"\$"`) never ends up concatenated with adjacent raw text before `scan_expansions` runs: were
+/// that allowed, `"\$FOO"` would wrongly re-combine into the literal text `$FOO` and then be
+/// *rescanned* as if it were an unescaped reference to `$FOO`, exactly the bug this type exists to
+/// avoid. A raw run (`Raw`) is scanned for expansions; an escaped char (`Esc`) becomes a literal
+/// `Part` on its own, isolated from whatever raw text sits next to it on either side.
+enum DChar {
+    Raw(char),
+    Esc(char),
+}
+
+/// Walks `chars` (one double-quoted string's content, in order), scanning each maximal run of
+/// `Raw` characters for `$`-expansions (`scan_expansions`, always `quoted: true` here) while
+/// `Esc` characters become their own isolated literal part -- see `DChar`'s own doc comment for
+/// why the isolation matters.
+fn assemble_dquoted(chars: Vec<DChar>) -> Result<Vec<Part>, LexError> {
+    let mut parts = Vec::new();
+    let mut raw = String::new();
+    for c in chars {
+        match c {
+            DChar::Raw(c) => raw.push(c),
+            DChar::Esc(c) => {
+                if !raw.is_empty() {
+                    parts.extend(scan_expansions(&core::mem::take(&mut raw), true)?);
+                }
+                parts.push(Part::Lit(c.to_string()));
+            }
+        }
+    }
+    if !raw.is_empty() {
+        parts.extend(scan_expansions(&raw, true)?);
+    }
+    Ok(parts)
 }
 
 peg::parser! {
@@ -93,48 +328,63 @@ peg::parser! {
         // "#" may continue a word already started but is excluded from unquoted_start, so it
         // can never start one -- at a fresh position only `comment` matches "#".
         rule unquoted_tail_char() = unquoted_start() / "#"
-        rule unquoted() -> String = s:$(unquoted_start() unquoted_tail_char()*) { s.to_string() }
+        rule unquoted() -> Vec<Part>
+            = s:$(unquoted_start() unquoted_tail_char()*) {?
+                scan_expansions(s, false).map_err(decode_as_token)
+              }
 
         rule squote_char() = !"'" [_]
-        rule squoted() -> String
-            = "'" s:$(squote_char()*) "'" { s.to_string() }
+        rule squoted() -> Vec<Part>
+            = "'" s:$(squote_char()*) "'" { vec![Part::Lit(s.to_string())] }
             / "'" squote_char()* {? Err("unterminated-quote") }
-        // No escaping inside single quotes.
+        // No escaping or expansion inside single quotes.
 
-        rule dquote_escape() -> char = "\\" c:['"' | '\\' | '$' | '`'] { c }
-        rule dquote_char() -> char = dquote_escape() / (!"\"" c:[_] { c })
+        rule dquote_escape() -> DChar = "\\" c:['"' | '\\' | '$' | '`'] { DChar::Esc(c) }
+        rule dquote_char() -> DChar = dquote_escape() / (!"\"" c:[_] { DChar::Raw(c) })
         // A backslash not immediately before one of the four specials falls through to the
-        // catch-all and is kept, as itself, by the *next* dquote_char -- pushing a lone '\\' and
-        // letting the following character (or end of input) be handled normally on the next
-        // iteration, rather than needing a dedicated "backslash but not before a special" rule.
-        rule dquoted() -> String
-            = "\"" s:dquote_char()* "\"" { s.into_iter().collect() }
+        // catch-all and is kept, as a raw character, by the *next* dquote_char -- pushing a lone
+        // '\\' and letting the following character (or end of input) be handled normally on the
+        // next iteration, rather than needing a dedicated "backslash but not before a special"
+        // rule.
+        rule dquoted() -> Vec<Part>
+            = "\"" s:dquote_char()* "\"" {? assemble_dquoted(s).map_err(decode_as_token) }
             / "\"" dquote_char()* {? Err("unterminated-quote") }
 
-        rule escape_piece() -> String
-            = "\\" c:[_] { c.to_string() }
+        rule escape_piece() -> Vec<Part>
+            = "\\" c:[_] { vec![Part::Lit(c.to_string())] }
             / "\\" {? Err("unterminated-escape") }
-        // Outside any quote, a backslash escapes exactly the next character, whatever it is;
-        // with nothing after it (end of input), that's an error distinct from an unterminated
-        // quote.
+        // Outside any quote, a backslash escapes exactly the next character, whatever it is --
+        // including `$`, which this isolates from `tail`'s own trailing `unquoted_tail_char`
+        // text the same way `assemble_dquoted` isolates an escaped `$` inside double quotes:
+        // `piece` (below) and the raw text after it are two separate grammar productions, never
+        // concatenated into one string before either is scanned for expansions.
 
-        rule piece() -> String = dquoted() / squoted() / escape_piece()
-        rule tail() -> String
-            = p:piece() s:$(unquoted_tail_char()*) { let mut r = p; r.push_str(s); r }
+        rule piece() -> Vec<Part> = dquoted() / squoted() / escape_piece()
+        rule tail() -> Vec<Part>
+            = p:piece() s:$(unquoted_tail_char()*) {?
+                let mut parts = p;
+                if !s.is_empty() {
+                    parts.extend(scan_expansions(s, false).map_err(decode_as_token)?);
+                }
+                Ok(parts)
+              }
 
         // A word is unquoted text with zero or more (piece, then more text) pairs after it, or
         // -- if it starts with a piece instead -- one or more of those same pairs.
-        rule word_token() -> (String, bool)
+        rule word_token() -> Word
             = u:unquoted() ts:tail()* {
-                let quoted = !ts.is_empty();
-                let mut s = u;
-                for t in ts { s.push_str(&t); }
-                (s, quoted)
+                let mut parts = u;
+                for t in ts { parts.extend(t); }
+                let parts = merge_lits(parts);
+                let assign = detect_assign(&parts);
+                Word { parts, assign }
               }
             / ts:tail()+ {
-                let mut s = String::new();
-                for t in &ts { s.push_str(t); }
-                (s, true)
+                let mut parts = Vec::new();
+                for t in ts { parts.extend(t); }
+                let parts = merge_lits(parts);
+                let assign = detect_assign(&parts);
+                Word { parts, assign }
               }
 
         rule comment() = "#" [_]*
@@ -188,7 +438,7 @@ peg::parser! {
             / op_lparen()
             / op_rparen()
             / pipe()
-            / w:word_token() { Token::Word { text: w.0, quoted: w.1 } }
+            / w:word_token() { Token::Word(w) }
 
         // Blanks and comments are just two more no-op alternatives in the same repeated choice
         // as a real token -- not a separate skip-whitespace wrapper around `token()`, which is
@@ -202,24 +452,33 @@ peg::parser! {
     }
 }
 
+/// Translates a `LexError` into the one sentinel string `BadSubstitution` always uses
+/// (`decode_error`'s own doc comment explains the convention) -- `scan_expansions`/
+/// `assemble_dquoted` can only ever fail with `BadSubstitution` (the `Result` type is shared with
+/// `LexError` generally, but an unterminated quote/escape is caught by the grammar itself, not by
+/// either of these two functions).
+fn decode_as_token(_: LexError) -> &'static str {
+    "bad-substitution"
+}
+
 /// Splits `line` into tokens, in order. An empty or comment-only line (`#` at the start of a
 /// word runs to the end of the line) produces an empty list, not an error.
 pub fn lex(line: &str) -> Result<Vec<Token>, LexError> {
     grammar::tokens(line).map_err(decode_error)
 }
 
-/// Translates a `peg::ParseError` back into the `LexError` its own `{? Err("...") }` action
-/// reported. Every failure this grammar can produce is tagged with one of these exact strings
-/// at the point it happens (`peg`'s own error tracking keeps the ones tried at the furthest
-/// position reached, regardless of which alternative the parser backtracked through afterward),
-/// so decoding is just matching the string back to its variant -- never reached for any other
-/// reason, since every character this grammar doesn't otherwise recognize as an operator or
-/// quote falls into an ordinary word.
+/// Translates a `peg::ParseError` back into the specific `LexError` its own `{? Err("...") }`
+/// action reported -- `peg`'s own error tracking keeps the ones tried at the furthest position
+/// reached, regardless of which alternative the parser backtracked through afterward, so decoding
+/// is just matching the string back to its variant -- never reached for any other reason, since
+/// every character this grammar doesn't otherwise recognize as an operator, quote, or expansion
+/// falls into an ordinary literal.
 fn decode_error(e: peg::error::ParseError<peg::str::LineCol>) -> LexError {
     for token in e.expected.tokens() {
         match token {
             "unterminated-quote" => return LexError::Unterminated("quote"),
             "unterminated-escape" => return LexError::Unterminated("escape"),
+            "bad-substitution" => return LexError::BadSubstitution,
             "op-heredoc" => return LexError::Unsupported("<<"),
             "op-dupin" => return LexError::Unsupported("<&"),
             "op-semicolon" => return LexError::Unsupported(";"),
@@ -235,19 +494,22 @@ fn decode_error(e: peg::error::ParseError<peg::str::LineCol>) -> LexError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use RedirOp::*;
 
+    fn word(parts: Vec<Part>) -> Token {
+        let assign = detect_assign(&parts);
+        Token::Word(Word { parts, assign })
+    }
     fn w(text: &str) -> Token {
-        Token::Word {
-            text: text.into(),
-            quoted: false,
+        word(vec![Part::Lit(text.into())])
+    }
+    fn var(name: &str, quoted: bool) -> Part {
+        Part::Var {
+            name: name.into(),
+            quoted,
         }
     }
-    fn q(text: &str) -> Token {
-        Token::Word {
-            text: text.into(),
-            quoted: true,
-        }
+    fn status(quoted: bool) -> Part {
+        Part::Status { quoted }
     }
     fn r(fd: Option<u8>, op: RedirOp) -> Token {
         Token::Redir { fd, op }
@@ -266,50 +528,59 @@ mod tests {
 
     #[test]
     fn quotes_group_and_mark_the_word() {
-        assert_eq!(lexed(r#"echo "a b""#), [w("echo"), q("a b")]);
-        assert_eq!(lexed("echo 'a b'"), [w("echo"), q("a b")]);
-        assert_eq!(lexed(r#"echo a"b c"d"#), [w("echo"), q("ab cd")]);
-        assert_eq!(lexed(r#"echo """#), [w("echo"), q("")]); // an empty word
+        assert_eq!(lexed(r#"echo "a b""#), [w("echo"), w("a b")]);
+        assert_eq!(lexed("echo 'a b'"), [w("echo"), w("a b")]);
+        assert_eq!(lexed(r#"echo a"b c"d"#), [w("echo"), w("ab cd")]);
+        assert_eq!(lexed(r#"echo """#), [w("echo"), word(vec![])]); // an empty word
     }
 
     #[test]
     fn quoted_operators_are_text() {
-        assert_eq!(lexed(r#"echo "|""#), [w("echo"), q("|")]);
-        assert_eq!(lexed("echo '|'"), [w("echo"), q("|")]);
+        assert_eq!(lexed(r#"echo "|""#), [w("echo"), w("|")]);
+        assert_eq!(lexed("echo '|'"), [w("echo"), w("|")]);
         assert_eq!(
             lexed(r#"echo ">" '<' ">>""#),
-            [w("echo"), q(">"), q("<"), q(">>")]
+            [w("echo"), w(">"), w("<"), w(">>")]
         );
         assert_eq!(
             lexed(r#"echo ";" "&" "(""#),
-            [w("echo"), q(";"), q("&"), q("(")]
+            [w("echo"), w(";"), w("&"), w("(")]
         );
     }
 
     #[test]
     fn single_quotes_are_fully_literal() {
-        assert_eq!(lexed(r"echo 'a\b'"), [w("echo"), q(r"a\b")]);
-        assert_eq!(lexed(r#"echo 'a"b'"#), [w("echo"), q(r#"a"b"#)]);
-        assert_eq!(lexed("echo '$x `y`'"), [w("echo"), q("$x `y`")]);
+        assert_eq!(lexed(r"echo 'a\b'"), [w("echo"), w(r"a\b")]);
+        assert_eq!(lexed(r#"echo 'a"b'"#), [w("echo"), w(r#"a"b"#)]);
+        assert_eq!(lexed("echo '$x `y`'"), [w("echo"), w("$x `y`")]);
     }
 
     #[test]
     fn double_quotes_escape_only_four_characters() {
-        assert_eq!(lexed(r#"echo "a\"b""#), [w("echo"), q(r#"a"b"#)]);
-        assert_eq!(lexed(r#"echo "a\\b""#), [w("echo"), q(r"a\b")]);
-        assert_eq!(lexed(r#"echo "\$""#), [w("echo"), q("$")]);
-        assert_eq!(lexed(r#"echo "\`""#), [w("echo"), q("`")]);
-        assert_eq!(lexed(r#"echo "a\nb""#), [w("echo"), q(r"a\nb")]); // any other backslash is itself
-        assert_eq!(lexed(r#"echo "\ ""#), [w("echo"), q(r"\ ")]);
+        assert_eq!(lexed(r#"echo "a\"b""#), [w("echo"), w(r#"a"b"#)]);
+        assert_eq!(lexed(r#"echo "a\\b""#), [w("echo"), w(r"a\b")]);
+        assert_eq!(lexed(r#"echo "\$""#), [w("echo"), w("$")]);
+        assert_eq!(lexed(r#"echo "\`""#), [w("echo"), w("`")]);
+        assert_eq!(lexed(r#"echo "a\nb""#), [w("echo"), w(r"a\nb")]); // any other backslash is itself
+        assert_eq!(lexed(r#"echo "\ ""#), [w("echo"), w(r"\ ")]);
+    }
+
+    #[test]
+    fn an_escaped_dollar_is_never_rescanned_for_expansion() {
+        // The bug `DChar`/`assemble_dquoted` exist to avoid: if the escaped `$` were naively
+        // concatenated with the raw text after it before scanning, this would wrongly become a
+        // reference to `$FOO`.
+        assert_eq!(lexed(r#"echo "\$FOO""#), [w("echo"), w("$FOO")]);
+        assert_eq!(lexed(r"echo \$FOO"), [w("echo"), w("$FOO")]);
     }
 
     #[test]
     fn an_unquoted_backslash_escapes_the_next_character() {
-        assert_eq!(lexed(r"echo a\ b"), [w("echo"), q("a b")]);
-        assert_eq!(lexed(r"echo \|"), [w("echo"), q("|")]);
-        assert_eq!(lexed(r"echo \>x"), [w("echo"), q(">x")]);
-        assert_eq!(lexed(r"echo \\"), [w("echo"), q(r"\")]);
-        assert_eq!(lexed(r"echo \#a"), [w("echo"), q("#a")]);
+        assert_eq!(lexed(r"echo a\ b"), [w("echo"), w("a b")]);
+        assert_eq!(lexed(r"echo \|"), [w("echo"), w("|")]);
+        assert_eq!(lexed(r"echo \>x"), [w("echo"), w(">x")]);
+        assert_eq!(lexed(r"echo \\"), [w("echo"), w(r"\")]);
+        assert_eq!(lexed(r"echo \#a"), [w("echo"), w("#a")]);
     }
 
     #[test]
@@ -326,7 +597,7 @@ mod tests {
         assert_eq!(lexed("echo a #b c"), [w("echo"), w("a")]);
         assert_eq!(lexed("echo a#b"), [w("echo"), w("a#b")]);
         assert_eq!(lexed("echo #"), [w("echo")]);
-        assert_eq!(lexed(r##"echo "#""##), [w("echo"), q("#")]);
+        assert_eq!(lexed(r##"echo "#""##), [w("echo"), w("#")]);
         assert_eq!(
             lexed("echo a | # trailing"),
             [w("echo"), w("a"), Token::Pipe]
@@ -336,68 +607,224 @@ mod tests {
     #[test]
     fn pipes_and_redirections_end_words() {
         assert_eq!(lexed("a|b"), [w("a"), Token::Pipe, w("b")]);
-        assert_eq!(lexed("a>b"), [w("a"), r(None, Out), w("b")]);
-        assert_eq!(lexed("a>>b"), [w("a"), r(None, Append), w("b")]);
-        assert_eq!(lexed("a<b"), [w("a"), r(None, In), w("b")]);
+        assert_eq!(lexed("a>b"), [w("a"), r(None, RedirOp::Out), w("b")]);
+        assert_eq!(lexed("a>>b"), [w("a"), r(None, RedirOp::Append), w("b")]);
+        assert_eq!(lexed("a<b"), [w("a"), r(None, RedirOp::In), w("b")]);
         assert_eq!(
             lexed("a | b > c < d"),
             [
                 w("a"),
                 Token::Pipe,
                 w("b"),
-                r(None, Out),
+                r(None, RedirOp::Out),
                 w("c"),
-                r(None, In),
+                r(None, RedirOp::In),
                 w("d")
             ]
         );
-        assert_eq!(lexed("a >&2"), [w("a"), r(None, DupOut), w("2")]);
+        assert_eq!(lexed("a >&2"), [w("a"), r(None, RedirOp::DupOut), w("2")]);
     }
 
     #[test]
     fn a_descriptor_number_right_before_an_operator_is_taken() {
-        assert_eq!(lexed("cmd 2>x"), [w("cmd"), r(Some(2), Out), w("x")]);
-        assert_eq!(lexed("cmd 1>x"), [w("cmd"), r(Some(1), Out), w("x")]);
-        assert_eq!(lexed("cmd 2>>x"), [w("cmd"), r(Some(2), Append), w("x")]);
-        assert_eq!(lexed("cmd 2>&1"), [w("cmd"), r(Some(2), DupOut), w("1")]);
-        assert_eq!(lexed("cmd 0<x"), [w("cmd"), r(Some(0), In), w("x")]);
+        assert_eq!(
+            lexed("cmd 2>x"),
+            [w("cmd"), r(Some(2), RedirOp::Out), w("x")]
+        );
+        assert_eq!(
+            lexed("cmd 1>x"),
+            [w("cmd"), r(Some(1), RedirOp::Out), w("x")]
+        );
+        assert_eq!(
+            lexed("cmd 2>>x"),
+            [w("cmd"), r(Some(2), RedirOp::Append), w("x")]
+        );
+        assert_eq!(
+            lexed("cmd 2>&1"),
+            [w("cmd"), r(Some(2), RedirOp::DupOut), w("1")]
+        );
+        assert_eq!(
+            lexed("cmd 0<x"),
+            [w("cmd"), r(Some(0), RedirOp::In), w("x")]
+        );
     }
 
     #[test]
     fn digits_elsewhere_are_ordinary_text() {
-        assert_eq!(lexed("a2>x"), [w("a2"), r(None, Out), w("x")]);
+        assert_eq!(lexed("a2>x"), [w("a2"), r(None, RedirOp::Out), w("x")]);
         assert_eq!(
             lexed("echo 2 >x"),
-            [w("echo"), w("2"), r(None, Out), w("x")]
+            [w("echo"), w("2"), r(None, RedirOp::Out), w("x")]
         );
         assert_eq!(
             lexed(r#"echo "2">x"#),
-            [w("echo"), q("2"), r(None, Out), w("x")]
+            [w("echo"), w("2"), r(None, RedirOp::Out), w("x")]
         );
         assert_eq!(
             lexed(r"echo \2>x"),
-            [w("echo"), q("2"), r(None, Out), w("x")]
+            [w("echo"), w("2"), r(None, RedirOp::Out), w("x")]
         );
-        assert_eq!(lexed("cmd 3>x"), [w("cmd"), w("3"), r(None, Out), w("x")]);
-        assert_eq!(lexed("cmd 12>x"), [w("cmd"), w("12"), r(None, Out), w("x")]);
-        assert_eq!(lexed("cmd 2<x"), [w("cmd"), w("2"), r(None, In), w("x")]); // 2 is not an input descriptor
-        assert_eq!(lexed("cmd 0>x"), [w("cmd"), w("0"), r(None, Out), w("x")]); // nor 0 an output one
+        assert_eq!(
+            lexed("cmd 3>x"),
+            [w("cmd"), w("3"), r(None, RedirOp::Out), w("x")]
+        );
+        assert_eq!(
+            lexed("cmd 12>x"),
+            [w("cmd"), w("12"), r(None, RedirOp::Out), w("x")]
+        );
+        assert_eq!(
+            lexed("cmd 2<x"),
+            [w("cmd"), w("2"), r(None, RedirOp::In), w("x")]
+        ); // 2 is not an input descriptor
+        assert_eq!(
+            lexed("cmd 0>x"),
+            [w("cmd"), w("0"), r(None, RedirOp::Out), w("x")]
+        ); // nor 0 an output one
     }
 
     #[test]
-    fn expansion_characters_are_ordinary() {
+    fn non_dollar_expansion_characters_are_still_ordinary() {
         assert_eq!(
-            lexed("echo $x `y` * ? ~ {a,b}"),
+            lexed("echo `y` * ? ~ {a,b}"),
+            [w("echo"), w("`y`"), w("*"), w("?"), w("~"), w("{a,b}")]
+        );
+    }
+
+    #[test]
+    fn unquoted_var_is_recognized() {
+        assert_eq!(lexed("echo $x"), [w("echo"), word(vec![var("x", false)])]);
+        assert_eq!(
+            lexed("echo $x!"),
             [
                 w("echo"),
-                w("$x"),
-                w("`y`"),
-                w("*"),
-                w("?"),
-                w("~"),
-                w("{a,b}")
+                word(vec![var("x", false), Part::Lit("!".into())])
             ]
         );
+        assert_eq!(
+            lexed("echo a$xb"),
+            [
+                w("echo"),
+                word(vec![Part::Lit("a".into()), var("xb", false)])
+            ]
+        );
+    }
+
+    #[test]
+    fn braced_var_stops_at_the_closing_brace() {
+        assert_eq!(
+            lexed("echo ${x}y"),
+            [
+                w("echo"),
+                word(vec![var("x", false), Part::Lit("y".into())])
+            ]
+        );
+    }
+
+    #[test]
+    fn dollar_question_is_status() {
+        assert_eq!(lexed("echo $?"), [w("echo"), word(vec![status(false)])]);
+        assert_eq!(lexed("echo ${?}"), [w("echo"), word(vec![status(false)])]);
+    }
+
+    #[test]
+    fn quoted_var_is_marked_quoted() {
+        assert_eq!(
+            lexed(r#"echo "$x""#),
+            [w("echo"), word(vec![var("x", true)])]
+        );
+        assert_eq!(
+            lexed(r#"echo "$x" $x"#),
+            [
+                w("echo"),
+                word(vec![var("x", true)]),
+                word(vec![var("x", false)])
+            ]
+        );
+    }
+
+    #[test]
+    fn dollar_not_followed_by_a_name_is_literal() {
+        assert_eq!(lexed("echo $"), [w("echo"), w("$")]);
+        assert_eq!(lexed("echo $1"), [w("echo"), w("$1")]);
+        assert_eq!(lexed("echo $$"), [w("echo"), w("$$")]);
+        assert_eq!(lexed(r#"echo "$""#), [w("echo"), w("$")]);
+    }
+
+    #[test]
+    fn single_quotes_block_expansion_but_double_quotes_do_not() {
+        assert_eq!(lexed("echo '$x'"), [w("echo"), w("$x")]);
+        assert_eq!(
+            lexed(r#"echo "$x""#),
+            [w("echo"), word(vec![var("x", true)])]
+        );
+    }
+
+    #[test]
+    fn bad_substitution_is_an_error() {
+        assert_eq!(lex("echo ${"), Err(LexError::BadSubstitution));
+        assert_eq!(lex("echo ${x"), Err(LexError::BadSubstitution));
+        assert_eq!(lex("echo ${1abc}"), Err(LexError::BadSubstitution));
+        assert_eq!(lex(r#"echo "${""#), Err(LexError::BadSubstitution));
+    }
+
+    #[test]
+    fn assignment_shaped_words_are_marked() {
+        let Token::Word(word) = &lexed("FOO=bar")[0] else {
+            panic!("expected a word")
+        };
+        assert_eq!(word.assign, Some(3));
+        assert_eq!(
+            word.assignment(),
+            Some((
+                "FOO",
+                Word {
+                    parts: vec![Part::Lit("bar".into())],
+                    assign: None
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn assignment_value_can_contain_an_expansion() {
+        let Token::Word(word) = &lexed("FOO=$BAR")[0] else {
+            panic!("expected a word")
+        };
+        assert_eq!(
+            word.assignment(),
+            Some((
+                "FOO",
+                Word {
+                    parts: vec![var("BAR", false)],
+                    assign: None
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_plain_word_is_not_marked_as_an_assignment() {
+        let Token::Word(word) = &lexed("echo")[0] else {
+            panic!("expected a word")
+        };
+        assert_eq!(word.assign, None);
+    }
+
+    #[test]
+    fn an_invalid_identifier_before_equals_is_not_an_assignment() {
+        let Token::Word(word) = &lexed("1FOO=bar")[0] else {
+            panic!("expected a word")
+        };
+        assert_eq!(word.assign, None);
+    }
+
+    #[test]
+    fn a_word_starting_with_an_expansion_is_never_an_assignment() {
+        // `$FOO=bar` -- the name half must be literal text, not an expansion.
+        let Token::Word(word) = &lexed("$FOO=bar")[0] else {
+            panic!("expected a word")
+        };
+        assert_eq!(word.assign, None);
     }
 
     #[test]

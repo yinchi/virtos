@@ -47,19 +47,24 @@ unsafe extern "C" {
 
     /// Restores the register set `enter_el0` saved and jumps back into it directly -- never
     /// returns itself. Called from `syscall::sync_el0_handler` for `exit` and for a caught fault
-    /// alike.
+    /// alike. `code` becomes `enter`'s own return value: `context.s`'s register restore never
+    /// touches `x0`, so whatever AAPCS64 places there for this call survives untouched all the way
+    /// back out through `enter_el0`'s own `ret` and the `bl` that reaches it in `enter`'s inline
+    /// asm below.
     ///
     /// # Safety
     /// Must only be called from within the `sync_el0_64` handler, after `enter` has actually
     /// started a program (so `context.s`'s `KERNEL_CTX` holds a real checkpoint, not its zeroed
     /// initial state).
-    pub fn resume_kernel() -> !;
+    pub fn resume_kernel(code: i32) -> !;
 }
 
 /// Enters EL0 at `entry`, with `argv` as the initial `SP_EL0` (the top of what `push_strings` just
 /// wrote there -- `argc`/`argv`/`envp` sit at or below it), and returns once that program exits or
 /// faults -- `enter_el0`/`resume_kernel` (`context.s`) are what make an ordinary Rust function call
-/// correctly "pause" for however long the program runs, however it ends.
+/// correctly "pause" for however long the program runs, however it ends. The returned `i32` is
+/// whatever `resume_kernel` was called with: the program's own `exit` code, or a fixed `139` for a
+/// caught fault (`syscall::sync_el0_handler`'s own doc comment on both call sites).
 ///
 /// Interrupts are masked from the first system-register write below until `enter_el0`'s `eret`
 /// (see `irq::mask`), then explicitly unmasked again once it returns: every path back out of a
@@ -72,7 +77,7 @@ unsafe extern "C" {
 /// `entry` must be mapped EL0-executable and `argv` must be a valid EL0 stack pointer, with
 /// `argc`/`argv`/`envp` already written at/below it (`push_strings`) -- callers so far map and
 /// write both inside `mmu::USER_BASE..USER_BASE + USER_SIZE` before calling this.
-pub unsafe fn enter(entry: usize, argc: usize, argv: usize, envp: usize) {
+pub unsafe fn enter(entry: usize, argc: usize, argv: usize, envp: usize) -> i32 {
     irq::mask();
 
     // M[3:0] = 0b0000 (EL0t), every DAIF bit unmasked (bits 9:6 = 0) -- the program runs
@@ -91,17 +96,23 @@ pub unsafe fn enter(entry: usize, argc: usize, argv: usize, envp: usize) {
     // instruction sequence that calls it, with nothing of Rust's own codegen between the two free
     // to reuse those (ordinarily caller-saved) registers first -- AAPCS64 passes the first three
     // integer arguments in x0-x2, which is exactly the argc/argv/envp convention a program's own
-    // `_start` expects to find them in.
+    // `_start` expects to find them in. `inout("x0")`, not a separate `in`/`lateout` pair for the
+    // same register (not even expressible -- a register names at most one operand): `x0` seeds
+    // `argc` going in, exactly as before, and `context.s`'s register restore never touches `x0` on
+    // the way back (`resume_kernel`'s own doc comment), so whatever `resume_kernel` was called
+    // with is still sitting there once this `bl` "returns", read out as `exit_code`.
+    let exit_code: usize;
     unsafe {
         core::arch::asm!(
             "bl {enter}",
-            in("x0") argc,
+            inout("x0") argc => exit_code,
             in("x1") argv,
             in("x2") envp,
             enter = sym enter_el0,
             clobber_abi("C"),
         );
     }
+    let exit_code = exit_code as i32;
 
     // Back from the program: drop whatever fds it still had open (its `write`/`read`'s own table,
     // untouched by the longjmp above) before anything else can look at fd numbers again.
@@ -111,6 +122,8 @@ pub unsafe fn enter(entry: usize, argc: usize, argv: usize, envp: usize) {
     // again regardless of what the program itself last had them set to) -- unmask unconditionally
     // so the kernel resumes normal operation, exactly as if this had been an ordinary call.
     irq::unmask();
+
+    exit_code
 }
 
 /// Writes the argument and environment strings onto the stack below `sp` as NUL-terminated
@@ -188,13 +201,14 @@ fn map_and_zero(start: usize, end: usize) -> Result<(), ElfError> {
 /// Returns `Err` without entering EL0 at all if the ELF is invalid (`LaunchError::Elf`), if
 /// `args`/`env` together don't fit in `ARG_MAX` (`LaunchError::ArgsTooBig`), if mapping the stack
 /// or heap fails (`LaunchError::Elf(ElfError::MapFailed)`), or if a `stdio` redirection couldn't
-/// be bound (`LaunchError::BadRedirect`).
+/// be bound (`LaunchError::BadRedirect`). `Ok` carries the program's own real exit status --
+/// `enter`'s own doc comment on where that value actually comes from.
 pub fn run_program(
     elf_bytes: &[u8],
     args: &[&str],
     env: &[&str],
     stdio: [Option<crate::syscall::fd::StdioRedirect>; 3],
-) -> Result<(), LaunchError> {
+) -> Result<i32, LaunchError> {
     let floor = USER_STACK_TOP - ARG_MAX;
 
     // Dry run first: a list that can't fit must not cost a load.
@@ -231,6 +245,5 @@ pub fn run_program(
     // SAFETY: `entry` came from `elf::load`, which only ever returns an address inside a segment
     // it just mapped EL0-executable; `argv`/`envp` came from `push_strings`, which wrote them (and
     // everything they point to) inside the same stack window.
-    unsafe { enter(entry, args.len(), argv, envp) };
-    Ok(())
+    Ok(unsafe { enter(entry, args.len(), argv, envp) })
 }

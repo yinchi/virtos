@@ -7,9 +7,13 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::lexer::{self, LexError, RedirOp, Token};
+use super::lexer::{self, LexError, RedirOp, Token, Word};
 
-/// One redirection a `Segment` applies before its program starts.
+/// One redirection a `Segment` applies before its program starts. Its own target is plain text,
+/// not a `Word` -- `$VAR` expansion inside a redirect target isn't implemented yet (`echo x >
+/// $FILE` stays unimplemented, `$FILE` taken as a literal name): `Word::raw()` reconstructs
+/// whatever text the lexer matched, rendering any expansion marker back as literal `$name`/`$?`
+/// rather than silently doing the wrong thing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redirection {
     In(String),
@@ -17,10 +21,12 @@ pub enum Redirection {
     Dup { fd: u8, target: u8 },
 }
 
-/// One `|`-separated command: its own argv and redirections, in the order they were written.
+/// One `|`-separated command: its own words and redirections, in the order they were written.
+/// `words`, not `argv` -- each one may still need `$VAR`/`${VAR}`/`$?` expansion (`shell::expand`)
+/// before it's a real argument string.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Segment {
-    pub argv: Vec<String>,
+    pub words: Vec<Word>,
     pub redirs: Vec<Redirection>,
 }
 
@@ -102,27 +108,35 @@ fn decode_error(e: peg::error::ParseError<usize>) -> SyntaxError {
 /// One thing a `segment` rule saw: either an ordinary argument, or a redirection. Not part of
 /// this module's public API -- `Segment` itself splits these apart before returning.
 enum Item {
-    Arg(String),
+    Arg(Word),
     Redir(Redirection),
 }
 
 peg::parser! {
     grammar grammar<'a>() for SliceByRef<'a, Token> {
-        rule word() -> String
-            = [Token::Word { text, .. }] { text.clone() }
+        /// A plain argument word, kept structured -- `$VAR`/`${VAR}`/`$?` expansion (`shell::
+        /// expand`) still needs to happen against it later.
+        rule word() -> Word
+            = [Token::Word(w)] { w.clone() }
+
+        /// A redirect's own target, or `>&`'s dup-target digit -- plain text, via `Word::raw()`
+        /// (its own doc comment explains why: expansion isn't implemented for these two call
+        /// sites yet).
+        rule raw_word() -> String
+            = [Token::Word(w)] { w.raw() }
 
         rule redir() -> Redirection
-            = [Token::Redir { fd, op: RedirOp::In }] path:word() { Redirection::In(path) }
+            = [Token::Redir { fd, op: RedirOp::In }] path:raw_word() { Redirection::In(path) }
             / [Token::Redir { op: RedirOp::In, .. }] {? Err("missing-target-in") }
-            / [Token::Redir { fd, op: RedirOp::Out }] path:word() {
+            / [Token::Redir { fd, op: RedirOp::Out }] path:raw_word() {
                 Redirection::Out { fd: fd.unwrap_or(1), path, append: false }
               }
             / [Token::Redir { op: RedirOp::Out, .. }] {? Err("missing-target-out") }
-            / [Token::Redir { fd, op: RedirOp::Append }] path:word() {
+            / [Token::Redir { fd, op: RedirOp::Append }] path:raw_word() {
                 Redirection::Out { fd: fd.unwrap_or(1), path, append: true }
               }
             / [Token::Redir { op: RedirOp::Append, .. }] {? Err("missing-target-append") }
-            / [Token::Redir { fd, op: RedirOp::DupOut }] path:word() {?
+            / [Token::Redir { fd, op: RedirOp::DupOut }] path:raw_word() {?
                 match path.as_str() {
                     "1" => Ok(Redirection::Dup { fd: fd.unwrap_or(1), target: 1 }),
                     "2" => Ok(Redirection::Dup { fd: fd.unwrap_or(1), target: 2 }),
@@ -137,18 +151,18 @@ peg::parser! {
 
         rule segment() -> Segment
             = items:item()* {?
-                let mut argv = Vec::new();
+                let mut words = Vec::new();
                 let mut redirs = Vec::new();
                 for it in items {
                     match it {
-                        Item::Arg(a) => argv.push(a),
+                        Item::Arg(a) => words.push(a),
                         Item::Redir(r) => redirs.push(r),
                     }
                 }
-                if argv.is_empty() && redirs.is_empty() {
+                if words.is_empty() && redirs.is_empty() {
                     Err("empty-command")
                 } else {
-                    Ok(Segment { argv, redirs })
+                    Ok(Segment { words, redirs })
                 }
               }
 
@@ -166,8 +180,10 @@ peg::parser! {
 mod tests {
     use super::*;
 
-    fn argv(pipeline: &Pipeline, i: usize) -> Vec<&str> {
-        pipeline[i].argv.iter().map(String::as_str).collect()
+    // `.raw()` is good enough for these tests -- none of them involve an expansion, so it's the
+    // same text `argv` used to compare directly before `Segment.words` existed.
+    fn argv(pipeline: &Pipeline, i: usize) -> Vec<String> {
+        pipeline[i].words.iter().map(Word::raw).collect()
     }
 
     #[test]
@@ -204,7 +220,7 @@ mod tests {
     fn a_stage_of_only_redirections_parses() {
         // POSIX allows `> f` (it creates the file); running it is another matter.
         let p = parse("> f").unwrap();
-        assert!(p[0].argv.is_empty());
+        assert!(p[0].words.is_empty());
         assert_eq!(
             p[0].redirs,
             [Redirection::Out {

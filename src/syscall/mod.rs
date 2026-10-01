@@ -25,6 +25,10 @@ const EC_SVC64: u8 = 0x15;
 const EC_IABT_LOWER: u8 = 0x20;
 const EC_DABT_LOWER: u8 = 0x24;
 
+/// The exit status a caught fault reports as its "`exit` code" -- `128 + SIGSEGV`, matching the
+/// reference lab's own convention (a real Unix exit status for a signal-killed process).
+const FAULT_EXIT_CODE: i32 = 139;
+
 /// Mirrors `kernel_entry`'s stack layout exactly (`vectors.s`): `x0`-`x29`, then the `ELR_EL1`/
 /// `SPSR_EL1` pair, then `x30` (padded to keep the frame 16-byte aligned). `sync_el0_64` passes
 /// the frame's base address in `x0` before calling `sync_el0_handler`, so this struct is how Rust
@@ -76,11 +80,12 @@ extern "C" fn sync_el0_handler(regs: *mut TrapFrame) {
                     // Never returns to kernel_exit's normal eret-back-to-EL0 path --
                     // resume_kernel (context.s) restores the register set enter_el0
                     // checkpointed and jumps straight back into `exec::process::enter`'s call
-                    // site instead.
+                    // site instead, with `a0` (the program's own real exit code) becoming
+                    // `enter`'s return value -- see `resume_kernel`'s own doc comment for how.
                     // SAFETY: only reachable once `exec::process::enter` has actually started a
                     // program (context.s's KERNEL_CTX holds a real checkpoint, not its zeroed
                     // initial state).
-                    unsafe { process::resume_kernel() }
+                    unsafe { process::resume_kernel(a0 as i32) }
                 }
                 _ => regs.x[0] = (-1i64) as u64, // no such syscall yet
             }
@@ -94,8 +99,10 @@ extern "C" fn sync_el0_handler(regs: *mut TrapFrame) {
                 uart,
                 "Segmentation fault (address {far:#x}, ESR_EL1 {esr:?})"
             );
-            // SAFETY: as in the `SYS_EXIT` arm above.
-            unsafe { process::resume_kernel() }
+            // SAFETY: as in the `SYS_EXIT` arm above. `FAULT_EXIT_CODE`, not the program's own
+            // choice -- there's no real exit code to read from a program that never called
+            // `exit` at all.
+            unsafe { process::resume_kernel(FAULT_EXIT_CODE) }
         }
 
         // Anything else (FP exceptions, alignment faults, ...) -- deliberately narrow decoding,
