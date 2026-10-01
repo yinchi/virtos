@@ -6,8 +6,10 @@
 //! `apply_redirects_standalone` here, for `cd` or a segment with no command at all), and a
 //! multi-stage pipeline via temp files under `/tmp` (`run_pipeline`), a stage's own redirections
 //! layered on top of its pipe binding the same way a real shell does (`apply_overrides`'s own
-//! doc comment). `cd` is its one builtin (`fs::cwd`'s own doc comment explains why it has to
-//! be): everything else is looked up under `usr/bin/` and run as a real EL0 program.
+//! doc comment). `cd` (`fs::cwd`'s own doc comment explains why it has to be a builtin) and
+//! `source`/`.` (runs a script's lines unscoped, so its own `cd` sticks -- there's no frame/scope
+//! stack here to push one onto in the first place) are its only builtins (`is_builtin`);
+//! everything else is looked up under `usr/bin/` and run as a real EL0 program.
 //!
 //! `lexer`/`syntax` are pure logic, no hardware dependency: built and host-tested under both
 //! targets, like `fs::sector`/`exec::elfparse`. Everything below them touches the console,
@@ -56,6 +58,15 @@ fn report(uart: &mut Uart, msg: &str) {
     }
 }
 
+/// The builtin `name` is, if it is one -- checked before ever trying to resolve
+/// `usr/bin/<name>`, and before a pipeline stage is allowed to even attempt connecting to the
+/// pipe wiring: neither `cd` nor `source`/`.` launches a real process with a real fd table, so
+/// neither has anywhere to plug a pipe binding into (`run_pipeline`'s own doc comment).
+#[cfg(target_os = "none")]
+fn is_builtin(name: &str) -> bool {
+    matches!(name, "cd" | "source" | ".")
+}
+
 /// Makes `argv[1]` (or `/`, with no argument -- there's no `$HOME` to fall back to yet) the
 /// working directory, if it names a real directory. Unlike every other command, this can't be an
 /// ordinary `usr/bin/` program: an EL0 process changing its own working directory would never be
@@ -75,6 +86,74 @@ fn cd(uart: &mut Uart, argv: &[String]) {
         return;
     }
     fs::cwd::set(absolute);
+}
+
+/// How many scripts may be nested (a script's own line sourcing another, and so on) before
+/// `source` refuses to go further -- protects the kernel stack from a script that (directly or
+/// indirectly) sources itself. Matches the reference lab's own chosen value; no reason here to
+/// pick a different one.
+const MAX_SCRIPT_DEPTH: usize = 16;
+
+/// `source FILE` / `. FILE` (`.` is POSIX's own name for this; `source` is bash's alias) --
+/// resolves `FILE` against the working directory (no `/usr/bin` search, and no exec bit needed,
+/// unlike launching a program: POSIX's own rule for this, and virtos has no notion of an exec
+/// bit on a plain file to check anyway) and runs each of its lines as if typed at the prompt.
+/// Unscoped, matching the lab's own `source`/`.` (as opposed to its `sh FILE`, which pushes a
+/// scope first): a sourced script's own `cd` sticks after it returns, the same as if its lines
+/// had been typed directly -- there is no frame/scope stack to push one onto in the first place
+/// (`fs::cwd`'s own doc comment already commits to flat, global state), so this needs no extra
+/// mechanism to get that behavior, only to *not* build one it doesn't have.
+///
+/// `depth` is the nesting level `source` itself is running at (0 at the prompt, incrementing by
+/// one per level); refused outright at `MAX_SCRIPT_DEPTH` before this even tries to open `FILE`,
+/// and threaded through as `depth + 1` to every line it runs, the same way `run_pipeline` would
+/// need to if a builtin were ever allowed to run as one of its stages (it isn't -- `is_builtin`'s
+/// own doc comment).
+#[cfg(target_os = "none")]
+fn source(uart: &mut Uart, name: &str, argv: &[String], depth: usize) {
+    let path = match argv {
+        [_, path] => path.as_str(),
+        [_] => {
+            report(uart, &format!("{name}: usage: {name} FILE"));
+            return;
+        }
+        _ => {
+            report(uart, &format!("{name}: too many arguments"));
+            return;
+        }
+    };
+    if depth >= MAX_SCRIPT_DEPTH {
+        report(uart, &format!("{name}: {path}: too many levels of scripts"));
+        return;
+    }
+    let Some(vol) = fs::volume::get(0) else {
+        report(uart, "system.img not mounted");
+        return;
+    };
+    let absolute = fs::cwd::absolute(path);
+    let Ok(entry) = fs::path::resolve(vol, &absolute) else {
+        report(uart, &format!("{name}: {path}: not found"));
+        return;
+    };
+    if entry.is_directory() {
+        report(uart, &format!("{name}: {path}: is a directory"));
+        return;
+    }
+    let Ok(mut reader) = vol.read_file(&entry) else {
+        report(uart, &format!("{name}: {path}: failed to open"));
+        return;
+    };
+    let Ok(bytes) = reader.read_to_vec() else {
+        report(uart, &format!("{name}: {path}: failed to read"));
+        return;
+    };
+    let Ok(content) = core::str::from_utf8(&bytes) else {
+        report(uart, &format!("{name}: {path}: not valid UTF-8"));
+        return;
+    };
+    for line in content.lines() {
+        run(uart, line, depth + 1);
+    }
 }
 
 /// Applies `redirs` with no program to run afterward -- `cd`, and a segment with no command at
@@ -276,10 +355,10 @@ fn run_pipeline(uart: &mut Uart, pipeline: &[syntax::Segment]) {
 
     for (i, segment) in pipeline.iter().enumerate() {
         let argv = &segment.argv;
-        if argv.is_empty() || argv[0] == "cd" {
+        if argv.is_empty() || is_builtin(argv[0].as_str()) {
             report(
                 uart,
-                "cd, or a stage with no command, is not supported in a pipeline",
+                "a builtin, or a stage with no command, is not supported in a pipeline",
             );
             break;
         }
@@ -361,16 +440,21 @@ fn describe_syntax_error(err: syntax::SyntaxError) -> String {
 /// a real shell's own response to pressing Enter on nothing; every other parse failure is
 /// reported the same way a failed launch already is. A pipeline of more than one segment runs
 /// via `run_pipeline`; a single segment runs directly here, with its redirections applied first,
-/// uniformly, before whatever follows -- `cd`, an external program, or nothing at all, for an
-/// empty-argv segment of only redirections -- the same ordering a real shell uses, and the
+/// uniformly, before whatever follows -- a builtin, an external program, or nothing at all, for
+/// an empty-argv segment of only redirections -- the same ordering a real shell uses, and the
 /// reason `cd foo > bar` creates `bar` relative to where the shell started rather than `foo`
-/// (`apply_redirects_standalone`'s own doc comment). `cd` stays a builtin; anything else looks up
-/// `usr/bin/<argv[0]>` on `system.img` (blk0) and runs it at EL0 to completion, with an empty
-/// environment (nothing produces real environment variables yet). Any other failure -- not
-/// mounted, not found, bad ELF, argv too large -- is reported and swallowed; one bad command
-/// shouldn't take the REPL down.
+/// (`apply_redirects_standalone`'s own doc comment). `cd`/`source`/`.` stay builtins; anything
+/// else looks up `usr/bin/<argv[0]>` on `system.img` (blk0) and runs it at EL0 to completion,
+/// with an empty environment (nothing produces real environment variables yet). Any other
+/// failure -- not mounted, not found, bad ELF, argv too large -- is reported and swallowed; one
+/// bad command shouldn't take the REPL down.
+///
+/// `depth` is the script-nesting level this line is running at -- `0` from `run_forever`
+/// (nothing has sourced anything yet), `source`'s own `depth + 1` for every line a sourced
+/// script feeds back through here (`source`'s own doc comment, including the recursion guard
+/// that depth is for).
 #[cfg(target_os = "none")]
-fn run(uart: &mut Uart, line: &str) {
+fn run(uart: &mut Uart, line: &str, depth: usize) {
     let pipeline = match syntax::parse(line) {
         Ok(pipeline) => pipeline,
         Err(syntax::SyntaxError::EmptyCommand) => return,
@@ -388,11 +472,11 @@ fn run(uart: &mut Uart, line: &str) {
     // (a pipeline with nothing in it is `SyntaxError::EmptyCommand`, handled above).
     let segment = &pipeline[0];
     let argv = &segment.argv;
-    // `cd` never reaches `run_program`, so it never reaches `bind_stdio` either -- same for an
-    // empty-argv segment, which has no program to launch at all. Both apply their redirections
-    // here instead, directly; anything else still gets its redirections (if any) via
-    // `apply_overrides`/`bind_stdio`, below, once it actually launches.
-    let launches_program = !argv.is_empty() && argv[0] != "cd";
+    // No builtin ever reaches `run_program`, so none ever reaches `bind_stdio` either -- same
+    // for an empty-argv segment, which has no program to launch at all. All three apply their
+    // redirections here instead, directly; anything else still gets its redirections (if any)
+    // via `apply_overrides`/`bind_stdio`, below, once it actually launches.
+    let launches_program = !argv.is_empty() && !is_builtin(argv[0].as_str());
 
     if !segment.redirs.is_empty()
         && !launches_program
@@ -409,6 +493,10 @@ fn run(uart: &mut Uart, line: &str) {
 
     if name == "cd" {
         cd(uart, argv);
+        return;
+    }
+    if name == "source" || name == "." {
+        source(uart, name, argv, depth);
         return;
     }
 
@@ -480,7 +568,7 @@ pub fn run_forever(uart: &mut Uart) -> ! {
 
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            run(uart, trimmed);
+            run(uart, trimmed, 0);
         }
         line.clear();
     }
