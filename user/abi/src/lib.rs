@@ -3,6 +3,8 @@
 //! simply hold the same literal.
 #![no_std]
 
+pub mod keys;
+
 /// Syscall numbers. Linux's real aarch64 numbers -- borrowed for familiarity, no other Linux-ABI-
 /// compatibility claim beyond that (the calling convention and argument order are this project's
 /// own, not verified against Linux's).

@@ -18,6 +18,32 @@ pub fn fits_on_screen(prefix_len: usize, text_len: usize, cols: usize, rows: usi
     rows_needed(prefix_len, text_len, cols) < rows
 }
 
+/// The `(row, col)`, relative to the line's first row, of the cell the visible cursor occupies
+/// when it sits at byte offset `cursor` of a `text_len`-byte text (ASCII, so a byte is a cell).
+///
+/// Follows the same deferred-wrap rule as drawing: a cursor at the very end of text that exactly
+/// fills a row stays on that row's last column rather than jumping to a row nothing has been drawn
+/// on yet (which would be past `rows_needed`'s own count -- and off the screen entirely if that is
+/// the screen's last row). For any `cursor` short of the end, the character at that offset really
+/// is drawn one row down, so it resolves there.
+pub fn cursor_position(
+    prefix_len: usize,
+    text_len: usize,
+    cursor: usize,
+    cols: usize,
+) -> (usize, usize) {
+    let cells = prefix_len + cursor;
+    if cells > 0 && cells.is_multiple_of(cols) {
+        if cursor < text_len {
+            (cells / cols, 0)
+        } else {
+            (cells / cols - 1, cols - 1)
+        }
+    } else {
+        (cells / cols, cells % cols)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,5 +79,34 @@ mod tests {
         // 30 rows: 29 are allowed, 30 are not.
         assert!(fits_on_screen(0, 29 * 80, 80, 30));
         assert!(!fits_on_screen(0, 29 * 80 + 1, 80, 30));
+    }
+
+    #[test]
+    fn the_cursor_at_the_start_is_right_after_the_prefix() {
+        assert_eq!(cursor_position(2, 5, 0, 10), (0, 2));
+        assert_eq!(cursor_position(0, 5, 0, 10), (0, 0));
+    }
+
+    #[test]
+    fn the_cursor_mid_line_depends_only_on_what_precedes_it() {
+        assert_eq!(cursor_position(2, 5, 3, 10), (0, 5));
+        assert_eq!(cursor_position(2, 3, 3, 10), (0, 5));
+    }
+
+    #[test]
+    fn the_cursor_at_the_very_end_of_a_full_row_stays_on_it() {
+        // Regression: this once resolved to "the next row", past `rows_needed`'s own count -- an
+        // out-of-range row for `put_char_at` when the line ended on the screen's last row.
+        assert_eq!(cursor_position(0, 10, 10, 10), (0, 9));
+        assert_eq!(rows_needed(0, 10, 10) - 1, 0);
+        assert_eq!(cursor_position(2, 18, 18, 10), (1, 9));
+    }
+
+    #[test]
+    fn the_cursor_just_before_the_end_of_a_full_row_wraps_to_the_next_row() {
+        // "> " (2) + 8 characters fill row 0 exactly, so byte 8 of a longer line starts row 1.
+        assert_eq!(cursor_position(2, 20, 8, 10), (1, 0));
+        assert_eq!(cursor_position(2, 20, 9, 10), (1, 1));
+        assert_eq!(cursor_position(2, 20, 20, 10), (2, 2));
     }
 }

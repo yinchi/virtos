@@ -17,9 +17,10 @@
 
 use alloc::collections::VecDeque;
 
-use super::{KeyState, Token};
+use super::{KeyState, Token, admits};
 use crate::arch::irq::without_irqs;
 use crate::drivers::virtio::input;
+use core::fmt::Write;
 
 /// How many characters can wait. Matches the reference lab's release-build queue size.
 const CAPACITY: usize = 256;
@@ -29,6 +30,9 @@ const CAPACITY: usize = 256;
 /// these at the same time.
 static mut QUEUE: VecDeque<Token> = VecDeque::new();
 static mut KEYS: KeyState = KeyState::new();
+/// Whether the overflow note for the current burst has been printed -- one note per burst, not one
+/// per dropped key. Cleared once the queue has been emptied (`pop`).
+static mut OVERFLOW_NOTED: bool = false;
 
 /// Drains every event the keyboard has queued, translates it, and pushes the result. Called from
 /// `gic::irq_handler` once it's confirmed the acknowledged interrupt was the keyboard's SPI.
@@ -39,13 +43,30 @@ pub fn drain() {
     // Clears the device's interrupt line so it doesn't keep re-asserting.
     keyboard.ack_interrupt();
     #[allow(clippy::deref_addrof)]
-    let (queue, keys) = unsafe { (&mut *(&raw mut QUEUE), &mut *(&raw mut KEYS)) };
+    let (queue, keys, noted) = unsafe {
+        (
+            &mut *(&raw mut QUEUE),
+            &mut *(&raw mut KEYS),
+            &mut *(&raw mut OVERFLOW_NOTED),
+        )
+    };
     while let Some(event) = keyboard.poll() {
         let Some(token) = keys.apply(event.code, event.value) else {
             continue;
         };
+        // A key's auto-repeat is dropped while anything is still queued (see `admits`), so a slow
+        // reader never has a backlog of repeats to work off after the key is let go.
+        if !admits(&token, queue.len()) {
+            continue;
+        }
         if queue.len() < CAPACITY {
             queue.push_back(token);
+        } else if !*noted {
+            *noted = true;
+            let _ = writeln!(
+                crate::bare_metal::get_uart(),
+                "\n[keyboard: input queue full, further keys dropped]"
+            );
         }
     }
 }
@@ -53,7 +74,15 @@ pub fn drain() {
 /// Takes the oldest waiting key press, if there is one.
 #[allow(clippy::deref_addrof)]
 pub fn pop() -> Option<Token> {
-    without_irqs(|| unsafe { (&mut *(&raw mut QUEUE)).pop_front() })
+    without_irqs(|| {
+        // SAFETY: see QUEUE.
+        let (queue, noted) = unsafe { (&mut *(&raw mut QUEUE), &mut *(&raw mut OVERFLOW_NOTED)) };
+        let token = queue.pop_front();
+        if queue.is_empty() {
+            *noted = false; // the next burst gets its own note
+        }
+        token
+    })
 }
 
 /// Sleeps until an interrupt arrives, unless a key is already waiting. The check and the `wfi`

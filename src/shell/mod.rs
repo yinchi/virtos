@@ -15,13 +15,14 @@
 //! currently-exported variable (`frame_stack`), plus any one-shot assignment prefix
 //! (`frame_stack::with_overlay`), as its `envp`.
 //!
-//! `lexer`/`syntax`/`frame_stack`/`expand` are pure logic, no hardware dependency: built and
+//! `lexer`/`syntax`/`frame_stack`/`expand`/`prompt` are pure logic, no hardware dependency: built and
 //! host-tested under both targets, like `fs::sector`/`exec::elfparse`. Everything below them
 //! touches the console, keyboard, or filesystem, so it's bare-metal-only, like `exec::process`.
 
 mod expand;
 mod frame_stack;
 mod lexer;
+mod prompt;
 mod syntax;
 
 #[cfg(target_os = "none")]
@@ -762,6 +763,10 @@ pub fn run_forever(uart: &mut Uart) -> ! {
         }
     }
     ensure_tmp_exists(uart);
+    // The prompt this shell has always shown, now just a variable like any other: `PS1=` or
+    // `unset PS1` falls back to `prompt::DEFAULT_PROMPT`. (Seeded here rather than from a startup
+    // file -- there isn't one yet.)
+    let _ = frame_stack::set_var("PS1", prompt::DEFAULT_SHELL_PS1);
 
     loop {
         // Scoped so `console`/`gpu_dev` are dropped before `run` below: it calls `run_program`,
@@ -771,11 +776,8 @@ pub fn run_forever(uart: &mut Uart) -> ! {
             let console = console::get().expect("checked above");
             let gpu_dev = gpu::get().expect("checked above");
             let discipline = line_discipline::get();
-            discipline.begin(
-                console,
-                &format!("virtos:{}> ", fs::cwd::get()),
-                Mode::Prompt,
-            );
+            let prompt = prompt::render(frame_stack::var("PS1"), &fs::cwd::get());
+            discipline.begin(console, &prompt, Mode::Prompt);
             gpu_dev.flush();
             loop {
                 let Some(token) = keyboard::queue::pop() else {

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Plain `no_std` constants (syscall numbers, key codes): builds on the host target too, so the
+# pure `keyboard` module can use `abi::keys` under `just test-host`.
+abi = { path = "user/abi" }
 hadris-fat = { version = "2.4.0", default-features = false, features = ["alloc", "lfn", "read", "write", "sync"] }
 peg = { version = "0.8.6", default-features = false }
 spin = "0.12.3"
@@ -17,7 +20,6 @@ unifont = "1.1.0"
 # needing QEMU. See `just test-host`.
 [target.'cfg(target_os = "none")'.dependencies]
 aarch64-paging = "0.12.1"
-abi = { path = "user/abi" }
 arm-gic = "0.10.0"
 arm-pl011-uart = { version = "0.5.1", features = ["embedded-io"] }
 arm-sysregs = { version = "0.5.1", features = ["el1"] }

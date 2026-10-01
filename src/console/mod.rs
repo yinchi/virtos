@@ -85,7 +85,7 @@ impl Console {
 
     /// Places `ch` at (`row`, `col`) with the given foreground/background colors, without moving
     /// the cursor.
-    fn put_char(&self, row: usize, col: usize, ch: char, fg: u32, bg: u32) {
+    pub fn put_char(&self, row: usize, col: usize, ch: char, fg: u32, bg: u32) {
         assert!(row < self.rows && col < self.cols);
         let glyph = glyph_for(ch);
         let x0 = col * GLYPH_WIDTH;
