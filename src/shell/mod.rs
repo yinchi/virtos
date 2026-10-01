@@ -35,6 +35,8 @@ use crate::fs;
 #[cfg(target_os = "none")]
 use crate::keyboard;
 #[cfg(target_os = "none")]
+use crate::keyboard::line_discipline::{self, LineOutcome, Mode};
+#[cfg(target_os = "none")]
 use crate::syscall::fd::{self, StdioRedirect};
 #[cfg(target_os = "none")]
 use alloc::format;
@@ -761,43 +763,41 @@ pub fn run_forever(uart: &mut Uart) -> ! {
     }
     ensure_tmp_exists(uart);
 
-    let mut line = String::new();
     loop {
         // Scoped so `console`/`gpu_dev` are dropped before `run` below: it calls `run_program`,
         // whose EL0 program may itself reach `console::get()` (via `syscall::fd`'s `write`),
         // which would otherwise alias a `&mut Console` still held here across that call.
-        {
+        let line = {
             let console = console::get().expect("checked above");
             let gpu_dev = gpu::get().expect("checked above");
-            console.puts(&format!("virtos:{}> ", fs::cwd::get()), FG, BG);
+            let discipline = line_discipline::get();
+            discipline.begin(
+                console,
+                &format!("virtos:{}> ", fs::cwd::get()),
+                Mode::Prompt,
+            );
             gpu_dev.flush();
             loop {
-                let Some(ch) = keyboard::queue::pop() else {
+                let Some(token) = keyboard::queue::pop() else {
+                    keyboard::queue::wait_for_token();
                     continue;
                 };
-                match ch {
-                    '\n' => break,
-                    '\x08' => {
-                        if line.pop().is_some() {
-                            console.putc(ch, FG, BG);
-                            gpu_dev.flush();
-                        }
-                    }
-                    _ => {
-                        line.push(ch);
-                        console.putc(ch, FG, BG);
+                match discipline.handle(token, console) {
+                    LineOutcome::Ignored => {}
+                    LineOutcome::Finished(line) => {
                         gpu_dev.flush();
+                        break line;
                     }
+                    // `Prompt` mode never produces `Partial`/`EndOfFile` (Ctrl+D is a no-op here:
+                    // the shell never exits on EOF).
+                    _ => gpu_dev.flush(),
                 }
             }
-            console.putc('\n', FG, BG);
-            gpu_dev.flush();
-        }
+        };
 
         let trimmed = line.trim();
         if !trimmed.is_empty() {
             run(uart, trimmed, 0);
         }
-        line.clear();
     }
 }

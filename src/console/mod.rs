@@ -11,6 +11,7 @@
 //! under `cargo test --target <host triple>` (`just test-host`) exactly as it does on target.
 
 pub mod font;
+pub mod input_layout;
 
 use font::{GLYPH_HEIGHT, GLYPH_WIDTH, glyph_for};
 
@@ -99,12 +100,24 @@ impl Console {
     }
 
     /// Clears one row of character cells to `bg`.
-    fn clear_row(&self, row: usize, bg: u32) {
+    pub fn clear_row(&self, row: usize, bg: u32) {
         for dy in 0..GLYPH_HEIGHT {
             for x in 0..self.fb.width {
                 self.fb.put_pixel(x, row * GLYPH_HEIGHT + dy, bg);
             }
         }
+    }
+
+    /// The cursor's `(row, col)`.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.cursor_row, self.cursor_col)
+    }
+
+    /// Moves the cursor to `(row, col)` (clamped onto the screen), cancelling any pending wrap.
+    pub fn move_cursor(&mut self, row: usize, col: usize) {
+        self.cursor_row = row.min(self.rows - 1);
+        self.cursor_col = col.min(self.cols - 1);
+        self.wrap_pending = false;
     }
 
     /// Clears the whole screen to `bg` and homes the cursor.

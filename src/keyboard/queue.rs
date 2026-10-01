@@ -10,12 +10,14 @@
 //! a scheduler, though the real loss point this doesn't fully close is upstream, in virtio-input's
 //! own fixed-size event queue.
 //!
-//! `drain` runs from `gic::irq_handler`; `pop` runs from ordinary code with interrupts on, so it
-//! masks them for the instant it takes -- the two never touch `QUEUE`/`KEYS` at the same time.
+//! `drain` runs from `gic::irq_handler` and, while a program is blocked in `read(0)` (IRQs are
+//! masked inside every syscall), from `keyboard::stdin` directly; `pop` runs from ordinary code
+//! with interrupts on, so it masks them for the instant it takes -- none of them ever touches
+//! `QUEUE`/`KEYS` at the same time as another.
 
 use alloc::collections::VecDeque;
 
-use super::KeyState;
+use super::{KeyState, Token};
 use crate::arch::irq::without_irqs;
 use crate::drivers::virtio::input;
 
@@ -25,7 +27,7 @@ const CAPACITY: usize = 256;
 /// SAFETY (both statics): single core; `drain` (the sole writer, called only from the IRQ
 /// handler) and `pop` (the sole other accessor, which masks IRQs around its access) never touch
 /// these at the same time.
-static mut QUEUE: VecDeque<char> = VecDeque::new();
+static mut QUEUE: VecDeque<Token> = VecDeque::new();
 static mut KEYS: KeyState = KeyState::new();
 
 /// Drains every event the keyboard has queued, translates it, and pushes the result. Called from
@@ -39,17 +41,32 @@ pub fn drain() {
     #[allow(clippy::deref_addrof)]
     let (queue, keys) = unsafe { (&mut *(&raw mut QUEUE), &mut *(&raw mut KEYS)) };
     while let Some(event) = keyboard.poll() {
-        let Some(ch) = keys.apply(event.code, event.value) else {
+        let Some(token) = keys.apply(event.code, event.value) else {
             continue;
         };
         if queue.len() < CAPACITY {
-            queue.push_back(ch);
+            queue.push_back(token);
         }
     }
 }
 
-/// Takes the oldest waiting character, if there is one.
+/// Takes the oldest waiting key press, if there is one.
 #[allow(clippy::deref_addrof)]
-pub fn pop() -> Option<char> {
+pub fn pop() -> Option<Token> {
     without_irqs(|| unsafe { (&mut *(&raw mut QUEUE)).pop_front() })
+}
+
+/// Sleeps until an interrupt arrives, unless a key is already waiting. The check and the `wfi`
+/// happen with IRQs masked: unmasked, a keyboard IRQ landing between "queue is empty" and `wfi`
+/// would be handled and gone, and the sleep that followed would wait for the *next* key. (A
+/// masked-but-pending interrupt still wakes `wfi`, so it is delivered the moment IRQs are
+/// unmasked again.)
+#[allow(clippy::deref_addrof)]
+pub fn wait_for_token() {
+    without_irqs(|| {
+        if unsafe { (*(&raw const QUEUE)).is_empty() } {
+            // SAFETY: plain `wfi`, no memory or register effects.
+            unsafe { core::arch::asm!("wfi") };
+        }
+    });
 }

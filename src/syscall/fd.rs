@@ -27,7 +27,7 @@ use crate::console;
 use crate::drivers::virtio::gpu;
 use crate::fs;
 use crate::fs::blkio::BlkIo;
-use crate::keyboard::queue;
+use crate::keyboard::stdin;
 use abi::{
     ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, DIRENT_SIZE, NAME_MAX, O_APPEND, O_RDONLY, O_WRONLY,
     STAT_SIZE,
@@ -113,6 +113,7 @@ fn table() -> &'static mut [Option<FileDescriptor>; MAX_FDS] {
 pub fn reset_for_launch() {
     let table = table();
     *table = [const { None }; MAX_FDS];
+    stdin::reset();
     table[0] = Some(FileDescriptor::Keyboard);
     table[1] = Some(FileDescriptor::Console);
     table[2] = Some(FileDescriptor::Console);
@@ -166,23 +167,13 @@ impl FileDescriptor {
         }
     }
 
-    /// Reads from a file descriptor: the keyboard queue (non-blocking: no process model exists to
-    /// block *on*, so an empty queue returns `0` immediately rather than waiting for a key that
-    /// might never come), or an open file's next bytes (`0` at end of file). Reading from
-    /// `Console`, a write-only `FileWrite`, or a `Dir` is rejected, same reasoning as writing to
-    /// `Keyboard`.
+    /// Reads from a file descriptor: the keyboard (blocks for a whole typed line -- see
+    /// `keyboard::stdin`; `0` only for Ctrl+D on an empty line), or an open file's next bytes (`0`
+    /// at end of file). Reading from `Console`, a write-only `FileWrite`, or a `Dir` is rejected,
+    /// same reasoning as writing to `Keyboard`.
     fn read(&mut self, buf: &mut [u8]) -> isize {
         match self {
-            Self::Keyboard => {
-                let mut n = 0;
-                while n < buf.len() {
-                    let Some(ch) = queue::pop() else { break };
-                    // ASCII-only (see `keyboard`'s own doc comment) -- one byte per character.
-                    buf[n] = ch as u8;
-                    n += 1;
-                }
-                n as isize
-            }
+            Self::Keyboard => stdin::read(buf),
             Self::Console | Self::FileWrite(_) | Self::Dir { .. } => EBADF,
             Self::File(reader) => reader.read(buf).map_or(EBADF, |n| n as isize),
         }
