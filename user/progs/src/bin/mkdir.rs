@@ -8,7 +8,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::vec::Vec;
+use getargs::Arg;
 use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
@@ -62,20 +62,27 @@ fn mkdir_one(dir: &str, parents: bool) -> bool {
 
 fn run(args: Args) -> ExitCode {
     let mut parents = false;
-    let mut dirs: Vec<&str> = Vec::new();
-    for arg in args.skip(1) {
+    let mut any = false;
+    let mut opts = progs::cli::opts(args);
+    loop {
+        let arg = match progs::cli::next("mkdir", &mut opts) {
+            Ok(Some(arg)) => arg,
+            Ok(None) => break,
+            Err(status) => return status,
+        };
         match arg {
-            "--help" => return progs::help(USAGE, FLAGS),
-            "-p" | "--parents" => parents = true,
-            dir => dirs.push(dir),
+            Arg::Long("help") => return progs::help(USAGE, FLAGS),
+            Arg::Short('p') | Arg::Long("parents") => parents = true,
+            Arg::Positional(_) => any = true,
+            other => return progs::cli::invalid("mkdir", other),
         }
     }
-    if dirs.is_empty() {
+    if !any {
         userlib::write(2, b"mkdir: missing operand\n");
         return ExitCode(1);
     }
     let mut ok = true;
-    for dir in dirs {
+    for dir in progs::cli::operands(args) {
         if !mkdir_one(dir, parents) {
             ok = false;
         }

@@ -9,7 +9,6 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::vec::Vec;
 use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
@@ -39,27 +38,21 @@ fn counts(data: &[u8]) -> (usize, usize, usize) {
 }
 
 fn run(args: Args) -> ExitCode {
-    let mut paths: Vec<&str> = Vec::new();
-    for arg in args.skip(1) {
-        if arg == "--help" {
-            return progs::help(USAGE, FLAGS);
-        }
-        paths.push(arg);
-    }
-    let implicit_stdin = paths.is_empty();
-    if implicit_stdin {
-        paths.push("-");
-    }
+    let plain = match progs::cli::plain("wc", USAGE, FLAGS, args) {
+        Ok(plain) => plain,
+        Err(status) => return status,
+    };
+    let implicit_stdin = plain.count == 0;
 
     let mut ok = true;
     let (mut total_lines, mut total_words, mut total_bytes) = (0, 0, 0);
-    for &path in &paths {
+    let mut handle = |path: &str| {
         let Some(data) = progs::read_operand(path) else {
             userlib::write(2, b"wc: ");
             userlib::write(2, path.as_bytes());
             userlib::write(2, b": cannot open\n");
             ok = false;
-            continue;
+            return;
         };
         let (lines, words, bytes) = counts(&data);
         total_lines += lines;
@@ -71,8 +64,16 @@ fn run(args: Args) -> ExitCode {
             format!("{lines} {words} {bytes} {path}\n")
         };
         userlib::write(1, line.as_bytes());
+    };
+
+    if implicit_stdin {
+        handle("-");
     }
-    if paths.len() > 1 {
+    for path in progs::cli::operands(args) {
+        handle(path);
+    }
+
+    if plain.count > 1 {
         let line = format!("{total_lines} {total_words} {total_bytes} total\n");
         userlib::write(1, line.as_bytes());
     }

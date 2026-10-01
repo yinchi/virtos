@@ -74,13 +74,16 @@ fn print_one(path: &str, info: &userlib::Stat) {
 }
 
 fn run(args: Args) -> ExitCode {
-    let mut any = false;
+    let plain = match progs::cli::plain("stat", USAGE, FLAGS, args) {
+        Ok(plain) => plain,
+        Err(status) => return status,
+    };
+    if plain.count == 0 {
+        userlib::write(2, b"stat: missing operand\n");
+        return ExitCode(1);
+    }
     let mut ok = true;
-    for path in args.skip(1) {
-        if path == "--help" {
-            return progs::help(USAGE, FLAGS);
-        }
-        any = true;
+    for path in progs::cli::operands(args) {
         match userlib::stat(path) {
             Ok(info) => print_one(path, &info),
             Err(_) => {
@@ -90,10 +93,6 @@ fn run(args: Args) -> ExitCode {
                 ok = false;
             }
         }
-    }
-    if !any {
-        userlib::write(2, b"stat: missing operand\n");
-        return ExitCode(1);
     }
     if ok { ExitCode(0) } else { ExitCode(1) }
 }

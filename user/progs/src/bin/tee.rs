@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use getargs::Arg;
 use userlib::{Args, ExitCode, O_APPEND, O_WRONLY};
 
 userlib::entry_with_args!(run);
@@ -24,19 +25,25 @@ const CHUNK: usize = 512;
 
 fn run(args: Args) -> ExitCode {
     let mut append = false;
-    let mut paths: Vec<&str> = Vec::new();
-    for arg in args.skip(1) {
+    let mut opts = progs::cli::opts(args);
+    loop {
+        let arg = match progs::cli::next("tee", &mut opts) {
+            Ok(Some(arg)) => arg,
+            Ok(None) => break,
+            Err(status) => return status,
+        };
         match arg {
-            "--help" => return progs::help(USAGE, FLAGS),
-            "-a" | "--append" => append = true,
-            path => paths.push(path),
+            Arg::Long("help") => return progs::help(USAGE, FLAGS),
+            Arg::Short('a') | Arg::Long("append") => append = true,
+            Arg::Positional(_) => {}
+            other => return progs::cli::invalid("tee", other),
         }
     }
 
     let flags = O_WRONLY | if append { O_APPEND } else { 0 };
     let mut dests: Vec<(&str, usize)> = Vec::new();
     let mut status = 0;
-    for path in paths {
+    for path in progs::cli::operands(args) {
         let fd = userlib::open(path, flags);
         if fd < 0 {
             userlib::write(2, b"tee: ");

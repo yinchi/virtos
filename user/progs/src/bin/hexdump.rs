@@ -46,13 +46,16 @@ fn dump(data: &[u8]) {
 }
 
 fn run(args: Args) -> ExitCode {
-    let mut any = false;
+    let plain = match progs::cli::plain("hexdump", USAGE, FLAGS, args) {
+        Ok(plain) => plain,
+        Err(status) => return status,
+    };
     let mut ok = true;
-    for path in args.skip(1) {
-        if path == "--help" {
-            return progs::help(USAGE, FLAGS);
-        }
-        any = true;
+    if plain.count == 0 {
+        let data = progs::read_operand("-").expect("stdin never fails to open");
+        dump(&data);
+    }
+    for path in progs::cli::operands(args) {
         let Some(data) = progs::read_operand(path) else {
             userlib::write(2, b"hexdump: ");
             userlib::write(2, path.as_bytes());
@@ -60,10 +63,6 @@ fn run(args: Args) -> ExitCode {
             ok = false;
             continue;
         };
-        dump(&data);
-    }
-    if !any {
-        let data = progs::read_operand("-").expect("stdin never fails to open");
         dump(&data);
     }
     if ok { ExitCode(0) } else { ExitCode(1) }

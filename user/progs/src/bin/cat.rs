@@ -48,19 +48,18 @@ fn cat_one(path: &str) -> bool {
 }
 
 fn run(args: Args) -> ExitCode {
-    let mut any = false;
+    let plain = match progs::cli::plain("cat", USAGE, FLAGS, args) {
+        Ok(plain) => plain,
+        Err(status) => return status,
+    };
     let mut ok = true;
-    for path in args.skip(1) {
-        if path == "--help" {
-            return progs::help(USAGE, FLAGS);
-        }
-        any = true;
+    if plain.count == 0 {
+        cat_one("-");
+    }
+    for path in progs::cli::operands(args) {
         if !cat_one(path) {
             ok = false;
         }
-    }
-    if !any {
-        cat_one("-");
     }
     if ok { ExitCode(0) } else { ExitCode(1) }
 }

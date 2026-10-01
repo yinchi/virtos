@@ -1,18 +1,24 @@
-//! `ls [dir...]` -- lists the names in each named directory, one per line, in the order `getdents`
-//! returns them (not sorted). No `dir` operand lists the working directory (an empty path, which
-//! `open` resolves against it, same as every other relative path).
+//! `ls [-F] [dir...]` -- lists the names in each named directory, one per line, in the order
+//! `getdents` returns them (not sorted). No `dir` operand lists the working directory (an empty
+//! path, which `open` resolves against it, same as every other relative path). `-F`/`--classify`
+//! appends `/` to a directory's name and `*` to an executable file's -- the two FAT attribute
+//! bits this project tracks (no `@`/`=`/`|` for symlinks/sockets/pipes, since none of those
+//! exist here), read straight off each `getdents` record now that it carries them.
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-use userlib::{Args, DIRENT_SIZE, DirEnt, ExitCode, O_RDONLY};
+use getargs::Arg;
+use userlib::{ATTR_DIRECTORY, ATTR_EXEC, Args, DIRENT_SIZE, DirEnt, ExitCode, O_RDONLY};
 
 userlib::entry_with_args!(run);
 
-const USAGE: &str = "ls [dir...]";
-const FLAGS: &[(&str, &str)] = &[];
+const USAGE: &str = "ls [-F] [dir...]";
+const FLAGS: &[(&str, &str)] = &[(
+    "-F, --classify",
+    "append / to directories and * to executable files",
+)];
 
 /// Buffer size for one `getdents` call -- fetches several records per syscall rather than one, the
 /// way the mature reference's own `ls.rs` does (its `BATCH = 8`), but sized to one memory page (4
@@ -24,7 +30,7 @@ const GETDENTS_BUF_SIZE: usize = 4096;
 /// actually a directory (already reported to stderr either way) -- the first case uses the same
 /// "cannot open" wording every other program here already uses, not GNU's own distinct "cannot
 /// access"/"cannot open directory" split, which needs error codes this project doesn't have yet.
-fn list_one(dir: &str) -> bool {
+fn list_one(dir: &str, classify: bool) -> bool {
     let fd = userlib::open(dir, O_RDONLY);
     if fd < 0 {
         userlib::write(2, b"ls: ");
@@ -57,6 +63,16 @@ fn list_one(dir: &str) -> bool {
                 continue;
             };
             userlib::write(1, ent.name.as_bytes());
+            if classify {
+                let suffix = if ent.attrs & ATTR_DIRECTORY != 0 {
+                    "/"
+                } else if ent.attrs & ATTR_EXEC != 0 {
+                    "*"
+                } else {
+                    ""
+                };
+                userlib::write(1, suffix.as_bytes());
+            }
             userlib::write(1, b"\n");
         }
     }
@@ -65,21 +81,32 @@ fn list_one(dir: &str) -> bool {
 }
 
 fn run(args: Args) -> ExitCode {
-    let mut dirs: Vec<&str> = Vec::new();
-    for arg in args.skip(1) {
-        if arg == "--help" {
-            return progs::help(USAGE, FLAGS);
+    let mut classify = false;
+    let mut any = false;
+    let mut opts = progs::cli::opts(args);
+    loop {
+        let arg = match progs::cli::next("ls", &mut opts) {
+            Ok(Some(arg)) => arg,
+            Ok(None) => break,
+            Err(status) => return status,
+        };
+        match arg {
+            Arg::Long("help") => return progs::help(USAGE, FLAGS),
+            Arg::Short('F') | Arg::Long("classify") => classify = true,
+            Arg::Positional(_) => any = true,
+            other => return progs::cli::invalid("ls", other),
         }
-        dirs.push(arg);
     }
-    if dirs.is_empty() {
-        dirs.push("");
-    }
+
     let mut ok = true;
-    for dir in dirs {
-        if !list_one(dir) {
-            ok = false;
+    if any {
+        for dir in progs::cli::operands(args) {
+            if !list_one(dir, classify) {
+                ok = false;
+            }
         }
+    } else if !list_one("", classify) {
+        ok = false;
     }
     if ok { ExitCode(0) } else { ExitCode(1) }
 }

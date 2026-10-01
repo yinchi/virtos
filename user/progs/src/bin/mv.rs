@@ -12,7 +12,6 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::String;
-use alloc::vec::Vec;
 use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
@@ -66,26 +65,25 @@ fn move_one(src: &str, dst: &str, dst_is_dir: bool) -> bool {
 }
 
 fn run(args: Args) -> ExitCode {
-    let mut argv: Vec<&str> = Vec::new();
-    for arg in args.skip(1) {
-        if arg == "--help" {
-            return progs::help(USAGE, FLAGS);
+    let plain = match progs::cli::plain("mv", USAGE, FLAGS, args) {
+        Ok(plain) => plain,
+        Err(status) => return status,
+    };
+    let count = plain.count;
+    let Some(dst) = plain.last.filter(|_| count >= 2) else {
+        if let Some(src) = plain.first {
+            userlib::write(2, b"mv: missing destination file operand after '");
+            userlib::write(2, src.as_bytes());
+            userlib::write(2, b"'\n");
+        } else {
+            userlib::write(2, b"mv: missing operand\n");
         }
-        argv.push(arg);
-    }
-    let Some((&dst, srcs)) = argv.split_last() else {
-        userlib::write(2, b"mv: missing operand\n");
         return ExitCode(1);
     };
-    if srcs.is_empty() {
-        userlib::write(2, b"mv: missing destination file operand after '");
-        userlib::write(2, dst.as_bytes());
-        userlib::write(2, b"'\n");
-        return ExitCode(1);
-    }
 
     let dst_is_dir = matches!(userlib::stat(dst), Ok(info) if info.is_dir);
-    if srcs.len() > 1 && !dst_is_dir {
+    let n_src = count - 1;
+    if n_src > 1 && !dst_is_dir {
         userlib::write(2, b"mv: target '");
         userlib::write(2, dst.as_bytes());
         userlib::write(2, b"' is not a directory\n");
@@ -93,7 +91,10 @@ fn run(args: Args) -> ExitCode {
     }
 
     let mut ok = true;
-    for &src in srcs {
+    for (i, src) in progs::cli::operands(args).enumerate() {
+        if i == count - 1 {
+            break; // this operand is dst itself
+        }
         if !move_one(src, dst, dst_is_dir) {
             ok = false;
         }
