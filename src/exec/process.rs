@@ -207,7 +207,7 @@ pub fn run_program(
     elf_bytes: &[u8],
     args: &[&str],
     env: &[&str],
-    stdio: [Option<crate::syscall::fd::StdioRedirect>; 3],
+    stdio: crate::syscall::fd::Stdio,
 ) -> Result<i32, LaunchError> {
     let floor = USER_STACK_TOP - ARG_MAX;
 

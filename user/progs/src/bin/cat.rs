@@ -17,6 +17,7 @@ use alloc::format;
 use alloc::vec::Vec;
 use getargs::Arg;
 use progs::{cli, write_all};
+use textlib::catshow::{Flags, State};
 use userlib::{Args, ExitCode, O_RDONLY};
 
 userlib::entry_with_args!(run);
@@ -31,75 +32,6 @@ const FLAGS: &[(&str, &str)] = &[
     ("-T", "display tabs as ^I"),
     ("-s", "squeeze runs of blank lines into one"),
 ];
-
-#[derive(Default, Clone, Copy)]
-struct Flags {
-    number: bool,
-    dollar: bool,
-    tabs: bool,
-    squeeze: bool,
-}
-
-impl Flags {
-    fn any(self) -> bool {
-        self.number || self.dollar || self.tabs || self.squeeze
-    }
-}
-
-/// Where the output has got to, across chunks and across files.
-#[derive(Default)]
-struct State {
-    /// The number of the last line numbered.
-    line_no: usize,
-    /// Whether the line being written has started (its number, if any, is out).
-    in_line: bool,
-    /// Whether the last line written was blank, for `-s`.
-    prev_blank: bool,
-}
-
-impl State {
-    fn number(&mut self, out: &mut Vec<u8>) {
-        self.line_no += 1;
-        out.extend_from_slice(format!("{:>6}\t", self.line_no).as_bytes());
-    }
-
-    /// Appends `chunk`, as the flags say it is shown, to `out`.
-    fn show(&mut self, flags: Flags, chunk: &[u8], out: &mut Vec<u8>) {
-        for &b in chunk {
-            if b == b'\n' {
-                if !self.in_line {
-                    // A blank line: dropped, if it repeats one and `-s` says so.
-                    if flags.squeeze && self.prev_blank {
-                        continue;
-                    }
-                    if flags.number {
-                        self.number(out);
-                    }
-                    self.prev_blank = true;
-                } else {
-                    self.prev_blank = false;
-                }
-                if flags.dollar {
-                    out.push(b'$');
-                }
-                out.push(b'\n');
-                self.in_line = false;
-            } else {
-                if !self.in_line {
-                    if flags.number {
-                        self.number(out);
-                    }
-                    self.in_line = true;
-                }
-                if b == b'\t' && flags.tabs {
-                    out.extend_from_slice(b"^I");
-                } else {
-                    out.push(b);
-                }
-            }
-        }
-    }
-}
 
 /// Streams `path`'s content to stdout -- fd 0 directly if `path` is `-`, otherwise `open`ed and
 /// `close`d here. `false` (after reporting it) if `path` names a real file that fails to open.

@@ -320,6 +320,10 @@ pub(crate) fn open_for_write(
     Ok((dev, writer))
 }
 
+/// A command's redirections in the order they were written, each with the fd it binds (an `In`
+/// is fd 0; `Out` and `Dup` carry their own). The order matters: `> f 2>&1` and `2>&1 > f` differ.
+pub type Stdio = Vec<(usize, StdioRedirect)>;
+
 /// One redirection to apply to a program's stdio before it starts -- built by `shell`'s own
 /// launch code from `shell::syntax::Redirection`, with the fd it binds carried separately (the
 /// array position in `bind_stdio`'s own parameter), not stored here.
@@ -366,11 +370,10 @@ fn base() -> &'static mut [Option<FileDescriptor>; 3] {
 /// uncommitted, since the command never runs.
 fn resolve_streams(
     inherited: &[Option<FileDescriptor>; 3],
-    overrides: [Option<StdioRedirect>; 3],
+    overrides: Stdio,
 ) -> Result<[Option<FileDescriptor>; 3], String> {
     let mut streams = inherited.clone();
-    for (fd, redirect) in overrides.into_iter().enumerate() {
-        let Some(redirect) = redirect else { continue };
+    for (fd, redirect) in overrides {
         let stream = match redirect {
             StdioRedirect::In(path) => {
                 let Ok((dev, reader)) = open_for_read(&fs::cwd::absolute(&path)) else {
@@ -399,7 +402,7 @@ fn resolve_streams(
 /// `exec::process::run_program` right after `reset_for_launch()` and before `enter()`, so a
 /// program starts with its redirected stdio already in place. `Err` (already reported by the
 /// caller) if a redirect can't be opened.
-pub fn bind_stdio(overrides: [Option<StdioRedirect>; 3]) -> Result<(), ()> {
+pub fn bind_stdio(overrides: Stdio) -> Result<(), ()> {
     let streams = resolve_streams(base(), overrides).map_err(|_| ())?;
     for (fd, stream) in streams.into_iter().enumerate() {
         if let Some(stream) = stream {
@@ -419,10 +422,7 @@ pub fn bind_stdio(overrides: [Option<StdioRedirect>; 3]) -> Result<(), ()> {
 /// one offset), and are committed -- a writer's size written to disk -- when the outermost scope
 /// holding them ends, here, on every path out of `f`. `Err` is what to report if a redirect can't be
 /// opened, in which case `f` never runs.
-pub fn with_inherited_stdio<R>(
-    overrides: [Option<StdioRedirect>; 3],
-    f: impl FnOnce() -> R,
-) -> Result<R, String> {
+pub fn with_inherited_stdio<R>(overrides: Stdio, f: impl FnOnce() -> R) -> Result<R, String> {
     let streams = resolve_streams(base(), overrides)?;
     let outer = core::mem::replace(base(), streams.clone());
     let result = f();

@@ -15,6 +15,7 @@ use core::fmt::Write;
 use alloc::string::String;
 use getargs::Arg;
 use progs::cli;
+use textlib::wccount::Counts;
 use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
@@ -27,57 +28,6 @@ const FLAGS: &[(&str, &str)] = &[
     ("-c", "count bytes"),
     ("-L", "report the longest line's length"),
 ];
-
-/// Lines, words, characters, bytes and longest line of one input.
-#[derive(Default)]
-struct Counts {
-    lines: usize,
-    words: usize,
-    chars: usize,
-    bytes: usize,
-    max_line: usize,
-}
-
-impl Counts {
-    /// Lines are counted by `\n` bytes -- not `head`/`tail`'s notion of "lines", which also
-    /// counts a final unterminated one; a real `wc` doesn't. Words are maximal runs of
-    /// non-whitespace bytes. A character is a byte that is not a UTF-8 continuation byte
-    /// (`10xxxxxx`).
-    fn of(data: &[u8]) -> Self {
-        let mut c = Counts {
-            bytes: data.len(),
-            ..Counts::default()
-        };
-        c.chars = data.iter().filter(|&&b| b & 0xC0 != 0x80).count();
-        let mut in_word = false;
-        let mut cur_line = 0;
-        for &b in data {
-            if b == b'\n' {
-                c.lines += 1;
-                c.max_line = c.max_line.max(cur_line);
-                cur_line = 0;
-            } else {
-                cur_line += 1;
-            }
-            if b.is_ascii_whitespace() || b == 0x0b {
-                in_word = false;
-            } else if !in_word {
-                in_word = true;
-                c.words += 1;
-            }
-        }
-        c.max_line = c.max_line.max(cur_line);
-        c
-    }
-
-    fn add(&mut self, other: &Counts) {
-        self.lines += other.lines;
-        self.words += other.words;
-        self.chars += other.chars;
-        self.bytes += other.bytes;
-        self.max_line = self.max_line.max(other.max_line);
-    }
-}
 
 /// One output line: the wanted counts in order, then the name if there is one.
 fn format_counts(c: &Counts, wanted: [bool; 5], name: Option<&str>) -> String {

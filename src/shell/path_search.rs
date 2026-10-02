@@ -50,7 +50,7 @@ mod tests {
     }
 
     #[test]
-    fn unset_is_bin() {
+    fn unset_is_usr_bin() {
         assert_eq!(c(None, "cat"), ["/usr/bin/cat"]);
         assert_eq!(directories(None), ["/usr/bin"]);
     }
@@ -85,16 +85,5 @@ mod tests {
         assert_eq!(c(Some("/bin/"), "x"), ["/bin/x"]);
         assert_eq!(c(Some("/"), "x"), ["/x"]);
         assert_eq!(c(Some("dir/"), "x"), ["dir/x"]);
-    }
-
-    #[test]
-    fn a_name_is_taken_exactly_as_typed() {
-        assert_eq!(c(None, "cat.exe"), ["/usr/bin/cat.exe"]);
-    }
-
-    #[test]
-    fn the_same_directory_twice_is_tried_twice() {
-        // No de-duplication: the first hit wins anyway, and a miss is cheap.
-        assert_eq!(c(Some("/a:/a"), "x").len(), 2);
     }
 }

@@ -18,7 +18,8 @@ userlib::entry_with_args!(run);
 
 const ROW: usize = 16;
 /// Width of the hex column for a full row: 16 `"xx "` triples, plus one extra space at the
-/// midpoint -- a short final row is padded out to this so the `|ASCII|` column still lines up.
+/// midpoint -- a short final row is padded out to this so the `|ASCII|` column still lines up. One
+/// more space separates it from the `|` (two after the last byte of a full row, as `hexdump -C`).
 const HEX_COLUMN_WIDTH: usize = ROW * 3 + 1;
 const USAGE: &str = "hexdump [file...]";
 const FLAGS: &[(&str, &str)] = &[];
@@ -39,7 +40,7 @@ fn dump(data: &[u8]) {
                 '.'
             });
         }
-        let line = format!("{offset:08x}  {hex:<HEX_COLUMN_WIDTH$}|{ascii}|\n");
+        let line = format!("{offset:08x}  {hex:<HEX_COLUMN_WIDTH$} |{ascii}|\n");
         userlib::write(1, line.as_bytes());
     }
     userlib::write(1, format!("{:08x}\n", data.len()).as_bytes());

@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use getargs::Arg;
 use progs::{Out, cli};
 use textlib::cutlist::{self, ListError, Range};
-use textlib::textutil::split_lines;
+use textlib::textutil::{split_fields, split_lines};
 use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
@@ -121,24 +121,6 @@ fn cut(args: Args) -> Result<ExitCode, ExitCode> {
     Ok(ExitCode(status))
 }
 
-/// The pieces of `line` between occurrences of `delimiter`.
-fn split<'a>(line: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
-    let mut fields = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i + delimiter.len() <= line.len() {
-        if &line[i..i + delimiter.len()] == delimiter {
-            fields.push(&line[start..i]);
-            i += delimiter.len();
-            start = i;
-        } else {
-            i += 1;
-        }
-    }
-    fields.push(&line[start..]);
-    fields
-}
-
 fn cut_fields(
     out: &mut Out,
     line: &[u8],
@@ -146,7 +128,7 @@ fn cut_fields(
     ranges: &[Range],
     only_delimited: bool,
 ) {
-    let fields = split(line, delimiter);
+    let fields = split_fields(line, delimiter);
     if fields.len() == 1 {
         // No delimiter in the line: whole, unless it is to be skipped.
         if !only_delimited {

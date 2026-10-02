@@ -136,6 +136,8 @@ mod tests {
     }
 
     #[test]
+    // Interim: non-ASCII is dropped only because the console has no UTF-8 decoding yet, so the
+    // last assertion flips when that lands.
     fn control_and_non_ascii_characters_are_dropped() {
         assert_eq!(r("a\tb\x1b[2Jc> ", "/"), "ab[2Jc> ");
         assert_eq!(r("a\nb> ", "/"), "ab> ");

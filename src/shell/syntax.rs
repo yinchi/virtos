@@ -41,15 +41,19 @@ pub enum SyntaxError {
     MissingTarget(&'static str),
     /// `>&`'s target wasn't `1` or `2`.
     BadDupTarget,
-    /// A pipeline segment with no words and no redirections at all -- a blank or comment-only
-    /// line (handled the same way by whichever caller decides that's not worth reporting), or a
-    /// stray `|` with nothing on one side of it.
+    /// A line with nothing on it at all -- blank or comment-only: not worth reporting.
     EmptyCommand,
+    /// A pipeline stage with no words and no redirections, in a line that has other things on it:
+    /// a stray `|` with nothing on one side of it (`| a`, `a |`, `a | | b`).
+    MissingCommand,
 }
 
 /// Lexes then parses `line` into a `Pipeline`.
 pub fn parse(line: &str) -> Result<Pipeline, SyntaxError> {
     let tokens = lexer::lex(line).map_err(SyntaxError::Lex)?;
+    if tokens.is_empty() {
+        return Err(SyntaxError::EmptyCommand);
+    }
     grammar::pipeline(&SliceByRef(&tokens)).map_err(decode_error)
 }
 
@@ -94,15 +98,15 @@ fn decode_error(e: peg::error::ParseError<usize>) -> SyntaxError {
             "missing-target-append" => return SyntaxError::MissingTarget(RedirOp::Append.text()),
             "missing-target-dup" => return SyntaxError::MissingTarget(RedirOp::DupOut.text()),
             "bad-dup-target" => return SyntaxError::BadDupTarget,
-            "empty-command" => return SyntaxError::EmptyCommand,
+            "empty-command" => return SyntaxError::MissingCommand,
             _ => {}
         }
     }
     // A structurally malformed token stream (e.g. two pipes in a row, each side otherwise empty)
     // can leave tokens unconsumed without tripping one of the named failures above -- the
-    // resulting "expected end of input" is best described the same way an actually-empty segment
-    // already is, not a case to panic on for an input the lexer itself already accepted.
-    SyntaxError::EmptyCommand
+    // resulting "expected end of input" is best described the same way an empty stage already is,
+    // not a case to panic on for an input the lexer itself already accepted.
+    SyntaxError::MissingCommand
 }
 
 /// One thing a `segment` rule saw: either an ordinary argument, or a redirection. Not part of
@@ -302,6 +306,30 @@ mod tests {
     fn an_empty_or_comment_only_line_is_an_empty_command() {
         assert_eq!(parse(""), Err(SyntaxError::EmptyCommand));
         assert_eq!(parse("  # just a comment"), Err(SyntaxError::EmptyCommand));
+    }
+
+    #[test]
+    fn a_pipe_with_nothing_on_a_side_is_an_error_not_a_blank_line() {
+        for line in [
+            "| a",
+            "a |",
+            "a | | b",
+            "|",
+            "a | # nothing",
+            "> f |",
+            "| > f",
+        ] {
+            let result = parse(line);
+            // `> f |` and `| > f` have a redirection-only stage on one side and nothing on the
+            // other; either way the empty stage is what is wrong.
+            assert_eq!(result, Err(SyntaxError::MissingCommand), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_redirection_only_stage_is_a_command() {
+        assert!(parse("a | > f").is_ok());
+        assert!(parse("> f").is_ok());
     }
 
     #[test]

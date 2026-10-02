@@ -45,7 +45,7 @@ use crate::keyboard;
 #[cfg(target_os = "none")]
 use crate::keyboard::line_discipline::{self, LineOutcome, Mode};
 #[cfg(target_os = "none")]
-use crate::syscall::fd::{self, StdioRedirect};
+use crate::syscall::fd::{self, Stdio, StdioRedirect};
 #[cfg(target_os = "none")]
 use alloc::format;
 #[cfg(target_os = "none")]
@@ -279,33 +279,31 @@ fn unset(argv: &[String]) -> i32 {
     0
 }
 
-/// Layers `redirs` onto `overrides` (`syscall::fd::bind_stdio`'s own parameter shape) -- each
-/// `Redirection` names the fd it binds (`In` always fd 0; `Out`/`Dup` carry their own, defaulted
-/// to 1 by `syntax`'s own parsing), so this is a plain sort into array slots, *overwriting*
-/// whatever `overrides` already held in that slot. For a plain single command, `overrides`
-/// starts as `[None, None, None]`, so this is just "build the array from `redirs`" -- but
-/// `run_pipeline` (below) starts it from that stage's own pipe binding instead, which is exactly
-/// what makes a stage's own redirect take precedence over the pipe for the same fd (the same
-/// layering a real shell uses, and the reason `echo foo > bar | wc` sends `foo` to `bar`, not
-/// into the pipe, leaving `wc` to see nothing and report all zeros).
+/// Appends `redirs`, in the order they were written, to `overrides` -- each `Redirection` names
+/// the fd it binds (`In` always fd 0; `Out`/`Dup` carry their own, defaulted to 1 by `syntax`'s
+/// own parsing). For a plain single command `overrides` starts empty; `run_pipeline` starts it
+/// from that stage's own pipe binding instead, so a stage's own redirect for the same fd comes
+/// later and wins (the reason `echo foo > bar | wc` sends `foo` to `bar`, not into the pipe,
+/// leaving `wc` to see nothing). Applied left to right (`syscall::fd::resolve_streams`), so
+/// `> f 2>&1` and `2>&1 > f` differ, as in any shell.
 #[cfg(target_os = "none")]
-fn apply_overrides(
-    mut overrides: [Option<StdioRedirect>; 3],
-    redirs: &[syntax::Redirection],
-) -> [Option<StdioRedirect>; 3] {
+fn apply_overrides(mut overrides: Stdio, redirs: &[syntax::Redirection]) -> Stdio {
     for redir in redirs {
         match redir {
             syntax::Redirection::In(path) => {
-                overrides[0] = Some(StdioRedirect::In(path.clone()));
+                overrides.push((0, StdioRedirect::In(path.clone())));
             }
             syntax::Redirection::Out { fd, path, append } => {
-                overrides[*fd as usize] = Some(StdioRedirect::Out {
-                    path: path.clone(),
-                    append: *append,
-                });
+                overrides.push((
+                    usize::from(*fd),
+                    StdioRedirect::Out {
+                        path: path.clone(),
+                        append: *append,
+                    },
+                ));
             }
             syntax::Redirection::Dup { fd, target } => {
-                overrides[*fd as usize] = Some(StdioRedirect::Dup(*target));
+                overrides.push((usize::from(*fd), StdioRedirect::Dup(*target)));
             }
         }
     }
@@ -377,11 +375,9 @@ fn dispatch_builtin(uart: &mut Uart, name: &str, argv: &[String], depth: usize) 
 /// `pipe_stdio` is a pipeline stage's own pipe binding, applied underneath the segment's
 /// redirects. All of it is the command's stdio: a program starts with it already bound onto fds
 /// 0-2, a script or a builtin runs with it as the stdio every command inside inherits
-/// (`fd::with_inherited_stdio`). Returns `(status, aborts)`: `aborts` is `true` only for a failure
-/// at the *launch* level (not found, a bad redirect, a bad ELF) -- never a builtin's own `1`, nor a
-/// successfully launched program's own nonzero exit -- `run_pipeline`'s own reason for keeping
-/// the two apart: a pipeline keeps running after an ordinary command failure, but not after one
-/// that couldn't start at all.
+/// (`fd::with_inherited_stdio`). Returns the status for `$?`: the command's own, `127` for a
+/// command not found, `126` for one found but not runnable, `1` for a redirect that could not be
+/// opened (reported, and the command does not run).
 #[cfg(target_os = "none")]
 fn dispatch_segment(
     uart: &mut Uart,
@@ -389,17 +385,17 @@ fn dispatch_segment(
     argv: &[String],
     depth: usize,
     redirs: &[syntax::Redirection],
-    pipe_stdio: Option<[Option<StdioRedirect>; 3]>,
-) -> (i32, bool) {
-    let stdio = apply_overrides(pipe_stdio.unwrap_or([None, None, None]), redirs);
+    pipe_stdio: Option<Stdio>,
+) -> i32 {
+    let stdio = apply_overrides(pipe_stdio.unwrap_or_default(), redirs);
     if is_builtin(name) {
         // A builtin runs in the shell itself, but still under its own redirects: `cd` or `export`
         // with `> f` creates `f`, and `source script > out` collects what the script prints.
         return match fd::with_inherited_stdio(stdio, || dispatch_builtin(uart, name, argv, depth)) {
-            Ok(code) => (code, false),
+            Ok(code) => code,
             Err(msg) => {
                 report(uart, &msg);
-                (1, true)
+                1
             }
         };
     }
@@ -407,7 +403,7 @@ fn dispatch_segment(
         Ok(program) => program,
         Err(failure) => {
             report(uart, &failure.message);
-            return (failure.status, true);
+            return failure.status;
         }
     };
     let program = match program {
@@ -419,11 +415,21 @@ fn dispatch_segment(
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let env = exported_env();
     let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
-    match exec::process::run_program(&program, &argv_refs, &env_refs, stdio) {
-        Ok(code) => (code, false),
-        Err(e) => {
+    // The redirects are opened first, as the stdio the program inherits, so a failure to open one
+    // says which file and why (`run_program` then binds the inherited streams, with nothing of
+    // its own on top).
+    let ran = fd::with_inherited_stdio(stdio, || {
+        exec::process::run_program(&program, &argv_refs, &env_refs, Vec::new())
+    });
+    match ran {
+        Ok(Ok(code)) => code,
+        Ok(Err(e)) => {
             report(uart, &format!("{name}: {e:?}"));
-            (126, true)
+            launch::STATUS_CANNOT_EXECUTE
+        }
+        Err(msg) => {
+            report(uart, &msg);
+            1
         }
     }
 }
@@ -443,39 +449,44 @@ fn dispatch_segment(
 /// correctly isolating for the external-program case already; this is what extends the same
 /// guarantee to a builtin or bare-assignment stage now that both are allowed to be one).
 ///
-/// Returns `(status, aborts)` -- see `dispatch_segment`'s own doc comment for what `aborts` means
-/// and why it exists; a bare assignment's own failed redirect counts as an aborting failure too,
-/// for the same reason a launch failure does (the segment never really "ran" at all).
+/// Returns the segment's status -- see `dispatch_segment`'s own doc comment.
 #[cfg(target_os = "none")]
 fn run_segment(
     uart: &mut Uart,
     segment: &syntax::Segment,
     depth: usize,
-    pipe_stdio: Option<[Option<StdioRedirect>; 3]>,
-) -> (i32, bool) {
+    pipe_stdio: Option<Stdio>,
+) -> i32 {
     let is_pipeline_stage = pipe_stdio.is_some();
-    let body = || -> (i32, bool) {
+    let body = || -> i32 {
         let (assignments, command_words) = split_assignments(&segment.words);
-        let overlay: Vec<(String, String)> = assignments
-            .into_iter()
-            .map(|(name, value_word)| {
-                let value =
-                    expand::expand_assignment_value(&value_word, &var_lookup, last_status());
-                (name.to_string(), value)
-            })
-            .collect();
+        // Left to right, each value already seeing the ones before it (`A=1 B=$A` makes `B` 1),
+        // whether they end up as the shell's own variables or as the command's one-shot overlay.
+        let mut overlay: Vec<(String, String)> = Vec::new();
+        for (name, value_word) in assignments {
+            let seen = |n: &str| {
+                overlay
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == n)
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| var_lookup(n))
+            };
+            let value = expand::expand_assignment_value(&value_word, &seen, last_status());
+            overlay.push((name.to_string(), value));
+        }
 
         if command_words.is_empty() {
             for (name, value) in &overlay {
                 frame_stack::set_var(name, value).ok();
             }
             // Only the redirects: `> f` alone creates (or truncates) `f`.
-            let stdio = apply_overrides([None, None, None], &segment.redirs);
+            let stdio = apply_overrides(Vec::new(), &segment.redirs);
             return match fd::with_inherited_stdio(stdio, || ()) {
-                Ok(()) => (0, false),
+                Ok(()) => 0,
                 Err(msg) => {
                     report(uart, &msg);
-                    (1, true)
+                    1
                 }
             };
         }
@@ -509,8 +520,7 @@ fn run_segment(
 /// process would -- so its own `cd`, `export` and assignments don't leak back, unlike `source`'s --
 /// and under the command's own `stdio` (its redirects and, as a pipeline stage, its pipe
 /// binding), which every command inside it inherits (`fd::with_inherited_stdio`). Returns
-/// `dispatch_segment`'s `(status, aborts)`: `aborts` is true for a script that was refused (it
-/// never ran), false once it has run, whatever its own status.
+/// `dispatch_segment`'s status: the script's own once it has run, `126` if it was refused.
 ///
 /// A script takes no arguments: there are no positional parameters yet to hand them to.
 #[cfg(target_os = "none")]
@@ -520,11 +530,11 @@ fn run_script_file(
     argv: &[String],
     text: &str,
     depth: usize,
-    stdio: [Option<StdioRedirect>; 3],
-) -> (i32, bool) {
+    stdio: Stdio,
+) -> i32 {
     let refuse = |uart: &mut Uart, why: &str| {
         report(uart, &format!("{name}: {why}"));
-        (launch::STATUS_CANNOT_EXECUTE, true)
+        launch::STATUS_CANNOT_EXECUTE
     };
     if argv.len() > 1 {
         return refuse(uart, "too many arguments");
@@ -536,8 +546,11 @@ fn run_script_file(
         frame_stack::with_child(|| run_script_content(uart, text, depth))
     });
     match ran {
-        Ok(status) => (status, false),
-        Err(msg) => refuse(uart, &msg),
+        Ok(status) => status,
+        Err(msg) => {
+            report(uart, &msg);
+            1
+        }
     }
 }
 
@@ -620,10 +633,9 @@ fn cleanup_temps(paths: &[String]) {
 /// Every stage runs through `run_segment` -- a builtin or a bare assignment is as valid a stage
 /// as an external program now (`run_segment`'s own doc comment on why that's safe: it always
 /// runs wrapped in `with_subshell`, whichever kind of stage it is). A launch-level failure (not
-/// found, bad ELF, a bad redirect) aborts the rest, since the next stage would have no valid
-/// input otherwise (`run_segment`'s `aborts`); a stage that ran but exited nonzero does not -- a
-/// pipeline doesn't stop just because one stage found nothing to do. Every temp file this
-/// pipeline created is removed on every exit path, via the one `cleanup_temps` call at the end.
+/// found, bad ELF, a bad redirect) does not stop the pipeline either, as in bash: the stage just
+/// produced nothing, and the next one reads an empty pipe. Every temp file this pipeline created
+/// is removed on every exit path, via the one `cleanup_temps` call at the end.
 ///
 /// Returns the exit status to report for `$?`: the *last stage that actually ran*'s own status
 /// (bash's own default, no `pipefail` concept here either) -- including a stage that aborted the
@@ -647,21 +659,20 @@ fn run_pipeline(uart: &mut Uart, pipeline: &[syntax::Segment], depth: usize) -> 
 
     let mut status = 1;
     for (i, segment) in pipeline.iter().enumerate() {
-        let mut stdio: [Option<StdioRedirect>; 3] = [None, None, None];
+        let mut stdio: Stdio = Vec::new();
         if i > 0 {
-            stdio[0] = Some(StdioRedirect::In(temps[i - 1].clone()));
+            stdio.push((0, StdioRedirect::In(temps[i - 1].clone())));
         }
         if i + 1 < n {
-            stdio[1] = Some(StdioRedirect::Out {
-                path: temps[i].clone(),
-                append: false,
-            });
+            stdio.push((
+                1,
+                StdioRedirect::Out {
+                    path: temps[i].clone(),
+                    append: false,
+                },
+            ));
         }
-        let (stage_status, aborts) = run_segment(uart, segment, depth, Some(stdio));
-        status = stage_status;
-        if aborts {
-            break;
-        }
+        status = run_segment(uart, segment, depth, Some(stdio));
     }
 
     cleanup_temps(&temps);
@@ -705,6 +716,7 @@ fn describe_syntax_error(err: syntax::SyntaxError) -> String {
             format!("no file name after '{op}'")
         }
         syntax::SyntaxError::BadDupTarget => "a '>&' target must be 1 or 2".into(),
+        syntax::SyntaxError::MissingCommand => "no command next to '|'".into(),
         syntax::SyntaxError::EmptyCommand => {
             unreachable!("run() handles this before calling describe_syntax_error")
         }
@@ -749,7 +761,7 @@ fn run(uart: &mut Uart, line: &str, depth: usize) -> i32 {
     } else {
         // `pipeline` always has at least one segment -- `syntax::parse` never returns an empty
         // one (a pipeline with nothing in it is `SyntaxError::EmptyCommand`, handled above).
-        run_segment(uart, &pipeline[0], depth, None).0
+        run_segment(uart, &pipeline[0], depth, None)
     };
     set_last_status(status);
     status
@@ -1010,6 +1022,10 @@ pub fn run_forever(uart: &mut Uart) -> ! {
             let prompt = prompt::render(frame_stack::var("PS1"), &fs::cwd::get());
             discipline.begin(console, &prompt, Mode::Prompt);
             gpu_dev.flush();
+            // The serial transcript gets the prompt too (the typed line follows it, as in a
+            // terminal's own log): a log that ends with the prompt means the shell is ready for
+            // the next line, which is what the QEMU test harness waits for.
+            write!(uart, "{prompt}").ok();
             loop {
                 let Some(token) = keyboard::queue::pop() else {
                     keyboard::queue::wait_for_token();

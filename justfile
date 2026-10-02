@@ -1,6 +1,9 @@
 default:
     just --list
 
+# Everything: the host unit tests, then the end-to-end QEMU tests (see test/README.md).
+test: test-host test-qemu
+
 # See Cargo.toml's `[target.'cfg(target_os = "none")'.dependencies]` comment for how the split
 # between bare-metal and host-testable code works.
 # Run the pure-logic modules' unit tests on the host, not the bare-metal target.
@@ -8,6 +11,16 @@ test-host:
     cargo test --target aarch64-unknown-linux-gnu
     cd user/abi && cargo test --target aarch64-unknown-linux-gnu
     cd user/textlib && cargo test --target aarch64-unknown-linux-gnu
+
+# Boots the kernel headless in QEMU, one group (one QEMU) per module of test/cases/, in parallel,
+# after rebuilding the kernel and the system image (see test/README.md).
+# Run the end-to-end QEMU tests: all, or the named modules (`just test-qemu shell launch`).
+test-qemu *MODULES: build system build-mkimage
+    python3 test/run_tests.py --kernel virtos.elf --system system.img --mkimage {{MKIMAGE}} {{MODULES}}
+
+# The shortest end-to-end check: boot, an echo, a pipeline, a redirect.
+test-smoke: build system build-mkimage
+    python3 test/run_tests.py --kernel virtos.elf --system system.img --mkimage {{MKIMAGE}} smoke
 
 HOME_IMG := "home.img"
 

@@ -12,6 +12,26 @@ pub fn split_lines(data: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
+/// The pieces of `line` between occurrences of `delimiter` (any non-empty byte string): `"a,b,,c"`
+/// at `,` is `a`, `b`, ``, `c`; a line with no delimiter is one piece, an empty line is one empty
+/// piece, and a trailing delimiter leaves a final empty piece.
+pub fn split_fields<'a>(line: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i + delimiter.len() <= line.len() {
+        if &line[i..i + delimiter.len()] == delimiter {
+            fields.push(&line[start..i]);
+            i += delimiter.len();
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    fields.push(&line[start..]);
+    fields
+}
+
 fn fold(b: u8, ignore_case: bool) -> u8 {
     if ignore_case {
         b.to_ascii_lowercase()
@@ -46,6 +66,27 @@ mod tests {
         assert_eq!(split_lines(b"\n\n"), [&b""[..], b""]);
         assert_eq!(split_lines(b"a\n\nb\n"), [&b"a"[..], b"", b"b"]);
         assert_eq!(split_lines(b"one"), [&b"one"[..]]);
+    }
+
+    #[test]
+    fn fields_are_the_pieces_between_delimiters() {
+        assert_eq!(split_fields(b"a,b,c", b","), [&b"a"[..], b"b", b"c"]);
+        assert_eq!(split_fields(b"a,,c", b","), [&b"a"[..], b"", b"c"]);
+        assert_eq!(split_fields(b"a,b,", b","), [&b"a"[..], b"b", b""]); // a trailing delimiter
+        assert_eq!(split_fields(b",a", b","), [&b""[..], b"a"]);
+        assert_eq!(split_fields(b"lonely", b","), [&b"lonely"[..]]); // none: the whole line
+        assert_eq!(split_fields(b"", b","), [&b""[..]]);
+        assert_eq!(split_fields(b",", b","), [&b""[..], b""]);
+    }
+
+    #[test]
+    fn a_delimiter_may_be_several_bytes() {
+        assert_eq!(
+            split_fields("a\u{65e5}b".as_bytes(), "\u{65e5}".as_bytes()),
+            [&b"a"[..], b"b"]
+        );
+        assert_eq!(split_fields(b"a::b:c", b"::"), [&b"a"[..], b"b:c"]);
+        assert_eq!(split_fields(b"a:::b", b"::"), [&b"a"[..], b":b"]); // left to right, no overlap
     }
 
     #[test]
