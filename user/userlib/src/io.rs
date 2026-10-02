@@ -64,9 +64,8 @@ pub struct DirEnt<'a> {
 }
 
 impl<'a> DirEnt<'a> {
-    /// Decodes the record in `raw`, which must be exactly `DIRENT_SIZE` bytes. `None` if the name
-    /// isn't valid UTF-8.
-    pub fn parse(raw: &'a [u8]) -> Option<Self> {
+    /// Decodes the record in `raw`. `None` if the name isn't valid UTF-8.
+    pub fn parse(raw: &'a [u8; DIRENT_SIZE]) -> Option<Self> {
         let name_len = raw[5] as usize;
         Some(Self {
             size: u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),

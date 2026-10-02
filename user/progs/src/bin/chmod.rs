@@ -59,7 +59,7 @@ fn chmod_recursive(path: &str, set: u8, clear: u8) -> bool {
         if n == 0 {
             break;
         }
-        for raw in buf[..n as usize].chunks_exact(DIRENT_SIZE) {
+        for raw in buf[..n as usize].as_chunks::<DIRENT_SIZE>().0 {
             let Some(ent) = DirEnt::parse(raw) else {
                 continue;
             };
