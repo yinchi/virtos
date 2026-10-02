@@ -21,7 +21,8 @@ struct Device {
 
 struct Devices {
     list: Vec<Device>,
-    root: usize,
+    /// `None` if no device could be chosen (`probe` says why, and the kernel does not boot).
+    root: Option<usize>,
 }
 
 /// Every device found, and the root among them; set once by `probe` at boot.
@@ -38,9 +39,9 @@ fn table() -> Option<&'static Devices> {
 }
 
 /// Reads sector 0 of every block device, works out the root and stores the table. Returns the
-/// root's index, or `None` if no device holds a FAT volume. The table is written to `log` (the
-/// serial log).
-pub fn probe(log: &mut impl Write) -> Option<usize> {
+/// root's index: the one device labelled `SYSTEM` (`bootsector::pick_root`), or why there is not
+/// exactly one. The table is written to `log` (the serial log).
+pub fn probe(log: &mut impl Write) -> Result<usize, bootsector::RootError> {
     let count = blk::count();
     let mut list = Vec::with_capacity(count);
     for dev in 0..count {
@@ -65,9 +66,11 @@ pub fn probe(log: &mut impl Write) -> Option<usize> {
             Some(info) => {
                 let label = core::str::from_utf8(info.label()).unwrap_or("?");
                 let note = match root {
-                    Some((r, true)) if r == index => "  (root)",
-                    Some((r, false)) if r == index => {
-                        "  (root: no SYSTEM volume, using the first FAT volume)"
+                    Ok(r) if r == index => "  (root)",
+                    Err(bootsector::RootError::Ambiguous(_))
+                        if info.label_is(bootsector::ROOT_LABEL) =>
+                    {
+                        "  (labelled SYSTEM, like another volume)"
                     }
                     _ => "",
                 };
@@ -84,15 +87,14 @@ pub fn probe(log: &mut impl Write) -> Option<usize> {
         }
     }
 
-    let root_index = root.map(|(index, _)| index);
     // SAFETY: sole write to DEVICES, at boot (see `table`).
     unsafe {
         DEVICES = Some(Devices {
             list,
-            root: root_index.unwrap_or(0),
+            root: root.ok(),
         });
     }
-    root_index
+    root
 }
 
 /// A size in the binary units a disk image is made in: `64 MiB`, `512 KiB`, or plain bytes for the
@@ -127,7 +129,7 @@ pub fn blkinfo(index: usize) -> Option<BlkInfo> {
         info.label_len = u8::try_from(boot.label().len()).unwrap_or(0);
         info.label[..boot.label().len()].copy_from_slice(boot.label());
     }
-    if index == devices.root {
+    if devices.root == Some(index) {
         info.flags |= BLK_ROOT;
     }
     if let Some(point) = super::mounts::table().point_of(index) {

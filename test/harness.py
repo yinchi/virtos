@@ -53,7 +53,7 @@ DEFAULT_ENVIRONMENT = "HOME=/root\nPS1='\\w> '\n"
 
 
 class Session:
-    def __init__(self, elf, system_img, home_img, workdir):
+    def __init__(self, elf, system_img, home_img, workdir, expect_boot=True):
         self.serial_path = os.path.join(workdir, "serial.log")
         self.sock_path = os.path.join(workdir, "mon.sock")
         open(self.serial_path, "w").close()
@@ -85,8 +85,9 @@ class Session:
         self.sock.recv(4096)  # the monitor's banner
         self.pos = 0
         self.boot_log = ""
-        self.wait_prompt()  # boot finished: the first prompt is on the serial log
-        self.boot_log = self.log()
+        if expect_boot:
+            self.wait_prompt()  # boot finished: the first prompt is on the serial log
+            self.boot_log = self.log()
 
     def _stderr(self):
         if self.qemu.poll() is None:
@@ -136,6 +137,16 @@ class Session:
             if time.time() > deadline:
                 raise TimeoutError(f"timed out waiting for {what}; log since the checkpoint:\n{text!r}")
             time.sleep(0.05)
+
+    def wait_for_log(self, text, timeout=TIMEOUT):
+        """Waits for `text` to appear anywhere in the serial log, panics included -- for a test of
+        a boot that is meant to fail. Returns the whole log; raises `TimeoutError` if it never does."""
+        deadline = time.time() + timeout
+        while text not in self.log():
+            if time.time() > deadline:
+                raise TimeoutError(f"{text!r} never appeared; log:\n{self.log()!r}")
+            time.sleep(0.05)
+        return self.log()
 
     def wait_prompt(self, timeout=TIMEOUT):
         """Waits for the shell's prompt at the end of the log; returns the text since the
@@ -211,8 +222,13 @@ def get_file(img, path):
     return r.stdout if r.returncode == 0 else None
 
 
-def make_home_image(mkimage, path, workdir, files):
-    """A fresh HOME volume (label HOME, ID 5E6F-7A8B) holding `files` ({path: content})."""
+def relabel(img, label):
+    """Gives `img`'s FAT volume a new label (in the boot sector, where the kernel reads it)."""
+    _mtools("mlabel", "-i", img, f"::{label}")
+
+
+def make_home_image(mkimage, path, workdir, files, label="HOME"):
+    """A fresh volume (label `label`, ID 5E6F-7A8B) holding `files` ({path: content})."""
     seed = os.path.join(workdir, "home-seed")
     os.makedirs(seed, exist_ok=True)
     for name, content in files.items():
@@ -220,7 +236,7 @@ def make_home_image(mkimage, path, workdir, files):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "wb") as f:
             f.write(content.encode() if isinstance(content, str) else content)
-    subprocess.run([mkimage, path, "64M", "HOME", "5e6f7a8b", seed], check=True, capture_output=True)
+    subprocess.run([mkimage, path, "64M", label, "5e6f7a8b", seed], check=True, capture_output=True)
 
 
 class Context:

@@ -53,21 +53,40 @@ impl BootInfo {
     }
 }
 
-/// Which device is the root of the file tree, given each device's identity (`None` for one that is not FAT), in
-/// device order: the first volume labelled `SYSTEM`, and failing that the first FAT volume at all -- which is how
-/// every image built before the label existed (or a single unlabelled one) keeps booting. `None` when no device holds a FAT
-/// volume. The flag says whether the label chose it.
-pub fn pick_root(devices: &[Option<BootInfo>]) -> Option<(usize, bool)> {
-    let system = devices
-        .iter()
-        .position(|d| d.is_some_and(|d| d.label_is(ROOT_LABEL)));
-    if let Some(index) = system {
-        return Some((index, true));
+/// Why no device could be chosen as the root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootError {
+    /// No device holds a FAT volume labelled `SYSTEM`.
+    NoSystem,
+    /// This many devices (more than one) do: a label is not a unique name, and guessing which one
+    /// is the system could boot from -- and write to -- the wrong disk.
+    Ambiguous(usize),
+}
+
+impl fmt::Display for RootError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RootError::NoSystem => write!(f, "no FAT volume is labelled {ROOT_LABEL}"),
+            RootError::Ambiguous(n) => write!(f, "{n} FAT volumes are labelled {ROOT_LABEL}"),
+        }
     }
-    devices
+}
+
+/// Which device is the root of the file tree, given each device's identity (`None` for one that is
+/// not FAT), in device order: the one volume labelled `SYSTEM` (without regard to case). Exactly
+/// one: none is `NoSystem`, and two or more are `Ambiguous` -- there is no fallback to "the first
+/// FAT volume", which could be the HOME disk.
+pub fn pick_root(devices: &[Option<BootInfo>]) -> Result<usize, RootError> {
+    let mut systems = devices
         .iter()
-        .position(Option::is_some)
-        .map(|index| (index, false))
+        .enumerate()
+        .filter(|(_, d)| d.is_some_and(|d| d.label_is(ROOT_LABEL)))
+        .map(|(index, _)| index);
+    match (systems.next(), systems.next()) {
+        (Some(index), None) => Ok(index),
+        (None, _) => Err(RootError::NoSystem),
+        (Some(_), Some(_)) => Err(RootError::Ambiguous(2 + systems.count())),
+    }
 }
 
 fn u16_at(sector: &[u8], at: usize) -> u16 {
@@ -245,26 +264,45 @@ mod tests {
     fn the_root_is_the_system_volume_wherever_it_is() {
         let home = parse(&fat16(b"HOME       ", 1));
         let system = parse(&fat16(b"SYSTEM     ", 2));
-        assert_eq!(pick_root(&[home, system]), Some((1, true)));
-        assert_eq!(pick_root(&[system, home]), Some((0, true)));
-        assert_eq!(pick_root(&[None, system]), Some((1, true)));
+        assert_eq!(pick_root(&[home, system]), Ok(1));
+        assert_eq!(pick_root(&[system, home]), Ok(0));
+        assert_eq!(pick_root(&[None, system]), Ok(1));
     }
 
     #[test]
-    fn with_no_system_volume_the_first_fat_volume_is_the_root() {
+    fn without_a_system_volume_there_is_no_root() {
         let old = parse(&fat16(b"OLDDISK    ", 0));
         let home = parse(&fat16(b"HOME       ", 1));
-        assert_eq!(pick_root(&[old]), Some((0, false)));
-        assert_eq!(pick_root(&[None, home, old]), Some((1, false)));
-        assert_eq!(pick_root(&[None, None]), None);
-        assert_eq!(pick_root(&[]), None);
+        // Never "the first FAT volume": that could be the HOME disk.
+        assert_eq!(pick_root(&[old]), Err(RootError::NoSystem));
+        assert_eq!(pick_root(&[None, home, old]), Err(RootError::NoSystem));
+        assert_eq!(pick_root(&[None, None]), Err(RootError::NoSystem));
+        assert_eq!(pick_root(&[]), Err(RootError::NoSystem));
+        assert_eq!(
+            pick_root(&[parse(&fat16(b"NO NAME    ", 3))]),
+            Err(RootError::NoSystem)
+        );
     }
 
     #[test]
-    fn two_system_volumes_take_the_first() {
+    fn two_system_volumes_are_ambiguous() {
         let a = parse(&fat16(b"SYSTEM     ", 1));
-        let b = parse(&fat16(b"system     ", 2));
-        assert_eq!(pick_root(&[a, b]), Some((0, true)));
+        let b = parse(&fat16(b"system     ", 2)); // the label's case does not matter
+        let home = parse(&fat16(b"HOME       ", 3));
+        assert_eq!(pick_root(&[a, b]), Err(RootError::Ambiguous(2)));
+        assert_eq!(pick_root(&[a, home, b, a]), Err(RootError::Ambiguous(3)));
+    }
+
+    #[test]
+    fn the_error_says_which_problem_it_is() {
+        assert_eq!(
+            alloc::format!("{}", RootError::NoSystem),
+            "no FAT volume is labelled SYSTEM"
+        );
+        assert_eq!(
+            alloc::format!("{}", RootError::Ambiguous(2)),
+            "2 FAT volumes are labelled SYSTEM"
+        );
     }
 
     #[test]

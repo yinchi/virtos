@@ -16,7 +16,10 @@ A module exposes `run(ctx)`, and optionally:
 - `SYSTEM_FILES` / `HOME_FILES`: `{path: content}` put on the group's copy of the system image or
   on its fresh HOME disk before boot (`None` as content removes a file of the system image).
   Defaults: `harness.DEFAULT_ENVIRONMENT` as `/etc/environment`, an empty HOME disk;
-- `HOME = False`: boot with no HOME disk attached;
+- `HOME = False`: boot with no HOME disk attached; `HOME_LABEL` / `SYSTEM_LABEL`: the volume labels
+  (default HOME, and the system image's own SYSTEM);
+- `BOOT_FAILS = True`: the kernel is expected not to reach a prompt -- `run` reads the serial log
+  with `Session.wait_for_log` instead;
 - `EXCLUSIVE = True`: the group's checks are sensitive to CPU load (they race real key presses
   against the guest), so it runs alone, after every parallel group has finished;
 - `RETRIES = n`: if the group fails, run it again, up to n more times, and report which attempt
@@ -77,14 +80,18 @@ def run_once(module, args):
     system_files.update(getattr(module, "SYSTEM_FILES", {}))
     for path, content in system_files.items():
         harness.put_file(system_img, path, content)
+    if hasattr(module, "SYSTEM_LABEL"):
+        harness.relabel(system_img, module.SYSTEM_LABEL)
     home_img = None
     if getattr(module, "HOME", True):
         home_img = os.path.join(workdir, "home.img")
-        harness.make_home_image(args.mkimage, home_img, workdir, getattr(module, "HOME_FILES", {}))
+        harness.make_home_image(args.mkimage, home_img, workdir, getattr(module, "HOME_FILES", {}),
+                                getattr(module, "HOME_LABEL", "HOME"))
 
     session = None
     try:
-        session = harness.Session(os.path.abspath(args.kernel), system_img, home_img, workdir)
+        session = harness.Session(os.path.abspath(args.kernel), system_img, home_img, workdir,
+                                  expect_boot=not getattr(module, "BOOT_FAILS", False))
         ctx = harness.Context(session, check, workdir, system_img, home_img)
         module.run(ctx)
     except Exception:

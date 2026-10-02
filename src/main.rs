@@ -119,10 +119,12 @@ pub(crate) mod bare_metal {
         // IDs), and the root of the file tree is the volume labelled SYSTEM -- by what is on a
         // device, never by which slot QEMU put it in. Every other volume is mounted later:
         // `/etc/fstab`, or the `mount` syscall.
-        let root = fs::devices::probe(&mut uart);
-        match root {
-            Some(dev) if fs::mounts::install_root(dev) => {}
-            _ => panic!("no FAT volume to mount as the root (/)"),
+        // Exactly one volume must carry that label: with none, or with two, there is no telling
+        // which disk is the system, and guessing could boot from -- and write to -- the wrong one.
+        match fs::devices::probe(&mut uart) {
+            Ok(dev) if fs::mounts::install_root(dev) => {}
+            Ok(_) => panic!("the volume labelled SYSTEM is not a filesystem this kernel can open"),
+            Err(why) => panic!("cannot choose a root volume: {why} (exactly one must be)"),
         }
 
         // `run_forever` never returns: a real program is launched by typing its name here, rather
