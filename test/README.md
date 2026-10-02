@@ -21,6 +21,13 @@ runs only the named modules; `just test-smoke` is a few seconds' worth of boot, 
   HOME disk. By default `/etc/environment` is `HOME=/root` and `PS1='\w> '` and the HOME disk is empty, so
   a test never depends on the image's own start-up files by accident (`startup.py` and friends are the
   exceptions that test those mechanisms).
+- **Test-only programs** (`test/progs`, built by `just build-test-progs`): EL0 programs that make the
+  system calls no shell command can make badly (an unknown number, a pointer outside the program, an
+  fd that is not open) and that fault on purpose. A module lists the ones it wants in `TEST_PROGS`;
+  they are put on its private image as `/tests/<name>` (not executable: the module `chmod +x`es them).
+  They use `userlib` only for `_start` and exit and issue their own raw `svc`, so a wrapper that
+  checked its arguments could not hide a kernel that did not. Never in `user/`, never on the shipped
+  image. `syscalls.py` holds the table of what each bad call must return.
 - **The boot transcript** (start-up notes, what `.profile` printed) is `Session.boot_log`.
 
 ## Writing a test

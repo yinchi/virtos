@@ -1,0 +1,1 @@
+../../user/progs/link.ld

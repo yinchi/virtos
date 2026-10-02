@@ -16,6 +16,9 @@ A module exposes `run(ctx)`, and optionally:
 - `SYSTEM_FILES` / `HOME_FILES`: `{path: content}` put on the group's copy of the system image or
   on its fresh HOME disk before boot (`None` as content removes a file of the system image).
   Defaults: `harness.DEFAULT_ENVIRONMENT` as `/etc/environment`, an empty HOME disk;
+- `TEST_PROGS = ["badcalls", ...]`: programs of `test/progs` (bad system calls, deliberate faults)
+  put on the group's copy of the system image as `/tests/<name>` -- not executable: the module
+  `chmod +x`es what it runs;
 - `HOME = False`: boot with no HOME disk attached; `HOME_LABEL` / `SYSTEM_LABEL`: the volume labels
   (default HOME, and the system image's own SYSTEM);
 - `EXTRA_DISKS = [{"label": ..., "id": "8 hex digits", "files": {...}}, ...]`: more volumes, attached
@@ -82,6 +85,9 @@ def run_once(module, args):
     system_files.update(getattr(module, "SYSTEM_FILES", {}))
     for path, content in system_files.items():
         harness.put_file(system_img, path, content)
+    for name in getattr(module, "TEST_PROGS", []):
+        with open(os.path.join(args.test_progs, name), "rb") as f:
+            harness.put_file(system_img, f"tests/{name}", f.read())
     if hasattr(module, "SYSTEM_LABEL"):
         harness.relabel(system_img, module.SYSTEM_LABEL)
     home_img = None
@@ -139,6 +145,7 @@ def main():
     parser.add_argument("--kernel", required=True)
     parser.add_argument("--system", required=True)
     parser.add_argument("--mkimage", required=True)
+    parser.add_argument("--test-progs", help="directory holding the built test/progs binaries")
     parser.add_argument("modules", nargs="*")
     args = parser.parse_args()
 

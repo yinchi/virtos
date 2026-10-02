@@ -1,0 +1,21 @@
+[package]
+name = "testprogs"
+version = "0.1.0"
+edition = "2024"
+
+# EL0 programs that exist only for the QEMU tests (`test/cases/`): they make the system calls no
+# shell command can make -- an unknown number, a pointer outside the program's own memory, an
+# fd that is not open -- and fault on purpose, so the kernel's answer to each can be checked. Built
+# by `just build-test-progs` and put on a test group's private copy of the system image under
+# `/tests/` (a module's `TEST_PROGS`); never in `user/`, never in the shipped image. A sibling
+# crate to the kernel like every other, with `user/progs`'s own `link.ld` (a symlink: one layout
+# for every EL0 binary) and `build.rs`.
+
+[dependencies]
+userlib = { path = "../../user/userlib" }
+abi = { path = "../../user/abi" }
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

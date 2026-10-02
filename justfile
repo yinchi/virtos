@@ -15,8 +15,15 @@ test-host:
 # Boots the kernel headless in QEMU, one group (one QEMU) per module of test/cases/, in parallel,
 # after rebuilding the kernel and the system image (see test/README.md).
 # Run the end-to-end QEMU tests: all, or the named modules (`just test-qemu shell launch`).
-test-qemu *MODULES: build system build-mkimage
-    python3 test/run_tests.py --kernel virtos.elf --system system.img --mkimage {{MKIMAGE}} {{MODULES}}
+test-qemu *MODULES: build system build-mkimage build-test-progs
+    python3 test/run_tests.py --kernel virtos.elf --system system.img --mkimage {{MKIMAGE}} --test-progs test/progs/target/aarch64-unknown-none-softfloat/release {{MODULES}}
+
+# The EL0 programs only the tests use (`test/progs`): bad system calls and deliberate faults. A
+# module that wants them lists them in `TEST_PROGS`; they are put on its private copy of the
+# system image, never on the shipped one.
+# Build the test-only programs.
+build-test-progs:
+    cd test/progs && cargo build --release
 
 # The shortest end-to-end check: boot, an echo, a pipeline, a redirect.
 test-smoke: build system build-mkimage
