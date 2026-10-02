@@ -49,6 +49,9 @@ pub const ENAMETOOLONG: isize = -36;
 pub const ENOSYS: isize = -38;
 /// Directory not empty.
 pub const ENOTEMPTY: isize = -39;
+/// Name not unique (Linux's `ENOTUNIQ`) -- here: a mount source (`LABEL=` or `UUID=`) that more than one
+/// volume matches, so there is no telling which one is meant.
+pub const ENOTUNIQ: isize = -76;
 
 /// Human-readable text for a negative error a syscall returned (`strerror`'s wording).
 pub fn errmsg(code: isize) -> &'static str {
@@ -75,6 +78,7 @@ pub fn errmsg(code: isize) -> &'static str {
         ENAMETOOLONG => "File name too long",
         ENOSYS => "Function not implemented",
         ENOTEMPTY => "Directory not empty",
+        ENOTUNIQ => "Name not unique on network",
         _ => "Unknown error",
     }
 }
@@ -110,10 +114,11 @@ mod tests {
                 ENOTEMPTY,
                 ENODEV,
                 EBUSY,
-                EXDEV
+                EXDEV,
+                ENOTUNIQ
             ],
             [
-                -7, -8, -12, -14, -17, -25, -28, -34, -36, -38, -39, -19, -16, -18
+                -7, -8, -12, -14, -17, -25, -28, -34, -36, -38, -39, -19, -16, -18, -76
             ]
         );
     }
@@ -143,6 +148,7 @@ mod tests {
             ENODEV,
             EBUSY,
             EXDEV,
+            ENOTUNIQ,
         ] {
             assert_ne!(errmsg(code), "Unknown error", "{code}");
         }

@@ -53,14 +53,14 @@ DEFAULT_ENVIRONMENT = "HOME=/root\nPS1='\\w> '\n"
 
 
 class Session:
-    def __init__(self, elf, system_img, home_img, workdir, expect_boot=True):
+    def __init__(self, elf, system_img, home_img, workdir, expect_boot=True, extra_imgs=()):
         self.serial_path = os.path.join(workdir, "serial.log")
         self.sock_path = os.path.join(workdir, "mon.sock")
         open(self.serial_path, "w").close()
         drives = []
         # The home disk first, then the system disk, as `just run` does (the kernel names a
         # volume by its label, so the order does not matter).
-        for n, path in enumerate([p for p in (home_img, system_img) if p]):
+        for n, path in enumerate([p for p in (home_img, *extra_imgs, system_img) if p]):
             drives += ["-drive", f"file={path},if=none,format=raw,id=d{n}",
                        "-device", f"virtio-blk-device,drive=d{n}"]
         self.qemu = subprocess.Popen(
@@ -227,8 +227,9 @@ def relabel(img, label):
     _mtools("mlabel", "-i", img, f"::{label}")
 
 
-def make_home_image(mkimage, path, workdir, files, label="HOME"):
-    """A fresh volume (label `label`, ID 5E6F-7A8B) holding `files` ({path: content})."""
+def make_home_image(mkimage, path, workdir, files, label="HOME", volume_id="5e6f7a8b"):
+    """A fresh volume (label `label`, ID `volume_id`: 8 hex digits, 5E6F-7A8B by default) holding
+    `files` ({path: content})."""
     seed = os.path.join(workdir, "home-seed")
     os.makedirs(seed, exist_ok=True)
     for name, content in files.items():
@@ -236,15 +237,16 @@ def make_home_image(mkimage, path, workdir, files, label="HOME"):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "wb") as f:
             f.write(content.encode() if isinstance(content, str) else content)
-    subprocess.run([mkimage, path, "64M", label, "5e6f7a8b", seed], check=True, capture_output=True)
+    subprocess.run([mkimage, path, "64M", label, volume_id, seed], check=True, capture_output=True)
 
 
 class Context:
     """What a case module's `run` and `verify_disk` get."""
 
-    def __init__(self, session, check, workdir, system_img, home_img):
+    def __init__(self, session, check, workdir, system_img, home_img, extra_imgs=()):
         self.s = session
         self.check = check
         self.workdir = workdir
         self.system_img = system_img
         self.home_img = home_img
+        self.extra_imgs = list(extra_imgs)

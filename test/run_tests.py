@@ -18,6 +18,8 @@ A module exposes `run(ctx)`, and optionally:
   Defaults: `harness.DEFAULT_ENVIRONMENT` as `/etc/environment`, an empty HOME disk;
 - `HOME = False`: boot with no HOME disk attached; `HOME_LABEL` / `SYSTEM_LABEL`: the volume labels
   (default HOME, and the system image's own SYSTEM);
+- `EXTRA_DISKS = [{"label": ..., "id": "8 hex digits", "files": {...}}, ...]`: more volumes, attached
+  after the HOME disk;
 - `BOOT_FAILS = True`: the kernel is expected not to reach a prompt -- `run` reads the serial log
   with `Session.wait_for_log` instead;
 - `EXCLUSIVE = True`: the group's checks are sensitive to CPU load (they race real key presses
@@ -88,11 +90,18 @@ def run_once(module, args):
         harness.make_home_image(args.mkimage, home_img, workdir, getattr(module, "HOME_FILES", {}),
                                 getattr(module, "HOME_LABEL", "HOME"))
 
+    extra_imgs = []
+    for n, spec in enumerate(getattr(module, "EXTRA_DISKS", [])):
+        path = os.path.join(workdir, f"extra{n}.img")
+        harness.make_home_image(args.mkimage, path, os.path.join(workdir, f"extra{n}"), spec.get("files", {}),
+                                spec.get("label", "EXTRA"), spec.get("id", "00001111"))
+        extra_imgs.append(path)
+
     session = None
     try:
         session = harness.Session(os.path.abspath(args.kernel), system_img, home_img, workdir,
-                                  expect_boot=not getattr(module, "BOOT_FAILS", False))
-        ctx = harness.Context(session, check, workdir, system_img, home_img)
+                                  expect_boot=not getattr(module, "BOOT_FAILS", False), extra_imgs=extra_imgs)
+        ctx = harness.Context(session, check, workdir, system_img, home_img, extra_imgs)
         module.run(ctx)
     except Exception:
         check("the module ran to completion", traceback.format_exc(), None)
@@ -100,11 +109,11 @@ def run_once(module, args):
         if session:
             session.close()
     if session:
-        ctx = harness.Context(session, check, workdir, system_img, home_img)
+        ctx = harness.Context(session, check, workdir, system_img, home_img, extra_imgs)
         try:
             if hasattr(module, "verify_disk"):
                 module.verify_disk(ctx)
-            for name, img in (("system", system_img), ("home", home_img)):
+            for name, img in (("system", system_img), ("home", home_img), *[(f"extra{i}", p) for i, p in enumerate(extra_imgs)]):
                 if img:
                     fsck = subprocess.run(["fsck.fat", "-n", img], capture_output=True, text=True)
                     check(f"fsck.fat -n is clean on the {name} image",

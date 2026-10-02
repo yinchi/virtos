@@ -862,7 +862,7 @@ fn mount_fstab(uart: &mut Uart) {
         };
         if point == "/" {
             let root = fs::mounts::table().resolve("/").0;
-            if entry.source.find(&fs::devices::identities()) != Some(root) {
+            if entry.source.find(&fs::devices::identities()) != Ok(root) {
                 note(
                     "the root is chosen at boot (the volume labelled SYSTEM), not from this file -- ignored",
                 );
@@ -874,6 +874,11 @@ fn mount_fstab(uart: &mut Uart) {
             abi::errno::ENODEV if entry.nofail => {}
             abi::errno::ENODEV => note("no volume has that label or ID -- skipped"),
             abi::errno::EINVAL => note("not a FAT filesystem -- skipped"),
+            abi::errno::ENOTUNIQ => {
+                note(
+                    "more than one volume has that label or ID -- skipped (UUID= or unmount the twin)",
+                );
+            }
             e => note(&format!("{} -- skipped", abi::errno::errmsg(e))),
         }
     }

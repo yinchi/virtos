@@ -13,7 +13,7 @@ use alloc::format;
 use alloc::vec::Vec;
 
 use abi::blk::{BLK_FAT, BlkInfo};
-use abi::errno::{EINVAL, ENODEV, errmsg};
+use abi::errno::{EINVAL, ENODEV, ENOTUNIQ, errmsg};
 use progs::{Out, cli};
 use textlib::spell::source_of;
 use userlib::{Args, ExitCode, blkinfo, mount};
@@ -70,6 +70,7 @@ fn run(args: Args) -> ExitCode {
             let why = match result {
                 EINVAL => "not a LABEL= or UUID= source, or not a FAT filesystem",
                 ENODEV => "no volume has that label or ID",
+                ENOTUNIQ => "more than one volume has that label or ID (see lsblk)",
                 other => errmsg(other),
             };
             cli::report("mount", &format!("{source} on {target}: {why}"));

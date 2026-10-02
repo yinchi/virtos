@@ -165,12 +165,30 @@ impl Source {
         }
     }
 
-    /// The first device (by index) `self` matches among `devices` (`None` for a device that is not FAT).
-    pub fn find(&self, devices: &[Option<BootInfo>]) -> Option<usize> {
-        devices
+    /// The one device `self` matches among `devices` (`None` for a device that is not FAT). Neither a
+    /// label nor a volume ID is guaranteed unique -- a disk cloned from an image has the original's
+    /// ID too -- so a source that more than one device matches is `Ambiguous`, not "the first".
+    pub fn find(&self, devices: &[Option<BootInfo>]) -> Result<usize, FindError> {
+        let mut matches = devices
             .iter()
-            .position(|d| d.as_ref().is_some_and(|info| self.matches(info)))
+            .enumerate()
+            .filter(|(_, d)| d.as_ref().is_some_and(|info| self.matches(info)))
+            .map(|(index, _)| index);
+        match (matches.next(), matches.next()) {
+            (Some(index), None) => Ok(index),
+            (None, _) => Err(FindError::NoMatch),
+            (Some(_), Some(_)) => Err(FindError::Ambiguous(2 + matches.count())),
+        }
     }
+}
+
+/// Why a source did not name exactly one device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindError {
+    /// No device has that label or ID.
+    NoMatch,
+    /// This many devices (more than one) do.
+    Ambiguous(usize),
 }
 
 #[cfg(test)]
@@ -345,14 +363,47 @@ mod tests {
             fat(b"SYSTEM     ", 2),
             fat(b"HOME       ", 3),
         ];
+        assert_eq!(Source::Label(String::from("SYSTEM")).find(&devices), Ok(2));
+        assert_eq!(Source::Uuid(3).find(&devices), Ok(3)); // the ID tells the two HOMEs apart
+        assert_eq!(Source::Uuid(2).find(&devices), Ok(2));
         assert_eq!(
-            Source::Label(String::from("SYSTEM")).find(&devices),
-            Some(2)
+            Source::Label(String::from("NOPE")).find(&devices),
+            Err(FindError::NoMatch)
         );
-        assert_eq!(Source::Label(String::from("home")).find(&devices), Some(0)); // the first of two, ignoring case
-        assert_eq!(Source::Uuid(3).find(&devices), Some(3)); // the ID tells the two apart
-        assert_eq!(Source::Label(String::from("NOPE")).find(&devices), None);
-        assert_eq!(Source::Uuid(9).find(&devices), None);
-        assert_eq!(Source::Label(String::from("HOME")).find(&[]), None);
+        assert_eq!(Source::Uuid(9).find(&devices), Err(FindError::NoMatch));
+        assert_eq!(
+            Source::Label(String::from("HOME")).find(&[]),
+            Err(FindError::NoMatch)
+        );
+    }
+
+    #[test]
+    fn a_source_that_two_devices_match_is_ambiguous_not_the_first() {
+        let devices = [
+            fat(b"HOME       ", 1),
+            None,
+            fat(b"SYSTEM     ", 2),
+            fat(b"HOME       ", 3),
+            fat(b"home       ", 4), // the case of a label does not matter
+        ];
+        // The same label on three volumes.
+        assert_eq!(
+            Source::Label(String::from("HOME")).find(&devices),
+            Err(FindError::Ambiguous(3))
+        );
+        assert_eq!(
+            Source::Label(String::from("home")).find(&devices),
+            Err(FindError::Ambiguous(3))
+        );
+        // A volume ID is no better: a disk cloned from an image has the original's ID.
+        let cloned = [
+            fat(b"HOME       ", 7),
+            fat(b"BACKUP     ", 7),
+            fat(b"OTHER      ", 8),
+        ];
+        assert_eq!(Source::Uuid(7).find(&cloned), Err(FindError::Ambiguous(2)));
+        // ...while the other spelling still names one of them.
+        assert_eq!(Source::Label(String::from("BACKUP")).find(&cloned), Ok(1));
+        assert_eq!(Source::Uuid(8).find(&cloned), Ok(2));
     }
 }

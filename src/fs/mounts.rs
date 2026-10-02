@@ -10,9 +10,9 @@
 //! shell runs outside interrupts, so nothing else touches it while a call is in progress.
 
 use abi::blk::BLK_MOUNT_MAX;
-use abi::errno::{EBUSY, EINVAL, ENAMETOOLONG, ENODEV, ENOENT, ENOTDIR};
+use abi::errno::{EBUSY, EINVAL, ENAMETOOLONG, ENODEV, ENOENT, ENOTDIR, ENOTUNIQ};
 
-use super::mounttable::{MountError, MountTable, Source, is_within};
+use super::mounttable::{FindError, MountError, MountTable, Source, is_within};
 use super::{devices, path, volume};
 
 static mut TABLE: Option<MountTable> = None;
@@ -65,7 +65,8 @@ fn check_directory(target: &str) -> Result<(), isize> {
 
 /// Mounts the volume `source` names (`LABEL=name` or `UUID=XXXX-XXXX`) on the directory `target`,
 /// an absolute, normalized path. `0`, or: `EINVAL` (not a source, or not a filesystem this kernel
-/// can open), `ENODEV` (no device has that label or ID), `EBUSY` (that volume is mounted already,
+/// can open), `ENODEV` (no device has that label or ID), `ENOTUNIQ` (more than one does: a label or
+/// an ID is not guaranteed unique, so it is refused rather than guessed), `EBUSY` (that volume is mounted already,
 /// `target` is a mount point, or another mount is inside it), `ENAMETOOLONG`, and what
 /// `check_directory` says of the target (`ENOENT`, `ENOTDIR`).
 pub fn mount(source: &str, target: &str) -> isize {
@@ -75,8 +76,10 @@ pub fn mount(source: &str, target: &str) -> isize {
     if target.len() > BLK_MOUNT_MAX {
         return ENAMETOOLONG;
     }
-    let Some(dev) = source.find(&devices::identities()) else {
-        return ENODEV;
+    let dev = match source.find(&devices::identities()) {
+        Ok(dev) => dev,
+        Err(FindError::NoMatch) => return ENODEV,
+        Err(FindError::Ambiguous(_)) => return ENOTUNIQ,
     };
     if table().point_of(dev).is_some() || table().covers_a_mount(target) {
         return EBUSY;
