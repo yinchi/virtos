@@ -74,10 +74,10 @@ fn report(uart: &mut Uart, msg: &str) {
     }
 }
 
-/// The builtin `name` is, if it is one -- checked before ever trying to resolve
-/// `usr/bin/<name>`, and before a pipeline stage is allowed to even attempt connecting to the
-/// pipe wiring: none of these launches a real process with a real fd table, so none has anywhere
-/// to plug a pipe binding into (`run_pipeline`'s own doc comment).
+/// The builtin `name` is, if it is one -- checked before ever trying to resolve it as a command.
+/// A builtin runs in the shell itself rather than as a program of its own, but still under its
+/// own redirects and pipe bindings (`fd::with_inherited_stdio`): whatever a `source`d script runs
+/// inherits them.
 #[cfg(target_os = "none")]
 fn is_builtin(name: &str) -> bool {
     matches!(name, "cd" | "source" | "." | "sh" | "export" | "unset")
@@ -279,45 +279,6 @@ fn unset(argv: &[String]) -> i32 {
     0
 }
 
-/// Applies `redirs` with no program to run afterward -- `cd`, and a segment with no command at
-/// all (only redirections, e.g. `> f` -- POSIX still creates the file), both land here rather
-/// than through `syscall::fd::bind_stdio`/`run_program`: there is no process, and no fd table to
-/// bind into. Each redirect's real side effect still happens -- `In` still errors if its target
-/// is missing even though nothing reads it; `Out`/`Append` still creates or truncates its target
-/// even though nothing writes to it -- just opened and, for `Out`/`Append`, immediately finished,
-/// since there is nothing here to hand the open file to. `Dup` has nothing to alias without a
-/// real fd table, so it is a genuine no-op.
-///
-/// Applied by `run` (this function's only caller) *before* whatever follows -- `cd`'s own
-/// `fs::cwd::set`, if any -- touches anything, so a relative path in a redirect resolves against
-/// the working directory as it was *before* that: `cd foo > bar` creates `bar` relative to where
-/// the shell started, not `foo`, matching a real shell. This falls out of the calling order
-/// alone; nothing here needs to know which directory is "the right one" itself.
-#[cfg(target_os = "none")]
-fn apply_redirects_standalone(redirs: &[syntax::Redirection]) -> Result<(), String> {
-    for redir in redirs {
-        match redir {
-            syntax::Redirection::In(path) => {
-                let absolute = fs::cwd::absolute(path);
-                if fd::open_for_read(&absolute).is_err() {
-                    return Err(format!("{path}: not found"));
-                }
-            }
-            syntax::Redirection::Out { path, append, .. } => {
-                let absolute = fs::cwd::absolute(path);
-                let Ok((_, writer)) = fd::open_for_write(&absolute, *append) else {
-                    return Err(format!("{path}: cannot create"));
-                };
-                if writer.finish().is_err() {
-                    return Err(format!("{path}: cannot create"));
-                }
-            }
-            syntax::Redirection::Dup { .. } => {} // nothing to alias without a real fd table
-        }
-    }
-    Ok(())
-}
-
 /// Layers `redirs` onto `overrides` (`syscall::fd::bind_stdio`'s own parameter shape) -- each
 /// `Redirection` names the fd it binds (`In` always fd 0; `Out`/`Dup` carry their own, defaulted
 /// to 1 by `syntax`'s own parsing), so this is a plain sort into array slots, *overwriting*
@@ -413,12 +374,11 @@ fn dispatch_builtin(uart: &mut Uart, name: &str, argv: &[String], depth: usize) 
 
 /// Runs `name`'s command (`argv[0]`, already expanded) -- a builtin or an external program --
 /// once any leading assignment prefix has already been stripped by the caller (`run_segment`).
-/// `pipe_stdio` is only ever actually used by an external program: no builtin here has real
-/// fd-based I/O to connect a pipe to, pipeline stage or not, so a builtin's own redirections (if
-/// any) are always applied via `apply_redirects_standalone` -- same as a standalone builtin
-/// already used before pipeline stages could be one at all -- and `pipe_stdio` is simply unused
-/// for that stage. Returns `(status, aborts)`: `aborts` is `true` only for a failure at the
-/// *launch* level (not found, a bad redirect, a bad ELF) -- never a builtin's own `1`, nor a
+/// `pipe_stdio` is a pipeline stage's own pipe binding, applied underneath the segment's
+/// redirects. All of it is the command's stdio: a program starts with it already bound onto fds
+/// 0-2, a script or a builtin runs with it as the stdio every command inside inherits
+/// (`fd::with_inherited_stdio`). Returns `(status, aborts)`: `aborts` is `true` only for a failure
+/// at the *launch* level (not found, a bad redirect, a bad ELF) -- never a builtin's own `1`, nor a
 /// successfully launched program's own nonzero exit -- `run_pipeline`'s own reason for keeping
 /// the two apart: a pipeline keeps running after an ordinary command failure, but not after one
 /// that couldn't start at all.
@@ -431,12 +391,17 @@ fn dispatch_segment(
     redirs: &[syntax::Redirection],
     pipe_stdio: Option<[Option<StdioRedirect>; 3]>,
 ) -> (i32, bool) {
+    let stdio = apply_overrides(pipe_stdio.unwrap_or([None, None, None]), redirs);
     if is_builtin(name) {
-        if let Err(msg) = apply_redirects_standalone(redirs) {
-            report(uart, &msg);
-            return (1, true);
-        }
-        return (dispatch_builtin(uart, name, argv, depth), false);
+        // A builtin runs in the shell itself, but still under its own redirects: `cd` or `export`
+        // with `> f` creates `f`, and `source script > out` collects what the script prints.
+        return match fd::with_inherited_stdio(stdio, || dispatch_builtin(uart, name, argv, depth)) {
+            Ok(code) => (code, false),
+            Err(msg) => {
+                report(uart, &msg);
+                (1, true)
+            }
+        };
     }
     let program = match launch::load(name) {
         Ok(program) => program,
@@ -448,13 +413,12 @@ fn dispatch_segment(
     let program = match program {
         launch::Program::Elf(bytes) => bytes,
         launch::Program::Script(text) => {
-            return run_script_file(uart, name, argv, &text, depth, redirs, pipe_stdio.is_some());
+            return run_script_file(uart, name, argv, &text, depth, stdio);
         }
     };
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let env = exported_env();
     let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
-    let stdio = apply_overrides(pipe_stdio.unwrap_or([None, None, None]), redirs);
     match exec::process::run_program(&program, &argv_refs, &env_refs, stdio) {
         Ok(code) => (code, false),
         Err(e) => {
@@ -505,7 +469,9 @@ fn run_segment(
             for (name, value) in &overlay {
                 frame_stack::set_var(name, value).ok();
             }
-            return match apply_redirects_standalone(&segment.redirs) {
+            // Only the redirects: `> f` alone creates (or truncates) `f`.
+            let stdio = apply_overrides([None, None, None], &segment.redirs);
+            return match fd::with_inherited_stdio(stdio, || ()) {
                 Ok(()) => (0, false),
                 Err(msg) => {
                     report(uart, &msg);
@@ -540,13 +506,13 @@ fn run_segment(
 
 /// Runs a script file found as a command (`./script`, or a name on `$PATH`; `launch::load` has
 /// already checked the exec bit and that it is text): in a child scope, as a real child shell
-/// process would -- so its own `cd`, `export` and assignments don't leak back, unlike `source`'s.
-/// Returns `dispatch_segment`'s `(status, aborts)`: `aborts` is true for a script that was
-/// refused (it never ran), false once it has run, whatever its own status.
+/// process would -- so its own `cd`, `export` and assignments don't leak back, unlike `source`'s --
+/// and under the command's own `stdio` (its redirects and, as a pipeline stage, its pipe
+/// binding), which every command inside it inherits (`fd::with_inherited_stdio`). Returns
+/// `dispatch_segment`'s `(status, aborts)`: `aborts` is true for a script that was refused (it
+/// never ran), false once it has run, whatever its own status.
 ///
-/// A script takes no arguments (there are no positional parameters yet to hand them to) and, for
-/// now, no redirection or pipe: the commands inside it would not inherit the redirected streams,
-/// so the output would quietly go to the console instead -- refused rather than done wrongly.
+/// A script takes no arguments: there are no positional parameters yet to hand them to.
 #[cfg(target_os = "none")]
 fn run_script_file(
     uart: &mut Uart,
@@ -554,8 +520,7 @@ fn run_script_file(
     argv: &[String],
     text: &str,
     depth: usize,
-    redirs: &[syntax::Redirection],
-    piped: bool,
+    stdio: [Option<StdioRedirect>; 3],
 ) -> (i32, bool) {
     let refuse = |uart: &mut Uart, why: &str| {
         report(uart, &format!("{name}: {why}"));
@@ -564,14 +529,16 @@ fn run_script_file(
     if argv.len() > 1 {
         return refuse(uart, "too many arguments");
     }
-    if !redirs.is_empty() || piped {
-        return refuse(uart, "a script cannot be redirected or piped yet");
-    }
     if depth >= MAX_SCRIPT_DEPTH {
         return refuse(uart, "too many levels of scripts");
     }
-    let status = frame_stack::with_child(|| run_script_content(uart, text, depth));
-    (status, false)
+    let ran = fd::with_inherited_stdio(stdio, || {
+        frame_stack::with_child(|| run_script_content(uart, text, depth))
+    });
+    match ran {
+        Ok(status) => (status, false),
+        Err(msg) => refuse(uart, &msg),
+    }
 }
 
 /// Prefix for pipeline temp file names -- a leading dot, distinct from anything a user is likely

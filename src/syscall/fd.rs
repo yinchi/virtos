@@ -12,6 +12,7 @@
 use core::cell::RefCell;
 use core::fmt::Write;
 
+use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -47,12 +48,15 @@ const EBADF: isize = -1;
 /// compatibility promise attached to the exact number.
 const MAX_FDS: usize = 3 + 8;
 
+#[derive(Clone)]
 enum FileDescriptor {
     Keyboard,
     Console,
     /// An open file, read-only, and the device it is on (`umount` refuses while a file is open
-    /// on the volume).
-    File(usize, FileReader<'static, BlkIo>),
+    /// on the volume). Shared like `FileWrite` (see below), for the same reason: a script's
+    /// redirected stdin is one open file that every command in the script reads from in turn,
+    /// each continuing where the last stopped.
+    File(usize, Rc<RefCell<FileReader<'static, BlkIo>>>),
     /// An open file, write-only (`abi::O_WRONLY`) -- created fresh or truncated to empty at open
     /// time (`open`'s own doc comment), or opened positioned at its current end for `>>`
     /// (`open_for_write`). `Rc<RefCell<_>>`, not owned outright, so `bind_stdio`'s `Dup` (`>&`)
@@ -181,7 +185,7 @@ impl FileDescriptor {
         match self {
             Self::Keyboard => stdin::read(buf),
             Self::Console | Self::FileWrite(..) | Self::Dir { .. } => EBADF,
-            Self::File(_, reader) => reader.read(buf).map_or(EBADF, |n| n as isize),
+            Self::File(_, reader) => reader.borrow_mut().read(buf).map_or(EBADF, |n| n as isize),
         }
     }
 
@@ -331,51 +335,109 @@ pub enum StdioRedirect {
     Dup(u8),
 }
 
-/// Binds `overrides[i]`, when present, onto fd `i` for `i` in `0..3` -- called by
-/// `exec::process::run_program` right after `reset_for_launch()` and before `enter()`, so a
-/// redirected program's very first `read`/`write` already sees the right fd. Processed in array
-/// order (0, then 1, then 2) regardless of which redirection the shell line actually wrote first
-/// -- building `overrides` from a `Segment`'s redirections already collapses that ordering (a
-/// later redirection of the same fd simply overwrites an earlier one in the same array slot), so
-/// a `Dup` at index 2 sees whatever index 1 was *already* set to by this same call, not
-/// necessarily what fd 1 held before this line ran. This is a known, intentionally accepted
-/// divergence from a real shell's snapshot-at-the-time semantics for the less common
-/// `cmd 2>&1 > f` ordering (a real shell leaves fd 2 on the original target; this always ends up
-/// cloning fd 1 onto `f` instead, the same as `cmd > f 2>&1`) -- not fixed here, since it needs
-/// tracking *when* each redirection was written, which nothing before this point keeps.
+/// The streams standard fds 0-2 start from at every launch, below the command's own redirects:
+/// what the enclosing script or builtin was itself redirected to (`with_inherited_stdio`), `None`
+/// for a stream that is still the console's (or keyboard's) default. Only ever holds `Keyboard`,
+/// `Console`, `File` and `FileWrite`.
 ///
-/// `Dup`'s target must already be `Console`, `Keyboard`, or `FileWrite` by the time this runs --
-/// the only things `In`/`Out`/a fresh launch's own reset ever put at fd 1/2 -- so this itself
-/// never opens anything for it, only clones whichever of those `overrides[target]`'s own
-/// processing (if any) already left in place, or the slot's `reset_for_launch` default otherwise.
+/// SAFETY (every access, via `base`): single core, and the shell runs strictly sequentially --
+/// the same reasoning `FD_TABLE` rests on.
+static mut BASE_STDIO: [Option<FileDescriptor>; 3] = [const { None }; 3];
+
+#[allow(clippy::deref_addrof)]
+fn base() -> &'static mut [Option<FileDescriptor>; 3] {
+    // SAFETY: see BASE_STDIO.
+    unsafe { &mut *(&raw mut BASE_STDIO) }
+}
+
+/// Opens `overrides` -- the redirects of one command, built by `shell` from
+/// `shell::syntax::Redirection`s, plus a pipeline stage's own pipe binding underneath them --
+/// on top of `inherited`, giving the three streams the command ends up with (`None`: untouched,
+/// still the default). Left to right, each already in effect for the ones after it: a `Dup`
+/// (`>&`) copies whatever its target stream is *so far*, `inherited` included, so `2>&1` after
+/// `> f` shares `f`, and before it shares what stdout was.
 ///
-/// `Err` (already reported by the caller) if any `In`/`Out` fails to resolve or open, or a `Dup`'s
-/// target doesn't hold one of the three expected kinds; nothing already bound earlier in the same
-/// call is undone, since the caller never launches the program at all on `Err`.
-pub fn bind_stdio(overrides: [Option<StdioRedirect>; 3]) -> Result<(), ()> {
+/// `Dup`'s target (1 or 2) holds a `Console`, `Keyboard`, `File` or `FileWrite` by then -- an
+/// unset one is the console's own default -- so it clones that rather than opening anything: the
+/// clone shares the same open file (`FileDescriptor::FileWrite`'s doc comment says why it has to).
+///
+/// `Err` is what to report (`path: not found`, `path: cannot create`) if any `In`/`Out` fails to
+/// resolve or open; nothing already opened earlier in the same call is undone beyond being dropped
+/// uncommitted, since the command never runs.
+fn resolve_streams(
+    inherited: &[Option<FileDescriptor>; 3],
+    overrides: [Option<StdioRedirect>; 3],
+) -> Result<[Option<FileDescriptor>; 3], String> {
+    let mut streams = inherited.clone();
     for (fd, redirect) in overrides.into_iter().enumerate() {
         let Some(redirect) = redirect else { continue };
-        let descriptor = match redirect {
+        let stream = match redirect {
             StdioRedirect::In(path) => {
-                let (dev, reader) = open_for_read(&fs::cwd::absolute(&path))?;
-                FileDescriptor::File(dev, reader)
+                let Ok((dev, reader)) = open_for_read(&fs::cwd::absolute(&path)) else {
+                    return Err(format!("{path}: not found"));
+                };
+                FileDescriptor::File(dev, Rc::new(RefCell::new(reader)))
             }
             StdioRedirect::Out { path, append } => {
-                let (dev, writer) = open_for_write(&fs::cwd::absolute(&path), append)?;
+                let Ok((dev, writer)) = open_for_write(&fs::cwd::absolute(&path), append) else {
+                    return Err(format!("{path}: cannot create"));
+                };
                 FileDescriptor::FileWrite(dev, Rc::new(RefCell::new(writer)))
             }
-            StdioRedirect::Dup(target) => match table().get(target as usize) {
-                Some(Some(FileDescriptor::Console)) => FileDescriptor::Console,
-                Some(Some(FileDescriptor::Keyboard)) => FileDescriptor::Keyboard,
-                Some(Some(FileDescriptor::FileWrite(dev, writer))) => {
-                    FileDescriptor::FileWrite(*dev, writer.clone())
-                }
-                _ => return Err(()),
+            StdioRedirect::Dup(target) => match streams.get(target as usize) {
+                Some(Some(stream)) => stream.clone(),
+                Some(None) => FileDescriptor::Console,
+                None => return Err(format!(">&{target}: bad file descriptor")),
             },
         };
-        table()[fd] = Some(descriptor);
+        streams[fd] = Some(stream);
+    }
+    Ok(streams)
+}
+
+/// Binds the base streams, then `overrides` on top of them, onto fds 0-2 -- called by
+/// `exec::process::run_program` right after `reset_for_launch()` and before `enter()`, so a
+/// program starts with its redirected stdio already in place. `Err` (already reported by the
+/// caller) if a redirect can't be opened.
+pub fn bind_stdio(overrides: [Option<StdioRedirect>; 3]) -> Result<(), ()> {
+    let streams = resolve_streams(base(), overrides).map_err(|_| ())?;
+    for (fd, stream) in streams.into_iter().enumerate() {
+        if let Some(stream) = stream {
+            table()[fd] = Some(stream);
+        }
     }
     Ok(())
+}
+
+/// Runs `f` -- a script, or a builtin that is not a program of its own -- with `overrides`
+/// applied on top of the streams it already has, as that code's own stdio: every program `f`
+/// launches (and every redirect inside it, layered on top) starts from them, so `./script > out`
+/// collects what every command in the script prints, and `source file | cat` pipes it. Nests:
+/// whatever `f` is itself redirected to is what its own inner scripts inherit.
+///
+/// The files the redirects open are shared by every command that inherits them (one open file,
+/// one offset), and are committed -- a writer's size written to disk -- when the outermost scope
+/// holding them ends, here, on every path out of `f`. `Err` is what to report if a redirect can't be
+/// opened, in which case `f` never runs.
+pub fn with_inherited_stdio<R>(
+    overrides: [Option<StdioRedirect>; 3],
+    f: impl FnOnce() -> R,
+) -> Result<R, String> {
+    let streams = resolve_streams(base(), overrides)?;
+    let outer = core::mem::replace(base(), streams.clone());
+    let result = f();
+    *base() = outer;
+    // Dropping `streams` last: a writer shared with the outer scope (inherited, not opened here)
+    // still has a reference there and stays open; one opened here is down to ours (or, with
+    // `2>&1`, to its two slots, the second of which finishes it).
+    for stream in streams.into_iter().flatten() {
+        if let FileDescriptor::FileWrite(_, writer) = stream
+            && let Ok(writer) = Rc::try_unwrap(writer)
+        {
+            let _ = writer.into_inner().finish();
+        }
+    }
+    Ok(result)
 }
 
 /// Opens the file or directory at the user-space path `ptr`/`len` (resolved against the working
@@ -435,7 +497,7 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
         let Ok(reader) = vol.read_file(&entry) else {
             return EBADF;
         };
-        FileDescriptor::File(dev, reader)
+        FileDescriptor::File(dev, Rc::new(RefCell::new(reader)))
     };
 
     let table = table();
