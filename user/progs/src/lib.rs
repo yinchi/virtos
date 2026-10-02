@@ -8,6 +8,7 @@
 extern crate alloc;
 
 pub mod cli;
+pub mod copy;
 
 use alloc::format;
 use alloc::string::String;
@@ -89,16 +90,22 @@ pub fn join(parent: &str, child: &str) -> String {
     format!("{}/{}", parent.trim_end_matches('/'), child)
 }
 
-/// Writes all of `bytes` to `fd`, retrying after a short write; gives up silently on an error
-/// (there is nowhere left to report a failed write to stdout/stderr).
-pub fn write_all(fd: usize, mut bytes: &[u8]) {
+/// Writes all of `bytes` to `fd`, retrying after a short write. `false` if a write fails.
+pub fn write_all_fd(fd: usize, mut bytes: &[u8]) -> bool {
     while !bytes.is_empty() {
         let n = userlib::write(fd, bytes);
         if n <= 0 {
-            return;
+            return false;
         }
         bytes = &bytes[n as usize..];
     }
+    true
+}
+
+/// Writes all of `bytes` to `fd`, retrying after a short write; gives up silently on an error
+/// (there is nowhere left to report a failed write to stdout/stderr).
+pub fn write_all(fd: usize, bytes: &[u8]) {
+    write_all_fd(fd, bytes);
 }
 
 /// A buffered stdout, for the filters that produce many small pieces (a line at a time, a number

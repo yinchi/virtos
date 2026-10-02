@@ -32,7 +32,7 @@ use crate::fs::fattime::{self, TimeChoice};
 use crate::fs::rtc_time::RTC_TIME;
 use crate::keyboard::stdin;
 use abi::blk::BLKINFO_SIZE;
-use abi::errno::{EFAULT, ENODEV};
+use abi::errno::{EBUSY, EFAULT, ENODEV, EXDEV};
 use abi::{
     ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, DIRENT_SIZE, NAME_MAX, O_APPEND, O_RDONLY, O_WRONLY,
     STAT_SIZE, UTIMES_SIZE,
@@ -588,10 +588,12 @@ pub fn unlink(ptr: usize, len: usize) -> isize {
 }
 
 /// Renames or moves the entry at the user-space path `old_ptr`/`old_len` to `new_ptr`/`new_len`
-/// (each resolved against the working directory first), within the same volume -- a thin wrap of
-/// `hadris_fat::FatVolume::rename`, which refuses if `new` already names something (whatever type
-/// it is) and refuses moving a directory into its own descendant. `-1` for any of those, or if
-/// either path fails to resolve.
+/// (each resolved against the working directory first), within one volume -- a thin wrap of
+/// `hadris_fat::FatVolume::rename` (which refuses moving a directory into its own descendant),
+/// plus replacing an existing plain-file destination, as POSIX `rename` does. `EXDEV` if the two
+/// paths are on different volumes (a program copies and removes instead), `EBUSY` if either side is
+/// a mount point (or the source has one inside it); `-1` for any other failure: either path fails to resolve, a directory is on either side of a replacement, or the
+/// two paths name the same file.
 pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) -> isize {
     if !validate(old_ptr, old_len) || !validate(new_ptr, new_len) {
         return EBADF;
@@ -608,6 +610,14 @@ pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) ->
     };
     let old_path = fs::cwd::absolute(old_path);
     let new_path = fs::cwd::absolute(new_path);
+    // A mount point cannot be moved or replaced, nor can a directory with one inside it: the
+    // volume's own root has no directory entry to rename. Checked before the volumes, so that
+    // `mv` does not take `EXDEV` for "copy it" and empty a mounted volume.
+    if fs::mounts::table().covers_a_mount(&old_path)
+        || fs::mounts::table().is_mount_point(&new_path)
+    {
+        return EBUSY;
+    }
     let (Some((old_dev, vol, old_rest)), Some((new_dev, _, new_rest))) = (
         fs::path::volume_for(&old_path),
         fs::path::volume_for(&new_path),
@@ -615,7 +625,7 @@ pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) ->
         return EBADF;
     };
     if old_dev != new_dev {
-        return EBADF; // a rename cannot move a file between volumes
+        return EXDEV; // a rename cannot move an entry between volumes: `mv` copies and removes
     }
     let Ok(old_entry) = fs::path::resolve(vol, old_rest) else {
         return EBADF;
@@ -623,6 +633,22 @@ pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) ->
     let Ok((new_parent, new_leaf)) = fs::path::split(vol, new_rest) else {
         return EBADF;
     };
+    // An existing plain file at the destination is replaced (POSIX `rename`), but only once
+    // everything above has checked out -- `hadris_fat`'s own `rename` refuses an existing name,
+    // and a caller that removed the target first would lose it whenever the rename then failed.
+    // A directory on either side, or the very same file spelled another way (`A` for `a`), is
+    // refused: replacing one could orphan a whole tree.
+    if let Some(existing) = fs::path::find_entry(&new_parent, new_leaf) {
+        if existing.is_directory()
+            || old_entry.is_directory()
+            || old_path.eq_ignore_ascii_case(&new_path)
+        {
+            return EBADF;
+        }
+        if vol.delete(&existing).is_err() {
+            return EBADF;
+        }
+    }
     match vol.rename(&old_entry, &new_parent, new_leaf) {
         Ok(moved) => {
             // `hadris_fat` stamps a renamed entry with the clock; a move is not a modification

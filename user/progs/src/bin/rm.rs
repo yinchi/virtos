@@ -9,7 +9,7 @@
 extern crate alloc;
 
 use getargs::Arg;
-use userlib::{ATTR_DIRECTORY, Args, DIRENT_SIZE, DirEnt, ExitCode, O_RDONLY};
+use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
 
@@ -21,9 +21,6 @@ const FLAGS: &[(&str, &str)] = &[
     ),
     ("-f, --force", "ignore nonexistent operands"),
 ];
-
-/// Same buffer size as `ls.rs`'s/`chmod.rs`'s own batched-`getdents` idiom -- one memory page.
-const GETDENTS_BUF_SIZE: usize = 4096;
 
 fn report(path: &str) {
     userlib::write(2, b"rm: ");
@@ -56,55 +53,6 @@ fn refuse(path: &str, recursive: bool) -> bool {
     } else {
         false
     }
-}
-
-/// Removes the directory at `path` and everything under it: batches `path`'s own listing via
-/// `getdents` (matching `chmod_recursive`'s stack-buffer idiom, not the mature reference's own
-/// `Vec`+sort -- no `-v` here to make ordering visible, and `ls.rs` is already unsorted by
-/// design), recursing into a child first when it's a directory, then removing it -- and finally
-/// `path` itself, now empty. `false` (after reporting each failure) on any failure, having still
-/// attempted every entry.
-fn remove_recursive(path: &str) -> bool {
-    let fd = userlib::open(path, O_RDONLY);
-    if fd < 0 {
-        report(path);
-        return false;
-    }
-    let fd = fd as usize;
-    let mut buf = [0u8; GETDENTS_BUF_SIZE];
-    let mut ok = true;
-    loop {
-        let n = userlib::getdents(fd, &mut buf);
-        if n < 0 {
-            report(path);
-            ok = false;
-            break;
-        }
-        if n == 0 {
-            break;
-        }
-        for raw in buf[..n as usize].as_chunks::<DIRENT_SIZE>().0 {
-            let Some(ent) = DirEnt::parse(raw) else {
-                continue;
-            };
-            let child = progs::join(path, ent.name);
-            let removed = if ent.attrs & ATTR_DIRECTORY != 0 {
-                remove_recursive(&child)
-            } else {
-                userlib::unlink(&child) >= 0
-            };
-            if !removed {
-                report(&child);
-                ok = false;
-            }
-        }
-    }
-    userlib::close(fd);
-    if ok && userlib::unlink(path) < 0 {
-        report(path);
-        ok = false;
-    }
-    ok
 }
 
 fn run(args: Args) -> ExitCode {
@@ -150,7 +98,7 @@ fn run(args: Args) -> ExitCode {
             }
             Ok(info) if info.is_dir => {
                 if recursive {
-                    remove_recursive(path)
+                    progs::copy::remove_tree("rm", path).is_ok()
                 } else {
                     userlib::write(2, b"rm: cannot remove '");
                     userlib::write(2, path.as_bytes());
