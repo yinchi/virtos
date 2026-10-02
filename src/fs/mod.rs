@@ -2,6 +2,9 @@
 
 pub mod sector;
 
+/// Unix time to FAT's calendar fields, and `utimensat`'s timestamp requests -- pure arithmetic.
+pub mod fattime;
+
 /// The `blk`-backed byte-stream adapter `hadris_fat::FatVolume::open` needs -- hardware-only
 /// (wraps `drivers::virtio::blk::Blk`), unlike `sector`'s pure arithmetic.
 #[cfg(target_os = "none")]
@@ -22,3 +25,8 @@ pub mod path;
 /// comment for why this is `fs`, not `shell`.
 #[cfg(target_os = "none")]
 pub mod cwd;
+
+/// The real-time clock as the FAT volume's `TimeProvider`: new and modified entries get the
+/// current UTC time instead of the FAT epoch.
+#[cfg(target_os = "none")]
+pub mod rtc_time;

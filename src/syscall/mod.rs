@@ -16,7 +16,7 @@ use crate::exec::process;
 use abi::{
     SYS_CHMOD, SYS_CLEAR, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_EXIT, SYS_GETCWD, SYS_GETDENTS,
     SYS_MKDIRAT, SYS_NEWFSTATAT, SYS_OPEN, SYS_READ, SYS_REBOOT, SYS_RENAMEAT, SYS_UNLINKAT,
-    SYS_WRITE,
+    SYS_UTIMENSAT, SYS_WRITE,
 };
 
 // The ESR_EL1 EC field values this handler decodes -- see `sync_el0_handler` for what each one
@@ -73,6 +73,7 @@ extern "C" fn sync_el0_handler(regs: *mut TrapFrame) {
                 SYS_GETCWD => regs.x[0] = fd::getcwd(a0, a1) as u64,
                 SYS_NEWFSTATAT => regs.x[0] = fd::stat(a0, a1, a2) as u64,
                 SYS_CHMOD => regs.x[0] = fd::chmod(a0, a1, a2, a3) as u64,
+                SYS_UTIMENSAT => regs.x[0] = fd::utimensat(a0, a1, a2) as u64,
                 SYS_CLOCK_GETTIME => regs.x[0] = clock::time() as u64,
                 SYS_CLEAR => regs.x[0] = fd::clear() as u64,
                 SYS_REBOOT => regs.x[0] = power::reboot(a0) as u64,

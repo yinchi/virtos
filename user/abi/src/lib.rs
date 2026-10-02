@@ -24,6 +24,7 @@ pub const SYS_CLOCK_GETTIME: usize = 113; // Linux's `clock_gettime`, but no clo
 // put in `tv_nsec`) -- the Unix timestamp itself comes back directly in `x0`.
 pub const SYS_REBOOT: usize = 142;
 pub const SYS_CHMOD: usize = 53; // Linux's `fchmodat`, but plain-path: no dirfd, no flags
+pub const SYS_UTIMENSAT: usize = 88; // Linux's `utimensat`, but plain-path: no dirfd, no flags
 
 /// Longest absolute path this project deals with (`getcwd`'s buffer, `pwd`'s/`stat`'s own stack
 /// buffers) -- an arbitrary but generous bound, not a number `hadris-fat`/FAT itself imposes.
@@ -74,6 +75,14 @@ pub const ATTR_EXEC: u8 = 0x40;
 /// and this turns out to be one more request code on top of it, not a syscall of its own.
 pub const SYS_CLEAR: usize = 1000;
 
+/// `utimensat`'s `times` argument: two `timespec`s (access, then modify), each an `i64` seconds and
+/// an `i64` nanoseconds field, little-endian -- `UTIMES_SIZE` bytes in all. A null pointer means
+/// `UTIME_NOW` for both. A `tv_nsec` of `UTIME_NOW` takes the current time for that one, of
+/// `UTIME_OMIT` leaves it alone -- Linux's own special values.
+pub const UTIMES_SIZE: usize = 32;
+pub const UTIME_NOW: i64 = 0x3fff_ffff;
+pub const UTIME_OMIT: i64 = 0x3fff_fffe;
+
 /// `reboot`'s `cmd` values -- Linux's real magic numbers, borrowed for familiarity (no two-magic-
 /// number safety dance like Linux's own `reboot(2)`; this project has no multi-user safety concern
 /// that convention exists for).
@@ -100,6 +109,11 @@ mod tests {
     #[test]
     fn values_match_what_fd_rs_and_io_rs_assume() {
         assert_eq!(SYS_CHMOD, 53);
+        assert_eq!(SYS_UTIMENSAT, 88);
+        assert_eq!(
+            (UTIMES_SIZE, UTIME_NOW, UTIME_OMIT),
+            (32, 0x3fff_ffff, 0x3fff_fffe)
+        );
         assert_eq!(O_APPEND, 0o2000);
         assert_eq!(STAT_SIZE, 16);
         assert_eq!(DIRENT_SIZE, 4 + 1 + 1 + NAME_MAX);

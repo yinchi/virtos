@@ -10,6 +10,10 @@ edition = "2024"
 # `userlib`'s EL0 entry stub. A plain library crate (no `[[bin]]`), same as `abi`: `justfile`'s
 # `build-user` skips it, so it is never mistaken for a program.
 
+[dependencies]
+# Calendar arithmetic only (`stamp`): no clock, no time-zone database.
+chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
+
 [profile.dev]
 panic = "abort"
 [profile.release]

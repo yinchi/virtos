@@ -200,3 +200,19 @@ pub fn read_dir(path: &str) -> Result<Vec<Entry>, ReadDirError> {
     userlib::close(fd);
     result.map(|()| entries)
 }
+
+/// The local time zone for the programs that show or read a wall-clock time (`date`, `stat`,
+/// `touch`): the IANA name in `$TZ` (`America/Toronto`, `Europe/London`, `UTC`, ...; a leading `:`
+/// as POSIX allows is ignored), and UTC when `TZ` is unset, empty, or not a name in the database
+/// -- glibc's behaviour too. POSIX rule strings (`EST5EDT,M3.2.0,M11.1.0`) are not understood, so
+/// they mean UTC.
+///
+/// `env` is the program's own environment: it must be started with `userlib::entry_with_env!`,
+/// or there is none to look in and this is UTC.
+pub fn local_zone(env: userlib::Env) -> chrono_tz::Tz {
+    env.filter_map(|entry| entry.strip_prefix("TZ="))
+        .next()
+        .map(|name| name.strip_prefix(':').unwrap_or(name))
+        .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Tz::UTC)
+}

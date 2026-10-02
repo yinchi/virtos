@@ -19,7 +19,7 @@ use hadris_fat::raw::DirEntryAttrFlags;
 use hadris_fat::sync::read::FileReader;
 use hadris_fat::sync::write::FileWriter;
 use hadris_fat::sync::{DirectoryEntry, FatDir, FatVolume};
-use hadris_fat::time::FatDateTime;
+use hadris_fat::time::{FatDateTime, TimeProvider};
 use hadris_fat::{FatVolumeReadExt, FatVolumeWriteExt};
 
 use crate::arch::mmu::{self, USER_BASE, USER_STACK_TOP};
@@ -27,10 +27,12 @@ use crate::console;
 use crate::drivers::virtio::gpu;
 use crate::fs;
 use crate::fs::blkio::BlkIo;
+use crate::fs::fattime::{self, TimeChoice};
+use crate::fs::rtc_time::RTC_TIME;
 use crate::keyboard::stdin;
 use abi::{
     ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, DIRENT_SIZE, NAME_MAX, O_APPEND, O_RDONLY, O_WRONLY,
-    STAT_SIZE,
+    STAT_SIZE, UTIMES_SIZE,
 };
 
 /// This project's own error convention so far -- a negative value, not yet the real negated-errno
@@ -547,7 +549,13 @@ pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) ->
         return EBADF;
     };
     match vol.rename(&old_entry, &new_parent, new_leaf) {
-        Ok(_) => 0,
+        Ok(moved) => {
+            // `hadris_fat` stamps a renamed entry with the clock; a move is not a modification
+            // (POSIX leaves the time alone), so put the old one back. Failing to is not failing
+            // the rename, which has already happened.
+            let _ = vol.set_times(&moved, Some(old_entry.modified()), None, None);
+            0
+        }
         Err(_) => EBADF,
     }
 }
@@ -668,6 +676,65 @@ pub fn chmod(ptr: usize, len: usize, set: usize, clear: usize) -> isize {
     };
     let attrs = (entry.attributes().bits() | set) & !clear;
     match vol.set_attributes(&entry, DirEntryAttrFlags::from_bits_retain(attrs)) {
+        Ok(()) => 0,
+        Err(_) => EBADF,
+    }
+}
+
+/// Sets the modify time of the user-space path `ptr`/`len` (resolved against the working
+/// directory first) from the second of the two `timespec`s at `times_ptr` -- the first, the access
+/// time, is checked and ignored: FAT stores an access *date* only, nothing here reads it, and a
+/// timestamp that coarse is not worth a behavior. A null `times_ptr` is `UTIME_NOW` for both.
+/// FAT keeps the modify time to 2 seconds and holds 1980-2107: a time outside that, a `tv_nsec`
+/// that is neither a real fraction of a second nor one of the two special values, a path that
+/// doesn't resolve, and the bare root (which has no directory entry to hold a time) are all `-1`.
+/// The creation time is never touched. The file need not be writable.
+pub fn utimensat(ptr: usize, len: usize, times_ptr: usize) -> isize {
+    if !validate(ptr, len) {
+        return EBADF;
+    }
+    let _user = mmu::user_access();
+    // SAFETY: validated above to lie entirely within the user window.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return EBADF;
+    };
+    let path = fs::cwd::absolute(path);
+    let mtime = if times_ptr == 0 {
+        TimeChoice::Now
+    } else {
+        if !validate(times_ptr, UTIMES_SIZE) {
+            return EBADF;
+        }
+        // SAFETY: validated above to lie entirely within the user window.
+        let raw = unsafe { core::slice::from_raw_parts(times_ptr as *const u8, UTIMES_SIZE) };
+        let read = |at: usize| {
+            let sec = i64::from_le_bytes(raw[at..at + 8].try_into().unwrap_or([0; 8]));
+            let nsec = i64::from_le_bytes(raw[at + 8..at + 16].try_into().unwrap_or([0; 8]));
+            fattime::choose(sec, nsec)
+        };
+        match (read(0), read(16)) {
+            (Some(_), Some(mtime)) => mtime,
+            _ => return EBADF,
+        }
+    };
+    let modified = match mtime {
+        TimeChoice::Omit => None,
+        TimeChoice::Now => Some(RTC_TIME.now()),
+        TimeChoice::At(unix) => match fattime::checked_fields(unix) {
+            Some(f) => Some(FatDateTime::new(
+                f.year, f.month, f.day, f.hour, f.minute, f.second,
+            )),
+            None => return EBADF,
+        },
+    };
+    let Some(vol) = fs::volume::get(0) else {
+        return EBADF;
+    };
+    let Ok(entry) = fs::path::resolve(vol, &path) else {
+        return EBADF;
+    };
+    match vol.set_times(&entry, modified, None, None) {
         Ok(()) => 0,
         Err(_) => EBADF,
     }

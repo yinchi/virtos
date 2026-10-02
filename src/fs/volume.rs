@@ -8,9 +8,10 @@
 //! `mount`, specifically so the function that eventually implements *that* doesn't collide with
 //! this one.
 
-use hadris_fat::sync::FatVolume;
+use hadris_fat::sync::{FatVolume, FatVolumeBuilder};
 
 use super::blkio::BlkIo;
+use super::rtc_time::RTC_TIME;
 use crate::drivers::virtio::blk::{self, MAX_BLK};
 
 /// One open volume per `blk` device, indexed the same way `blk::get` is.
@@ -22,7 +23,10 @@ static mut VOLUMES: [Option<FatVolume<BlkIo>>; MAX_BLK] = [const { None }; MAX_B
 /// If `dev` holds no valid FAT filesystem.
 pub fn open(dev: usize) {
     let io = BlkIo::new(blk::get(dev));
-    let vol = FatVolume::open(io).expect("failed to open FAT volume");
+    let vol = FatVolumeBuilder::new(io)
+        .time_provider(&RTC_TIME)
+        .open()
+        .expect("failed to open FAT volume");
     // SAFETY: sole writer, and `get` is only ever called for a `dev` some earlier `open` call
     // already populated.
     #[allow(clippy::deref_addrof)]

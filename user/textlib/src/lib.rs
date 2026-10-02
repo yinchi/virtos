@@ -12,5 +12,6 @@ pub mod glob;
 pub mod headtail;
 pub mod human;
 pub mod sortkey;
+pub mod stamp;
 pub mod textutil;
 pub mod trset;
