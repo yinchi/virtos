@@ -52,7 +52,7 @@ pub(crate) mod bare_metal {
     /// while it is loaded (`shell` reads it into a `Vec`), so it has to fit the largest program:
     /// `date`/`stat`/`touch` carry the whole time-zone database (about 1.3 MB each), which a
     /// 1 MiB heap could not.
-    const HEAP_SIZE: usize = 4 << 20; // 4 MiB
+    pub(crate) const HEAP_SIZE: usize = 4 << 20; // 4 MiB
     /// The heap's backing storage: a plain `.bss` static, so it's already covered by `mmu::enable`'s
     /// `__data_start..__data_end` mapping -- nothing extra needs mapping for it.
     static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];

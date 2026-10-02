@@ -1,8 +1,7 @@
 # The initial environment: read once at boot, before the first prompt.
-# (There is no PATH yet: programs are looked up in /usr/bin directly, there is
-# no $PATH search.)
 
 HOME=/root
+PATH=/usr/bin
 TZ=America/Toronto
 # A value may be wrapped in single or double quotes (removed); nothing else is interpreted.
 PS1='\w> '

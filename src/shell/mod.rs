@@ -24,8 +24,13 @@ mod expand;
 mod frame_stack;
 mod fstab;
 mod lexer;
+mod path_search;
+mod program_kind;
 mod prompt;
 mod syntax;
+
+#[cfg(target_os = "none")]
+mod launch;
 
 #[cfg(target_os = "none")]
 use crate::console::{self, DEFAULT_BG as BG, DEFAULT_FG as FG};
@@ -179,7 +184,15 @@ fn source(uart: &mut Uart, name: &str, argv: &[String], depth: usize) -> i32 {
         report(uart, &format!("{name}: {path}: too many levels of scripts"));
         return 1;
     }
-    let absolute = fs::cwd::absolute(path);
+    // `source` and `.` find a bare name through `$PATH` before the working directory (the file
+    // need only be readable, not executable); `sh FILE` and any name with a `/` in it go straight
+    // to the working directory.
+    let searched = if name == "sh" {
+        None
+    } else {
+        launch::search_script(path)
+    };
+    let absolute = searched.unwrap_or_else(|| fs::cwd::absolute(path));
     let Some((_, vol, rest)) = fs::path::volume_for(&absolute) else {
         report(uart, "no volume mounted there");
         return 1;
@@ -425,11 +438,17 @@ fn dispatch_segment(
         }
         return (dispatch_builtin(uart, name, argv, depth), false);
     }
-    let program = match read_program(name) {
+    let program = match launch::load(name) {
         Ok(program) => program,
-        Err(msg) => {
-            report(uart, &msg);
-            return (127, true);
+        Err(failure) => {
+            report(uart, &failure.message);
+            return (failure.status, true);
+        }
+    };
+    let program = match program {
+        launch::Program::Elf(bytes) => bytes,
+        launch::Program::Script(text) => {
+            return run_script_file(uart, name, argv, &text, depth, redirs, pipe_stdio.is_some());
         }
     };
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -519,27 +538,40 @@ fn run_segment(
     }
 }
 
-/// Reads `/usr/bin/<name>` into a freshly allocated `Vec<u8>`. Fetches the volume itself
-/// (`fs::path::volume_for`), used and dropped entirely within this function -- deliberately never
-/// returned or held by a caller across a `run_program` call, which itself fetches the same volume
-/// again internally (via `bind_stdio`): `fs::volume::get` hands back a fresh `&'static mut` on
-/// every call, sound only as long as two such references are never *simultaneously* live, which
-/// holding one across a nested call that fetches its own would risk.
+/// Runs a script file found as a command (`./script`, or a name on `$PATH`; `launch::load` has
+/// already checked the exec bit and that it is text): in a child scope, as a real child shell
+/// process would -- so its own `cd`, `export` and assignments don't leak back, unlike `source`'s.
+/// Returns `dispatch_segment`'s `(status, aborts)`: `aborts` is true for a script that was
+/// refused (it never ran), false once it has run, whatever its own status.
+///
+/// A script takes no arguments (there are no positional parameters yet to hand them to) and, for
+/// now, no redirection or pipe: the commands inside it would not inherit the redirected streams,
+/// so the output would quietly go to the console instead -- refused rather than done wrongly.
 #[cfg(target_os = "none")]
-fn read_program(name: &str) -> Result<Vec<u8>, String> {
-    let path = format!("/usr/bin/{name}");
-    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
-        return Err("no volume mounted".into());
+fn run_script_file(
+    uart: &mut Uart,
+    name: &str,
+    argv: &[String],
+    text: &str,
+    depth: usize,
+    redirs: &[syntax::Redirection],
+    piped: bool,
+) -> (i32, bool) {
+    let refuse = |uart: &mut Uart, why: &str| {
+        report(uart, &format!("{name}: {why}"));
+        (launch::STATUS_CANNOT_EXECUTE, true)
     };
-    let Ok(entry) = fs::path::resolve(vol, rest) else {
-        return Err(format!("{name}: not found"));
-    };
-    let Ok(mut reader) = vol.read_file(&entry) else {
-        return Err(format!("{name}: failed to open"));
-    };
-    reader
-        .read_to_vec()
-        .map_err(|_| format!("{name}: failed to read"))
+    if argv.len() > 1 {
+        return refuse(uart, "too many arguments");
+    }
+    if !redirs.is_empty() || piped {
+        return refuse(uart, "a script cannot be redirected or piped yet");
+    }
+    if depth >= MAX_SCRIPT_DEPTH {
+        return refuse(uart, "too many levels of scripts");
+    }
+    let status = frame_stack::with_child(|| run_script_content(uart, text, depth));
+    (status, false)
 }
 
 /// Prefix for pipeline temp file names -- a leading dot, distinct from anything a user is likely
