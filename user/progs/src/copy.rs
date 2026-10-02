@@ -44,6 +44,12 @@ impl Copier {
         Reported
     }
 
+    /// `fail` for a syscall that returned the negated errno `errno`: `<what>: <what it means>`.
+    fn fail_errno(&self, what: &str, errno: isize) -> Reported {
+        cli::report_errno(self.prog, what, errno);
+        Reported
+    }
+
     /// Gives `dst` what `preserve` asks of a copy of `src`: for a file, its executable and
     /// read-only bits; for both, its modify time.
     fn preserve_from(&self, info: &Stat, dst: &str) -> Result<(), Reported> {
@@ -54,8 +60,9 @@ impl Copier {
         if !info.is_dir {
             const BITS: u8 = ATTR_EXEC | ATTR_READ_ONLY;
             let want = info.attrs & BITS;
-            if chmod(dst, want, BITS & !want) < 0 {
-                result = Err(self.fail(&format!("{dst}: failed to preserve permissions")));
+            let r = chmod(dst, want, BITS & !want);
+            if r < 0 {
+                result = Err(self.fail_errno(&format!("{dst}: failed to preserve permissions"), r));
             }
         }
         if let Some(unix) = fat_to_unix(info.modified_date, info.modified_time)
@@ -72,40 +79,41 @@ impl Copier {
     pub fn file(&self, src: &str, dst: &str) -> Result<(), Reported> {
         let input = open(src, O_RDONLY);
         if input < 0 {
-            return Err(self.fail(&format!("{src}: cannot open")));
+            return Err(self.fail_errno(src, input));
         }
         let input = input as usize;
         let mut buf = [0u8; BUF_SIZE];
         let first = read(input, &mut buf);
         if first < 0 {
             close(input);
-            return Err(self.fail(&format!("{src}: cannot read")));
+            return Err(self.fail_errno(src, first));
         }
         let output = open(dst, O_WRONLY);
         if output < 0 {
             close(input);
-            return Err(self.fail(&format!("{dst}: cannot open")));
+            return Err(self.fail_errno(dst, output));
         }
         let output = output as usize;
 
         let mut result = Ok(());
         let mut n = first;
         while n > 0 {
-            if !write_all_fd(output, &buf[..n as usize]) {
-                result = Err(self.fail(&format!("{dst}: write error")));
+            if let Err(e) = write_all_fd(output, &buf[..n as usize]) {
+                result = Err(self.fail_errno(dst, e));
                 break;
             }
             n = read(input, &mut buf);
             if n < 0 {
-                result = Err(self.fail(&format!("{src}: cannot read")));
+                result = Err(self.fail_errno(src, n));
                 break;
             }
         }
         close(input);
         // Closing `output` is what commits its final size to disk -- a failure here is a failed
         // copy.
-        if close(output) < 0 && result.is_ok() {
-            result = Err(self.fail(&format!("{dst}: write error")));
+        let closed = close(output);
+        if closed < 0 && result.is_ok() {
+            result = Err(self.fail_errno(dst, closed));
         }
         result?;
 
@@ -122,7 +130,7 @@ impl Copier {
     /// doesn't exist, or merged into if it's already a directory -- a hard error if it names
     /// anything else. Every entry is attempted even after a failure.
     pub fn tree(&self, src: &str, dst: &str) -> Result<(), Reported> {
-        let info = stat(src).map_err(|_| self.fail(&format!("{src}: cannot open")))?;
+        let info = stat(src).map_err(|e| self.fail_errno(src, e))?;
         match stat(dst) {
             Ok(existing) if existing.is_dir => {}
             Ok(_) => {
@@ -131,14 +139,13 @@ impl Copier {
                 )));
             }
             Err(_) => {
-                if mkdir(dst) < 0 {
-                    return Err(self.fail(&format!("{dst}: cannot create directory")));
+                let r = mkdir(dst);
+                if r < 0 {
+                    return Err(self.fail_errno(&format!("cannot create directory '{dst}'"), r));
                 }
             }
         }
-        let Ok(mut entries) = read_dir(src) else {
-            return Err(self.fail(&format!("{src}: not a directory")));
-        };
+        let mut entries = read_dir(src).map_err(|e| self.fail_errno(src, e))?;
         entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         let mut result = Ok(());
         for ent in entries {
@@ -161,7 +168,7 @@ impl Copier {
 
 /// Removes the file or directory `path`, and everything under a directory: every entry is
 /// attempted even after a failure, a directory's own removal last. Reports each failure as
-/// `<prog>: <path>: cannot remove`.
+/// `<prog>: cannot remove '<path>': <why>`.
 pub fn remove_tree(prog: &str, path: &str) -> Result<(), Reported> {
     let mut result = Ok(());
     if let Ok(info) = stat(path)
@@ -173,27 +180,33 @@ pub fn remove_tree(prog: &str, path: &str) -> Result<(), Reported> {
                     let child = join(path, &ent.name);
                     let removed = if ent.attrs & userlib::ATTR_DIRECTORY != 0 {
                         remove_tree(prog, &child)
-                    } else if unlink(&child) < 0 {
-                        cli::report(prog, &format!("{child}: cannot remove"));
-                        Err(Reported)
                     } else {
-                        Ok(())
+                        let r = unlink(&child);
+                        if r < 0 {
+                            cli::report_errno(prog, &format!("cannot remove '{child}'"), r);
+                            Err(Reported)
+                        } else {
+                            Ok(())
+                        }
                     };
                     if removed.is_err() {
                         result = Err(Reported);
                     }
                 }
             }
-            Err(_) => {
-                cli::report(prog, &format!("{path}: cannot remove"));
+            Err(e) => {
+                cli::report_errno(prog, &format!("cannot remove '{path}'"), e);
                 return Err(Reported);
             }
         }
     }
     // Only once everything inside is gone does the entry itself go.
-    if result.is_ok() && unlink(path) < 0 {
-        cli::report(prog, &format!("{path}: cannot remove"));
-        result = Err(Reported);
+    if result.is_ok() {
+        let r = unlink(path);
+        if r < 0 {
+            cli::report_errno(prog, &format!("cannot remove '{path}'"), r);
+            result = Err(Reported);
+        }
     }
     result
 }

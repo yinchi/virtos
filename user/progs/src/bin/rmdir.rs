@@ -26,14 +26,13 @@ fn run(args: Args) -> ExitCode {
     }
     let mut status = 0;
     for dir in cli::operands(args) {
-        let why = match userlib::stat(dir) {
-            Err(_) => Some("cannot open"),
-            Ok(info) if !info.is_dir => Some("not a directory"),
-            Ok(_) if userlib::unlink(dir) < 0 => Some("cannot remove (not empty?)"),
-            Ok(_) => None,
+        let failed = match userlib::stat(dir) {
+            Err(e) => Some(e),
+            Ok(info) if !info.is_dir => Some(abi::errno::ENOTDIR),
+            Ok(_) => Some(userlib::unlink(dir)).filter(|&r| r < 0),
         };
-        if let Some(why) = why {
-            cli::report("rmdir", &format!("{dir}: {why}"));
+        if let Some(e) = failed {
+            cli::report_errno("rmdir", &format!("failed to remove '{dir}'"), e);
             status = 1;
         }
     }

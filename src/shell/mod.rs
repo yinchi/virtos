@@ -47,6 +47,8 @@ use crate::keyboard::line_discipline::{self, LineOutcome, Mode};
 #[cfg(target_os = "none")]
 use crate::syscall::fd::{self, Stdio, StdioRedirect};
 #[cfg(target_os = "none")]
+use abi::errno::{EINVAL, EISDIR, ENODEV, errmsg};
+#[cfg(target_os = "none")]
 use alloc::format;
 #[cfg(target_os = "none")]
 use alloc::string::{String, ToString};
@@ -127,8 +129,8 @@ fn cd(uart: &mut Uart, argv: &[String]) -> i32 {
         report(uart, "no volume mounted there");
         return 1;
     };
-    if fs::path::resolve_dir(vol, rest).is_err() {
-        report(uart, &format!("cd: {target}: not a directory"));
+    if let Err(e) = fs::path::resolve_dir(vol, rest) {
+        report(uart, &format!("cd: {target}: {}", errmsg(e)));
         return 1;
     }
     fs::cwd::set(absolute);
@@ -197,9 +199,16 @@ fn source(uart: &mut Uart, name: &str, argv: &[String], depth: usize) -> i32 {
         report(uart, "no volume mounted there");
         return 1;
     };
-    let Ok(entry) = fs::path::resolve(vol, rest) else {
-        report(uart, &format!("{name}: {path}: not found"));
-        return 1;
+    let entry = match fs::path::resolve(vol, rest) {
+        Ok(entry) => entry,
+        Err(EINVAL) => {
+            report(uart, &format!("{name}: {path}: {}", errmsg(EISDIR))); // the root
+            return 1;
+        }
+        Err(e) => {
+            report(uart, &format!("{name}: {path}: {}", errmsg(e)));
+            return 1;
+        }
     };
     if entry.is_directory() {
         report(uart, &format!("{name}: {path}: is a directory"));
@@ -595,12 +604,11 @@ fn next_pipe_path() -> Result<String, String> {
             return Err("no volume mounted".into());
         };
         if fs::path::resolve(vol, rest).is_err() {
-            let Ok((_, writer)) = fd::open_for_write(&path, false) else {
-                return Err(format!("{path}: cannot create"));
-            };
+            let (_, writer) =
+                fd::open_for_write(&path, false).map_err(|e| format!("{path}: {}", errmsg(e)))?;
             return match writer.finish() {
                 Ok(()) => Ok(path),
-                Err(_) => Err(format!("{path}: cannot create")),
+                Err(e) => Err(format!("{path}: {}", errmsg(fs::errno::from_fat(&e)))),
             };
         }
     }
@@ -945,16 +953,19 @@ fn home_dir() -> Option<String> {
 fn enter_home(uart: &mut Uart) {
     let Some(home) = home_dir() else { return };
     let absolute = fs::cwd::absolute(&home);
-    let is_dir = fs::path::volume_for(&absolute)
-        .is_some_and(|(_, vol, rest)| fs::path::resolve_dir(vol, rest).is_ok());
-    if is_dir {
-        fs::cwd::set(absolute);
-    } else {
-        writeln!(
-            uart,
-            "Environment: cannot enter HOME={home}: not a directory -- staying in /."
-        )
-        .ok();
+    let entered = fs::path::volume_for(&absolute)
+        .ok_or(ENODEV)
+        .and_then(|(_, vol, rest)| fs::path::resolve_dir(vol, rest).map(|_| ()));
+    match entered {
+        Ok(()) => fs::cwd::set(absolute),
+        Err(e) => {
+            writeln!(
+                uart,
+                "Environment: cannot enter HOME={home}: {} -- staying in /.",
+                errmsg(e)
+            )
+            .ok();
+        }
     }
 }
 

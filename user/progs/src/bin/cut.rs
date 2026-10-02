@@ -99,10 +99,13 @@ fn cut(args: Args) -> Result<ExitCode, ExitCode> {
     let mut out = Out::new();
     let mut status = 0;
     for name in names {
-        let Some(data) = progs::read_operand(name) else {
-            cli::report("cut", &format!("{name}: cannot open"));
-            status = 1;
-            continue;
+        let data = match progs::read_operand(name) {
+            Ok(data) => data,
+            Err(e) => {
+                cli::report_errno("cut", name, e);
+                status = 1;
+                continue;
+            }
         };
         for line in split_lines(&data) {
             if by_field {

@@ -25,7 +25,7 @@
 
 extern crate alloc;
 
-use abi::errno::{EBUSY, EXDEV, errmsg};
+use abi::errno::EXDEV;
 use alloc::format;
 use alloc::string::String;
 use progs::cli;
@@ -39,9 +39,12 @@ const FLAGS: &[(&str, &str)] = &[];
 
 /// The move between two volumes, described above. Reports its own failures; `false` if it failed.
 fn move_across(src: &str, target: &str) -> bool {
-    let Ok(info) = userlib::stat(src) else {
-        cli::report("mv", &format!("cannot stat '{src}'"));
-        return false;
+    let info = match userlib::stat(src) {
+        Ok(info) => info,
+        Err(e) => {
+            cli::report_errno("mv", &format!("cannot stat '{src}'"), e);
+            return false;
+        }
     };
     let Some(partial) = partial_path(target, ".mv-partial") else {
         cli::report(
@@ -64,9 +67,10 @@ fn move_across(src: &str, target: &str) -> bool {
         let _ = remove_tree("mv", &partial);
         return false;
     }
-    if userlib::rename(&partial, target) < 0 {
+    let renamed = userlib::rename(&partial, target);
+    if renamed < 0 {
         let _ = remove_tree("mv", &partial);
-        cli::report("mv", &format!("cannot move '{src}' to '{target}'"));
+        cli::report_errno("mv", &format!("cannot move '{src}' to '{target}'"), renamed);
         return false;
     }
     // The destination is complete: what is left is taking the source away.
@@ -104,15 +108,8 @@ fn move_one(src: &str, dst: &str, dst_is_dir: bool) -> bool {
     match userlib::rename(src, &target) {
         r if r >= 0 => true,
         EXDEV => move_across(src, &target),
-        e @ EBUSY => {
-            cli::report(
-                "mv",
-                &format!("cannot move '{src}' to '{target}': {}", errmsg(e)),
-            );
-            false
-        }
-        _ => {
-            cli::report("mv", &format!("cannot move '{src}' to '{target}'"));
+        e => {
+            cli::report_errno("mv", &format!("cannot move '{src}' to '{target}'"), e);
             false
         }
     }

@@ -2,8 +2,9 @@
 //! `sync_el0_handler`.
 //!
 //! `exit`, `read`, `write`, `open`, `close`, `getdents`, `mkdir`, `unlink`, `rename`, `getcwd`,
-//! `stat`, `chmod`, `clock_gettime`, `clear` and `reboot` so far. Everything else still returns
-//! `-1` (see `fd`'s own doc comment on why that's not yet a real negated-errno convention).
+//! `stat`, `chmod`, `utimensat`, `mount`, `umount`, `blkinfo`, `clock_gettime`, `clear` and
+//! `reboot`. A failure is a negated errno in `x0` (`abi::errno`); a number that is no syscall is
+//! `ENOSYS`.
 
 mod clock;
 pub mod fd;
@@ -13,6 +14,7 @@ use arm_sysregs::el1::accessors::{read_esr_el1, read_far_el1};
 use core::fmt::Write;
 
 use crate::exec::process;
+use abi::errno::ENOSYS;
 use abi::{
     SYS_BLKINFO, SYS_CHMOD, SYS_CLEAR, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_EXIT, SYS_GETCWD,
     SYS_GETDENTS, SYS_MKDIRAT, SYS_MOUNT, SYS_NEWFSTATAT, SYS_OPEN, SYS_READ, SYS_REBOOT,
@@ -91,7 +93,7 @@ extern "C" fn sync_el0_handler(regs: *mut TrapFrame) {
                     // initial state).
                     unsafe { process::resume_kernel(a0 as i32) }
                 }
-                _ => regs.x[0] = (-1i64) as u64, // no such syscall yet
+                _ => regs.x[0] = ENOSYS as u64, // no such syscall
             }
         }
 

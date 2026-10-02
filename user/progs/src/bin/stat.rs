@@ -108,8 +108,8 @@ fn run(args: Args, env: Env) -> ExitCode {
     for path in cli::operands(args) {
         match userlib::stat(path) {
             Ok(info) => print_one(&mut out, path, zone, &info),
-            Err(_) => {
-                cli::report("stat", &format!("{path}: cannot stat"));
+            Err(e) => {
+                cli::report_errno("stat", &format!("cannot stat '{path}'"), e);
                 status = 1;
             }
         }

@@ -26,8 +26,8 @@ def run(ctx):
     check("cd resolves .. lexically", s.run("cd b/..") + s.run("pwd"), "/data/tree\n")
     check("cd .. goes up", s.run("cd ..") + s.run("pwd"), "/data\n")
     check("cd with no argument goes to $HOME", s.run("cd") + s.run("pwd"), "/root\n")
-    check("cd to a file is refused", s.run("cd /data/lines.txt"), "cd: /data/lines.txt: not a directory\n")
-    check("cd to nothing is refused", s.run("cd /nosuch"), "cd: /nosuch: not a directory\n")
+    check("cd to a file is refused", s.run("cd /data/lines.txt"), "cd: /data/lines.txt: Not a directory\n")
+    check("cd to nothing is refused", s.run("cd /nosuch"), "cd: /nosuch: No such file or directory\n")
     check("a refused cd leaves the directory alone", s.run("pwd"), "/root\n")
     check("cd's status", s.status("cd /nosuch")[1], 1)
 
@@ -51,7 +51,7 @@ def run(ctx):
           "/data/small.txt\n\n/data/tree/b:\nc.txt\n")
     check("ls -R recurses", s.run("ls -R /data/tree"),
           "/data/tree:\na.txt\nb\nc10\nc2\n\n/data/tree/b:\nc.txt\n")
-    check("ls of nothing", s.run("ls /nosuch"), "ls: /nosuch: cannot open\n")
+    check("ls of nothing", s.run("ls /nosuch"), "ls: /nosuch: No such file or directory\n")
     check("...has status 1", s.status("ls /nosuch")[1], 1)
     check("an unknown flag is refused", s.run("ls -z"), "ls: invalid option -- 'z'\nTry 'ls --help' for more information.\n")
     check("ls with no operand lists the working directory", s.run("cd /data/tree/b") + s.run("ls"), "c.txt\n")
@@ -69,7 +69,7 @@ def run(ctx):
     check("numbers continue across files (an unterminated line runs on into the next file)", s.run("cat -n /data/small.txt /data/noeol.txt"),
           "     1\tyya\n     2\tb")
     check("a missing file is reported and the rest are still read",
-          s.run("cat /nosuch /data/small.txt"), "cat: /nosuch: cannot open\nyy")
+          s.run("cat /nosuch /data/small.txt"), "cat: /nosuch: No such file or directory\nyy")
     check("...with status 1", s.status("cat /nosuch")[1], 1)
     check("a lone - is stdin", s.run("echo piped | cat - /data/small.txt"), "piped\nyy")
 
@@ -92,7 +92,7 @@ def run(ctx):
     check("tail -c N", s.run("tail -c 4 /data/lines.txt"), "ive\n")
     check("tail counts an unterminated last line", s.run("tail -n 1 /data/noeol.txt"), "b")
     check("tail with fewer lines than N prints all", s.run("tail -n 99 /data/small.txt"), "yy")
-    check("tail of a missing file", s.run("tail /nosuch"), "tail: /nosuch: cannot open\n")
+    check("tail of a missing file", s.run("tail /nosuch"), "tail: /nosuch: No such file or directory\n")
     check("head reads stdin", s.run("seq 5 | head -n 2"), "1\n2\n")
 
     # ------------------------------------------------------------------ wc
@@ -107,7 +107,7 @@ def run(ctx):
           "5 /data/lines.txt\n0 /data/small.txt\n5 total\n")
     check("wc of stdin has no name", s.run("echo hi | wc"), "1 1 3\n")
     check("wc -l counts newlines, not lines", s.run("wc -l /data/noeol.txt"), "1 /data/noeol.txt\n")
-    check("wc of a missing file", s.run("wc /nosuch"), "wc: /nosuch: cannot open\n")
+    check("wc of a missing file", s.run("wc /nosuch"), "wc: /nosuch: No such file or directory\n")
 
     # ------------------------------------------------------------------ echo
     check("echo -n has no newline", s.run("echo -n a"), "a")
@@ -123,15 +123,15 @@ def run(ctx):
 
     # ------------------------------------------------------------------ mkdir, rmdir, rm
     check("mkdir creates", s.run("mkdir /tmp/d1") + s.run("ls -d /tmp/d1"), "/tmp/d1\n")
-    check("mkdir of an existing name is an error", s.run("mkdir /tmp/d1"), "mkdir: /tmp/d1: cannot create directory\n")
+    check("mkdir of an existing name is an error", s.run("mkdir /tmp/d1"), "mkdir: cannot create directory '/tmp/d1': File exists\n")
     check("mkdir -p makes parents", s.run("mkdir -p /tmp/p/q/r") + s.run("ls /tmp/p/q"), "r\n")
     check("mkdir -p of an existing directory is fine", s.status("mkdir -p /tmp/p/q")[1], 0)
-    check("mkdir without -p needs the parent", s.run("mkdir /tmp/x/y"), "mkdir: /tmp/x/y: cannot create directory\n")
+    check("mkdir without -p needs the parent", s.run("mkdir /tmp/x/y"), "mkdir: cannot create directory '/tmp/x/y': No such file or directory\n")
     check("rmdir removes an empty directory", s.run("rmdir /tmp/d1") + s.run("ls /tmp"), "p\n")
-    check("rmdir refuses a non-empty one", s.run("rmdir /tmp/p"), "rmdir: /tmp/p: cannot remove (not empty?)\n")
-    check("rmdir refuses a file", s.run("rmdir /data/small.txt"), "rmdir: /data/small.txt: not a directory\n")
+    check("rmdir refuses a non-empty one", s.run("rmdir /tmp/p"), "rmdir: failed to remove '/tmp/p': Directory not empty\n")
+    check("rmdir refuses a file", s.run("rmdir /data/small.txt"), "rmdir: failed to remove '/data/small.txt': Not a directory\n")
     check("rm removes a file", s.run("echo x > /tmp/f") + s.run("rm /tmp/f") + s.run("ls /tmp"), "p\n")
-    check("rm of a missing file is an error", s.run("rm /tmp/f"), "rm: /tmp/f: cannot remove\n")
+    check("rm of a missing file is an error", s.run("rm /tmp/f"), "rm: cannot remove '/tmp/f': No such file or directory\n")
     check("rm -f ignores it", s.run("rm -f /tmp/f"), "")
     check("...with status 0", s.status("rm -f /tmp/f")[1], 0)
     check("rm of a directory needs -r", s.run("rm /tmp/p"), "rm: cannot remove '/tmp/p': Is a directory\n")
@@ -153,17 +153,17 @@ def run(ctx):
     check("cp -r merges into an existing directory", s.status("cp -r /data/tree /tmp/t1")[1], 0)
     check("cp a file onto itself is refused", s.run("cp /tmp/c1 /tmp/c1"), "cp: '/tmp/c1' and '/tmp/c1' are the same file\n")
     check("cp a directory into itself is refused", s.run("cp -r /tmp/t1 /tmp/t1/b").startswith("cp: cannot copy a directory"), True)
-    check("cp of a missing file", s.run("cp /nosuch /tmp/zz"), "cp: /nosuch: cannot open\n")
-    check("...does not create the target", s.run("ls /tmp/zz"), "ls: /tmp/zz: cannot open\n")
+    check("cp of a missing file", s.run("cp /nosuch /tmp/zz"), "cp: /nosuch: No such file or directory\n")
+    check("...does not create the target", s.run("ls /tmp/zz"), "ls: /tmp/zz: No such file or directory\n")
     s.run("cp /nosuch /tmp/c1")
     check("an unreadable source does not truncate an existing target", s.run("cat /tmp/c1"), "yy")
     check("cp with one operand", s.run("cp /tmp/c1").startswith("cp: missing destination file operand after '/tmp/c1'"), True)
 
     # ------------------------------------------------------------------ mv
-    check("mv renames", s.run("mv /tmp/c1 /tmp/m1") + s.run("ls /tmp/m1 /tmp/c1"), "ls: /tmp/c1: cannot open\n/tmp/m1\n")
+    check("mv renames", s.run("mv /tmp/c1 /tmp/m1") + s.run("ls /tmp/m1 /tmp/c1"), "ls: /tmp/c1: No such file or directory\n/tmp/m1\n")
     check("mv replaces a file", s.run("echo old > /tmp/m2") + s.run("mv /tmp/m1 /tmp/m2") + s.run("cat /tmp/m2"), "yy")
     check("a failing mv keeps the target", s.run("mv /tmp/nosuch /tmp/m2") + s.run("cat /tmp/m2"),
-          "mv: cannot move '/tmp/nosuch' to '/tmp/m2'\nyy")
+          "mv: cannot move '/tmp/nosuch' to '/tmp/m2': No such file or directory\nyy")
     check("mv into a directory", s.run("mv /tmp/m2 /tmp/cd") + s.run("ls /tmp/cd"), "m2\nnoeol.txt\nsmall.txt\n")
     check("mv of several files needs a directory", s.run("mv /tmp/cd /data/small.txt /tmp/nosuchdir"),
           "mv: target '/tmp/nosuchdir' is not a directory\n")
@@ -171,7 +171,7 @@ def run(ctx):
     s.run("mkdir /tmp/cd/ff")
     check("mv refuses to replace a directory with a file", s.run("mv /tmp/ff /tmp/cd"),
           "mv: cannot overwrite directory '/tmp/cd/ff' with non-directory\n")
-    check("mv a directory into itself is refused", s.run("mv /tmp/t1 /tmp/t1/b/x"), "mv: cannot move '/tmp/t1' to '/tmp/t1/b/x'\n")
+    check("mv a directory into itself is refused", s.run("mv /tmp/t1 /tmp/t1/b/x"), "mv: cannot move '/tmp/t1' to '/tmp/t1/b/x': Invalid argument\n")
     check("mv a file onto itself is refused", s.run("mv /tmp/ff /tmp/ff"), "mv: '/tmp/ff' and '/tmp/ff' are the same file\n")
     check("mv moves a directory with its contents", s.run("mv /tmp/t1 /tmp/t2") + s.run("ls /tmp/t2/b"), "c.txt\n")
 
@@ -186,12 +186,12 @@ def run(ctx):
     s.run("echo 2 > /tmp/cr/sub/b")
     check("chmod -R recurses", s.run("chmod -R +x /tmp/cr") + s.run("ls -lR /tmp/cr"),
           "/tmp/cr:\n-wx          2 a\ndwx          0 sub\n\n/tmp/cr/sub:\n-wx          2 b\n")
-    check("chmod of a missing file", s.run("chmod +x /nosuch"), "chmod: /nosuch: cannot change permissions\n")
+    check("chmod of a missing file", s.run("chmod +x /nosuch"), "chmod: cannot change permissions of '/nosuch': No such file or directory\n")
     check("chmod needs a mode", s.run("chmod").startswith("chmod: missing"), True)
     out = s.run("stat /data/small.txt").split("\n")
     check("stat shows the name, size and type", out[:3], ["  File: /data/small.txt", "  Size: 2            Type: regular file", " Attrs: read-only=no  exec=no"])
     check("stat of a directory", s.run("stat /data/tree").split("\n")[1], "  Size: 0            Type: directory")
-    check("stat of a missing file", s.run("stat /nosuch"), "stat: /nosuch: cannot stat\n")
+    check("stat of a missing file", s.run("stat /nosuch"), "stat: cannot stat '/nosuch': No such file or directory\n")
 
     # ------------------------------------------------------------------ find, cmp, tee, hexdump
     check("find lists a tree in name order", s.run("find /data/tree"),
@@ -200,7 +200,7 @@ def run(ctx):
     check("find -name globs the last component", s.run("find /data/tree -name 'c*'"), "/data/tree/b/c.txt\n/data/tree/c10\n/data/tree/c2\n")
     check("find -maxdepth/-mindepth", s.run("find /data/tree -mindepth 1 -maxdepth 1 -type f"),
           "/data/tree/.hidden\n/data/tree/a.txt\n/data/tree/c10\n/data/tree/c2\n")
-    check("find of a missing path", s.run("find /nosuch"), "find: '/nosuch': cannot open\n")
+    check("find of a missing path", s.run("find /nosuch"), "find: /nosuch: No such file or directory\n")
     check("find with an unknown predicate", s.run("find /data -frob"), "find: unknown predicate '-frob'\n")
     check("cmp of equal files is silent", s.run("cmp /data/lines.txt /data/lines.txt"), "")
     check("cmp names the first difference", s.run("cmp /data/small.txt /data/noeol.txt"),

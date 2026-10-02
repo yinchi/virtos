@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use abi::errno::ENOENT;
 use alloc::format;
 use alloc::vec::Vec;
 
@@ -126,25 +127,30 @@ fn touch(args: Args, env: Env) -> Result<ExitCode, ExitCode> {
 
     let mut status = 0;
     for path in files {
-        // This project's `stat` has no separate "no such file" error, so any failure to examine
-        // the path counts as it not existing: `-c` leaves it alone, and otherwise the create
-        // below reports whatever really is wrong.
-        if stat(path).is_err() {
-            if no_create {
-                continue;
+        match stat(path) {
+            Ok(_) => {}
+            // A missing file: `-c` leaves it alone, otherwise it is created.
+            Err(ENOENT) if no_create => continue,
+            Err(ENOENT) => {
+                // Opening for write creates a missing file; the append open leaves nothing to
+                // truncate.
+                let fd = open(path, O_WRONLY | O_APPEND);
+                if fd < 0 {
+                    cli::report_errno("touch", &format!("cannot touch '{path}'"), fd);
+                    status = 1;
+                    continue;
+                }
+                close(fd as usize);
             }
-            // Opening for write creates a missing file; the append open leaves nothing to
-            // truncate.
-            let fd = open(path, O_WRONLY | O_APPEND);
-            if fd < 0 {
-                cli::report("touch", &format!("cannot touch '{path}'"));
+            Err(e) => {
+                cli::report_errno("touch", &format!("cannot touch '{path}'"), e);
                 status = 1;
                 continue;
             }
-            close(fd as usize);
         }
-        if utimens(path, TimeSet::Omit, mtime) < 0 {
-            cli::report("touch", &format!("setting times of '{path}' failed"));
+        let r = utimens(path, TimeSet::Omit, mtime);
+        if r < 0 {
+            cli::report_errno("touch", &format!("setting times of '{path}'"), r);
             status = 1;
         }
     }

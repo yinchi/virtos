@@ -1,8 +1,10 @@
 //! Everything a program does with a file descriptor, plus the console and the path-only (no fd)
 //! `mkdir`/`unlink`/`rename`/`getcwd`/`stat`/`chmod`: `open`, `close`, `read`, `write`,
 //! `getdents`, `mkdir`, `unlink`, `rename`, `getcwd`, `stat`, `chmod`, `clear`. Each is a thin
-//! wrapper over one syscall (see `syscall.rs`) -- no stdout buffering yet (every call is its own
-//! `write` syscall); revisit if that ever shows up as an actual cost, not preemptively.
+//! wrapper over one syscall (see `syscall.rs`), returning what it returns: a count or `0` on
+//! success, a negated errno (`abi::errno`; `errmsg` words one) on failure. No stdout buffering yet
+//! (every call is its own `write` syscall); revisit if that ever shows up as an actual cost, not
+//! preemptively.
 
 use abi::{
     SYS_CHMOD, SYS_CLEAR, SYS_CLOSE, SYS_GETCWD, SYS_GETDENTS, SYS_MKDIRAT, SYS_NEWFSTATAT,
@@ -25,32 +27,32 @@ pub use abi::{DIRENT_SIZE, NAME_MAX};
 pub use abi::PATH_MAX;
 
 /// Opens the file or directory at `path` (`flags` is `O_RDONLY` or `O_WRONLY`). Returns the new
-/// file descriptor, or a negative value on error (see the kernel's `syscall::fd::open` for what
+/// file descriptor, or a negated errno on error (see the kernel's `syscall::fd::open` for what
 /// can fail and why).
 pub fn open(path: &str, flags: usize) -> isize {
     syscall!(SYS_OPEN, path.as_ptr() as usize, path.len(), flags)
 }
 
-/// Closes file descriptor `fd`. Returns `0`, or a negative value if `fd` wasn't open.
+/// Closes file descriptor `fd`. Returns `0`, or a negated errno if `fd` wasn't open.
 pub fn close(fd: usize) -> isize {
     syscall!(SYS_CLOSE, fd)
 }
 
-/// Writes `buf` to file descriptor `fd`. Returns the number of bytes written, or a negative value
+/// Writes `buf` to file descriptor `fd`. Returns the number of bytes written, or a negated errno
 /// on error (see the kernel's `syscall::fd` for what can fail and why).
 pub fn write(fd: usize, buf: &[u8]) -> isize {
     syscall!(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len())
 }
 
 /// Reads into `buf` from file descriptor `fd`. Returns the number of bytes read (possibly `0`,
-/// non-blocking -- see the kernel's `syscall::fd::read`), or a negative value on error.
+/// non-blocking -- see the kernel's `syscall::fd::read`), or a negated errno on error.
 pub fn read(fd: usize, buf: &mut [u8]) -> isize {
     syscall!(SYS_READ, fd, buf.as_mut_ptr() as usize, buf.len())
 }
 
 /// Fills `buf` with as many whole `DIRENT_SIZE` records as fit from an fd opened on a directory,
 /// picking up where the last call left off. Returns the number of bytes filled -- `0` once the
-/// listing is exhausted -- or a negative value on error. `buf` must hold at least one `DIRENT_SIZE`
+/// listing is exhausted -- or a negated errno on error. `buf` must hold at least one `DIRENT_SIZE`
 /// record, or the call fails outright, not an empty listing.
 pub fn getdents(fd: usize, buf: &mut [u8]) -> isize {
     syscall!(SYS_GETDENTS, fd, buf.as_mut_ptr() as usize, buf.len())
@@ -75,20 +77,20 @@ impl<'a> DirEnt<'a> {
     }
 }
 
-/// Creates an empty directory at `path`. Returns `0`, or a negative value on error (a missing or
+/// Creates an empty directory at `path`. Returns `0`, or a negated errno on error (a missing or
 /// non-directory parent, or an existing entry already at that name).
 pub fn mkdir(path: &str) -> isize {
     syscall!(SYS_MKDIRAT, path.as_ptr() as usize, path.len())
 }
 
 /// Removes the file, or empty directory, at `path` -- one call for both (see the kernel's
-/// `syscall::fd::unlink`). Returns `0`, or a negative value on error (a missing path, or a
+/// `syscall::fd::unlink`). Returns `0`, or a negated errno on error (a missing path, or a
 /// non-empty directory).
 pub fn unlink(path: &str) -> isize {
     syscall!(SYS_UNLINKAT, path.as_ptr() as usize, path.len())
 }
 
-/// Renames or moves the entry at `old` to `new`. Returns `0`, or a negative value on error (either
+/// Renames or moves the entry at `old` to `new`. Returns `0`, or a negated errno on error (either
 /// path fails to resolve, or `new` already names something).
 pub fn rename(old: &str, new: &str) -> isize {
     syscall!(
@@ -100,7 +102,7 @@ pub fn rename(old: &str, new: &str) -> isize {
     )
 }
 
-/// Reads the working directory into `buf`. Returns its length, or a negative value if `buf` is
+/// Reads the working directory into `buf`. Returns its length, or a negated errno if `buf` is
 /// too small.
 pub fn getcwd(buf: &mut [u8]) -> isize {
     syscall!(SYS_GETCWD, buf.as_mut_ptr() as usize, buf.len())
@@ -123,7 +125,7 @@ pub struct Stat {
     pub accessed_date: u16,
 }
 
-/// Reads `path`'s size, attributes and timestamps. `Err` carries the negative value the syscall
+/// Reads `path`'s size, attributes and timestamps. `Err` carries the negated errno the syscall
 /// returned.
 pub fn stat(path: &str) -> Result<Stat, isize> {
     let mut buf = [0u8; abi::STAT_SIZE];
@@ -152,7 +154,7 @@ pub fn stat(path: &str) -> Result<Stat, isize> {
 
 /// Sets `set`'s bits and clears `clear`'s bits of `path`'s attribute byte -- only
 /// `ATTR_READ_ONLY`/`ATTR_EXEC` may be named (the kernel rejects anything else). Returns `0`, or
-/// a negative value on error.
+/// a negated errno on error.
 pub fn chmod(path: &str, set: u8, clear: u8) -> isize {
     syscall!(
         SYS_CHMOD,

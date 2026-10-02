@@ -16,11 +16,10 @@ extern crate alloc;
 
 use core::fmt::Write;
 
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use getargs::Arg;
-use progs::{Out, ReadDirError, cli, join, read_dir};
+use progs::{Out, cli, join, read_dir};
 use textlib::human::human_size;
 use userlib::{ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, Args, ExitCode, Stat, stat};
 
@@ -135,12 +134,8 @@ fn print(out: &mut Out, item: &Item, o: &Options) {
 fn list_dir(out: &mut Out, path: &str, o: &Options) -> bool {
     let entries = match read_dir(path) {
         Ok(entries) => entries,
-        Err(ReadDirError::Open) => {
-            cli::report("ls", &format!("{path}: cannot open"));
-            return false;
-        }
-        Err(ReadDirError::Read) => {
-            cli::report("ls", &format!("{path}: not a directory"));
+        Err(e) => {
+            cli::report_errno("ls", path, e);
             return false;
         }
     };
@@ -226,8 +221,8 @@ fn list(args: Args) -> Result<ExitCode, ExitCode> {
                 attrs: info.attrs,
                 time: time_key(&info),
             }),
-            Err(_) => {
-                cli::report("ls", &format!("{operand}: cannot open"));
+            Err(e) => {
+                cli::report_errno("ls", operand, e);
                 status = 1;
             }
         }

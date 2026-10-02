@@ -79,7 +79,7 @@ def run(ctx):
     check("a script's status is its last command's", s.status("scoped")[1], 0)
     write_script(s, "/root/bin/failing", "cat /nosuch")
     s.run("chmod +x /root/bin/failing")
-    check("...a failing last command", s.status("failing"), ("cat: /nosuch: cannot open\n", 1))
+    check("...a failing last command", s.status("failing"), ("cat: /nosuch: No such file or directory\n", 1))
     write_script(s, "/root/bin/recur", "recur")
     s.run("chmod +x /root/bin/recur")
     out = s.run("recur")
@@ -114,8 +114,8 @@ def run(ctx):
     check("a script can be a pipeline stage", s.run("seq 3 | reader | sort -r"), "3\n2\n1\n")
     write_script(s, "/root/bin/errs", "cat /nosuch")
     s.run("chmod +x /root/bin/errs")
-    check("2>&1 on a script catches its errors", s.run("errs > /root/e 2>&1") + s.run("cat /root/e"), "cat: /nosuch: cannot open\n")
-    check("a script's redirect that cannot be opened stops it", s.run("three > /nosuchdir/x"), "/nosuchdir/x: cannot create\n")
+    check("2>&1 on a script catches its errors", s.run("errs > /root/e 2>&1") + s.run("cat /root/e"), "cat: /nosuch: No such file or directory\n")
+    check("a script's redirect that cannot be opened stops it", s.run("three > /nosuchdir/x"), "/nosuchdir/x: No such file or directory\n")
 
     # ---------------------------------------------------------------- source, ., sh
     write_script(s, "/root/sourced", "cd /tmp", "export SRC=1", "S2=2")
@@ -130,7 +130,7 @@ def run(ctx):
     s.run("cd /root")
     check("source finds a bare name through PATH", s.run("cp /root/sourced /root/bin/viapath") + s.run("source viapath") + s.run("pwd"), "/tmp\n")
     s.run("cd /root")
-    check("source of a missing file", s.run("source /nosuch"), "source: /nosuch: not found\n")
+    check("source of a missing file", s.run("source /nosuch"), "source: /nosuch: No such file or directory\n")
     check("source of a directory", s.run("source /usr"), "source: /usr: is a directory\n")
     check("source with no file", s.run("source"), "source: usage: source FILE\n")
     check("sh runs it scoped", s.run("sh /root/sourced") + s.run("pwd"), "/root\n")

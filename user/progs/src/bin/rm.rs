@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use getargs::Arg;
 use userlib::{Args, ExitCode};
 
@@ -22,10 +23,8 @@ const FLAGS: &[(&str, &str)] = &[
     ("-f, --force", "ignore nonexistent operands"),
 ];
 
-fn report(path: &str) {
-    userlib::write(2, b"rm: ");
-    userlib::write(2, path.as_bytes());
-    userlib::write(2, b": cannot remove\n");
+fn report(path: &str, errno: isize) {
+    progs::cli::report_errno("rm", &format!("cannot remove '{path}'"), errno);
 }
 
 /// Refuses an operand outright, `-r` included -- not a prompting-style confirmation, a hard
@@ -47,7 +46,7 @@ fn refuse(path: &str, recursive: bool) -> bool {
         if recursive {
             userlib::write(2, b"rm: it is dangerous to operate recursively on '/'\n");
         } else {
-            userlib::write(2, b"rm: cannot remove '/': Is a directory\n");
+            report("/", abi::errno::EISDIR);
         }
         true
     } else {
@@ -89,29 +88,26 @@ fn run(args: Args) -> ExitCode {
             continue;
         }
         let result = match userlib::stat(path) {
-            // `-f`: an operand that cannot be examined is treated as nonexistent (this project's
-            // `stat` has no separate "no such file" error to tell the cases apart).
-            Err(_) if force => true,
-            Err(_) => {
-                report(path);
+            // `-f`: an operand that does not exist is not an error.
+            Err(abi::errno::ENOENT) if force => true,
+            Err(e) => {
+                report(path, e);
                 false
             }
             Ok(info) if info.is_dir => {
                 if recursive {
                     progs::copy::remove_tree("rm", path).is_ok()
                 } else {
-                    userlib::write(2, b"rm: cannot remove '");
-                    userlib::write(2, path.as_bytes());
-                    userlib::write(2, b"': Is a directory\n");
+                    report(path, abi::errno::EISDIR);
                     false
                 }
             }
             Ok(_) => {
-                let removed = userlib::unlink(path) >= 0;
-                if !removed {
-                    report(path);
+                let r = userlib::unlink(path);
+                if r < 0 {
+                    report(path, r);
                 }
-                removed
+                r >= 0
             }
         };
         if !result {

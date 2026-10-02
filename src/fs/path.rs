@@ -4,9 +4,11 @@
 //! path *within* that volume. `cwd`'s `absolute` handles the working-directory half; every path
 //! given to `volume_for` is already absolute and normalized.
 
+use abi::errno::{EINVAL, ENOENT, ENOTDIR};
 use hadris_fat::sync::{DirectoryEntry, FatDir, FatVolume, FileEntry};
 
 use super::blkio::BlkIo;
+use super::errno::from_fat;
 use super::{mounts, volume};
 
 /// The entry named `name` directly inside `dir`, if there is one. Case-insensitive, matching
@@ -23,37 +25,38 @@ pub fn find_entry(dir: &FatDir<'_, BlkIo>, name: &str) -> Option<FileEntry> {
 
 /// Resolves `path` (its `/`-separated components; leading, trailing and doubled slashes are all
 /// tolerated -- empty components are just skipped) against `vol`'s root directory, one component
-/// at a time. `Err(())` if any component is missing, a non-final component isn't a directory, or
-/// `path` has no components at all (`""` or `"/"` -- the root itself has no entry to return).
-pub fn resolve(vol: &FatVolume<BlkIo>, path: &str) -> Result<FileEntry, ()> {
+/// at a time. `Err` is a negated errno: `ENOENT` if any component is missing, `ENOTDIR` if a
+/// non-final component isn't a directory, `EINVAL` if `path` has no components at all (`""` or
+/// `"/"` -- the root itself has no entry to return; a caller that can say more, says it).
+pub fn resolve(vol: &FatVolume<BlkIo>, path: &str) -> Result<FileEntry, isize> {
     let mut dir = vol.root_dir();
     let mut comps = path.split('/').filter(|c| !c.is_empty()).peekable();
     loop {
-        let name = comps.next().ok_or(())?;
-        let entry = find_entry(&dir, name).ok_or(())?;
+        let name = comps.next().ok_or(EINVAL)?;
+        let entry = find_entry(&dir, name).ok_or(ENOENT)?;
         if comps.peek().is_none() {
             return Ok(entry);
         }
         if !entry.is_directory() {
-            return Err(());
+            return Err(ENOTDIR);
         }
-        dir = dir.open_entry(&entry).map_err(|_| ())?;
+        dir = dir.open_entry(&entry).map_err(|e| from_fat(&e))?;
     }
 }
 
 /// Resolves `path` to the `FatDir` it names, one component at a time from `vol`'s root -- the root
 /// itself if `path` has no components at all (`""` or `"/"`), unlike `resolve` above, which has no
-/// entry to return for that case. `Err(())` if any component is missing, or any component
-/// (including the last) isn't a directory -- so a path naming an ordinary file always fails here,
-/// not just a path through one.
-pub fn resolve_dir<'a>(vol: &'a FatVolume<BlkIo>, path: &str) -> Result<FatDir<'a, BlkIo>, ()> {
+/// entry to return for that case. `Err` is `ENOENT` for a missing component, `ENOTDIR` for any
+/// component (including the last) that isn't a directory -- so a path naming an ordinary file
+/// always fails here, not just a path through one.
+pub fn resolve_dir<'a>(vol: &'a FatVolume<BlkIo>, path: &str) -> Result<FatDir<'a, BlkIo>, isize> {
     let mut dir = vol.root_dir();
     for name in path.split('/').filter(|c| !c.is_empty()) {
-        let entry = find_entry(&dir, name).ok_or(())?;
+        let entry = find_entry(&dir, name).ok_or(ENOENT)?;
         if !entry.is_directory() {
-            return Err(());
+            return Err(ENOTDIR);
         }
-        dir = dir.open_entry(&entry).map_err(|_| ())?;
+        dir = dir.open_entry(&entry).map_err(|e| from_fat(&e))?;
     }
     Ok(dir)
 }
@@ -63,16 +66,16 @@ pub fn resolve_dir<'a>(vol: &'a FatVolume<BlkIo>, path: &str) -> Result<FatDir<'
 /// to create an entry, and the name to give it), where `resolve`/`resolve_dir` only ever hand back
 /// something that already exists. Built on `resolve_dir` directly (via `rsplit_once`, not a second
 /// component walker) rather than duplicating its loop. `Err(())` if `path` has no components at
-/// all (the root itself has no parent to split off), or any component up to the parent isn't a
-/// directory.
+/// all (the root itself has no parent to split off: `EINVAL`, which a caller that can say more
+/// does), or whatever `resolve_dir` says of the parent.
 pub fn split<'a>(
     vol: &'a FatVolume<BlkIo>,
     path: &'a str,
-) -> Result<(FatDir<'a, BlkIo>, &'a str), ()> {
+) -> Result<(FatDir<'a, BlkIo>, &'a str), isize> {
     let trimmed = path.trim_matches('/');
     let (parent, leaf) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
     if leaf.is_empty() {
-        return Err(());
+        return Err(EINVAL);
     }
     Ok((resolve_dir(vol, parent)?, leaf))
 }

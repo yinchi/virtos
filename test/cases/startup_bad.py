@@ -31,7 +31,7 @@ def run(ctx):
     check("the good lines count", note("Environment: 3 variable(s) from /etc/environment."), True)
     check("blanks around the name are trimmed, the value is literal", s.run("printenv FOO"), " bar\n")
     check("a HOME that is not a directory is a note",
-          note("Environment: cannot enter HOME=/nosuch: not a directory -- staying in /."), True)
+          note("Environment: cannot enter HOME=/nosuch: No such file or directory -- staying in /."), True)
     check("...and the shell starts in /", s.run("pwd"), "/\n")
 
     check("ro is refused", note("Fstab: /etc/fstab: line 2: read-only mounts are not supported -- ignored."), True)

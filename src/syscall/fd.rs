@@ -1,5 +1,8 @@
 //! File descriptor dispatch for `open`/`close`/`read`/`write`/`getdents`, plus the path-only
-//! (no fd involved) `mkdir`/`unlink`/`rename`/`getcwd`/`stat`/`chmod`. Every path a program supplies is
+//! (no fd involved) `mkdir`/`unlink`/`rename`/`getcwd`/`stat`/`chmod`. Every failure is a negated
+//! errno (`abi::errno`): each call is written as an inner function returning `Result<isize,
+//! isize>`, so `?` carries the errno out, and `ret` flattens it into the one value a syscall
+//! returns. Every path a program supplies is
 //! resolved against the working directory first (`fs::cwd::absolute`) before it ever reaches
 //! `fs::path`. One fd table, not one per program: at most one
 //! program is ever resident (see `arch/mmu.rs`'s reasoning), so `reset_for_launch` simply refills
@@ -28,20 +31,19 @@ use crate::console;
 use crate::drivers::virtio::gpu;
 use crate::fs;
 use crate::fs::blkio::BlkIo;
+use crate::fs::errno::from_fat;
 use crate::fs::fattime::{self, TimeChoice};
 use crate::fs::rtc_time::RTC_TIME;
 use crate::keyboard::stdin;
 use abi::blk::BLKINFO_SIZE;
-use abi::errno::{EBUSY, EFAULT, ENODEV, EXDEV};
+use abi::errno::{
+    EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EIO, EISDIR, EMFILE, ENODEV, ENOTDIR, ERANGE, EXDEV,
+    errmsg,
+};
 use abi::{
     ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, DIRENT_SIZE, NAME_MAX, O_APPEND, O_RDONLY, O_WRONLY,
     STAT_SIZE, UTIMES_SIZE,
 };
-
-/// This project's own error convention so far -- a negative value, not yet the real negated-errno
-/// convention `plans/USERSPACE_PLAN.md` settles on for the full syscall set (no `errno` constants
-/// exist yet to return one of).
-const EBADF: isize = -1;
 
 /// How many fds a program may have open at once, the three standard ones included -- `open` fails
 /// once every slot above them already holds a file. Arbitrary and modest; easy to raise later, no
@@ -172,8 +174,9 @@ impl FileDescriptor {
             Self::FileWrite(_, writer) => writer
                 .borrow_mut()
                 .write(bytes)
-                .map_or(EBADF, |n| n as isize),
-            Self::Keyboard | Self::File(..) | Self::Dir { .. } => EBADF,
+                .map_or_else(|e| from_fat(&e), |n| n as isize),
+            Self::Keyboard | Self::File(..) => EBADF,
+            Self::Dir { .. } => EISDIR,
         }
     }
 
@@ -184,21 +187,25 @@ impl FileDescriptor {
     fn read(&mut self, buf: &mut [u8]) -> isize {
         match self {
             Self::Keyboard => stdin::read(buf),
-            Self::Console | Self::FileWrite(..) | Self::Dir { .. } => EBADF,
-            Self::File(_, reader) => reader.borrow_mut().read(buf).map_or(EBADF, |n| n as isize),
+            Self::Console | Self::FileWrite(..) => EBADF,
+            Self::Dir { .. } => EISDIR,
+            Self::File(_, reader) => reader
+                .borrow_mut()
+                .read(buf)
+                .map_or_else(|e| from_fat(&e), |n| n as isize),
         }
     }
 
     /// Fills `buf` with as many whole `DIRENT_SIZE` records as fit, picking up where the last call
-    /// left off; `0` once every entry has been returned. Rejected (`EBADF`) for anything but a
-    /// directory, and if `buf` can't even hold one record -- otherwise the `0` that means "buffer
-    /// too small" couldn't be told apart from "listing exhausted".
+    /// left off; `0` once every entry has been returned. Rejected (`ENOTDIR`) for anything but a
+    /// directory, and (`EINVAL`) if `buf` can't even hold one record -- otherwise the `0` that
+    /// means "buffer too small" couldn't be told apart from "listing exhausted".
     fn getdents(&mut self, buf: &mut [u8]) -> isize {
         let Self::Dir { entries, next, .. } = self else {
-            return EBADF;
+            return ENOTDIR;
         };
         if buf.len() < DIRENT_SIZE {
-            return EBADF;
+            return EINVAL;
         }
         let mut off = 0;
         while *next < entries.len() && off + DIRENT_SIZE <= buf.len() {
@@ -240,7 +247,7 @@ fn validate(ptr: usize, len: usize) -> bool {
 
 pub fn write(fd: usize, ptr: usize, len: usize) -> isize {
     if !validate(ptr, len) {
-        return EBADF;
+        return EFAULT;
     }
     // The read below touches a page marked USER, which PAN would otherwise forbid.
     let _user = mmu::user_access();
@@ -255,7 +262,7 @@ pub fn write(fd: usize, ptr: usize, len: usize) -> isize {
 
 pub fn read(fd: usize, ptr: usize, len: usize) -> isize {
     if !validate(ptr, len) {
-        return EBADF;
+        return EFAULT;
     }
     // The write below touches a page marked USER, which PAN would otherwise forbid.
     let _user = mmu::user_access();
@@ -270,7 +277,7 @@ pub fn read(fd: usize, ptr: usize, len: usize) -> isize {
 /// `getdents` on `fd`, into the user-space buffer `ptr`/`len` -- see `FileDescriptor::getdents`.
 pub fn getdents(fd: usize, ptr: usize, len: usize) -> isize {
     if !validate(ptr, len) {
-        return EBADF;
+        return EFAULT;
     }
     // The write below touches a page marked USER, which PAN would otherwise forbid.
     let _user = mmu::user_access();
@@ -282,42 +289,55 @@ pub fn getdents(fd: usize, ptr: usize, len: usize) -> isize {
     }
 }
 
+/// Flattens an inner call's `Result` into the one value a syscall returns: its result, or the
+/// negated errno.
+fn ret(result: Result<isize, isize>) -> isize {
+    result.unwrap_or_else(|errno| errno)
+}
+
 /// Opens `path` (already absolute) for reading -- an ordinary file only, never a directory (a
-/// redirected stdin can't be one either). Returns the file and the device it is on. Shared by
-/// `open`'s `O_RDONLY` path, `bind_stdio`'s `In`, and `shell`'s own standalone redirect
+/// redirected stdin can't be one either: `EISDIR`). Returns the file and the device it is on.
+/// Shared by `open`'s `O_RDONLY` path, `bind_stdio`'s `In`, and `shell`'s own standalone redirect
 /// application (`cd`/an empty-argv segment).
-pub(crate) fn open_for_read(path: &str) -> Result<(usize, FileReader<'static, BlkIo>), ()> {
-    let (dev, vol, rest) = fs::path::volume_for(path).ok_or(())?;
+pub(crate) fn open_for_read(path: &str) -> Result<(usize, FileReader<'static, BlkIo>), isize> {
+    let (dev, vol, rest) = fs::path::volume_for(path).ok_or(EIO)?;
     let vol: &'static FatVolume<BlkIo> = vol;
-    let entry = fs::path::resolve(vol, rest).map_err(|_| ())?;
-    Ok((dev, vol.read_file(&entry).map_err(|_| ())?))
+    let entry = match fs::path::resolve(vol, rest) {
+        Err(EINVAL) => return Err(EISDIR), // the root
+        other => other?,
+    };
+    Ok((dev, vol.read_file(&entry).map_err(|e| from_fat(&e))?))
 }
 
 /// Opens `path` (already absolute) for writing: creates it if missing, or truncates it to empty
 /// unless `append` -- in which case an existing file is instead opened positioned at its current
 /// end (`FileWriter::new_append`, not wrapped by `FatVolumeWriteExt`'s own convenience method,
 /// which is always create-or-truncate; a missing file with `append` set is still created fresh,
-/// since there is nothing yet to append to). A directory at `path` is refused either way. Returns
-/// the writer and the device it is on. Shared by `open`'s `O_WRONLY` path, `bind_stdio`'s `Out`,
-/// and `shell`'s own standalone redirect application (`cd`/an empty-argv segment).
+/// since there is nothing yet to append to). A directory at `path` is refused either way
+/// (`EISDIR`). Returns the writer and the device it is on. Shared by `open`'s `O_WRONLY` path,
+/// `bind_stdio`'s `Out`, and `shell`'s own standalone redirect application (`cd`/an empty-argv
+/// segment).
 pub(crate) fn open_for_write(
     path: &str,
     append: bool,
-) -> Result<(usize, FileWriter<'static, BlkIo>), ()> {
-    let (dev, vol, rest) = fs::path::volume_for(path).ok_or(())?;
+) -> Result<(usize, FileWriter<'static, BlkIo>), isize> {
+    let (dev, vol, rest) = fs::path::volume_for(path).ok_or(EIO)?;
     let vol: &'static FatVolume<BlkIo> = vol;
-    let (parent, leaf) = fs::path::split(vol, rest).map_err(|_| ())?;
+    let (parent, leaf) = match fs::path::split(vol, rest) {
+        Err(EINVAL) => return Err(EISDIR), // the root
+        other => other?,
+    };
     let entry = match fs::path::find_entry(&parent, leaf) {
-        Some(entry) if entry.is_directory() => return Err(()),
+        Some(entry) if entry.is_directory() => return Err(EISDIR),
         Some(entry) => entry,
-        None => vol.create_file(&parent, leaf).map_err(|_| ())?,
+        None => vol.create_file(&parent, leaf).map_err(|e| from_fat(&e))?,
     };
     let writer = if append {
-        FileWriter::new_append(vol, &entry).map_err(|_| ())?
+        FileWriter::new_append(vol, &entry)
     } else {
-        vol.write_file(&entry).map_err(|_| ())?
+        vol.write_file(&entry)
     };
-    Ok((dev, writer))
+    Ok((dev, writer.map_err(|e| from_fat(&e))?))
 }
 
 /// A command's redirections in the order they were written, each with the fd it binds (an `In`
@@ -365,8 +385,8 @@ fn base() -> &'static mut [Option<FileDescriptor>; 3] {
 /// unset one is the console's own default -- so it clones that rather than opening anything: the
 /// clone shares the same open file (`FileDescriptor::FileWrite`'s doc comment says why it has to).
 ///
-/// `Err` is what to report (`path: not found`, `path: cannot create`) if any `In`/`Out` fails to
-/// resolve or open; nothing already opened earlier in the same call is undone beyond being dropped
+/// `Err` is what to report (`path: No such file or directory`) if any `In`/`Out` fails to resolve
+/// or open; nothing already opened earlier in the same call is undone beyond being dropped
 /// uncommitted, since the command never runs.
 fn resolve_streams(
     inherited: &[Option<FileDescriptor>; 3],
@@ -376,15 +396,13 @@ fn resolve_streams(
     for (fd, redirect) in overrides {
         let stream = match redirect {
             StdioRedirect::In(path) => {
-                let Ok((dev, reader)) = open_for_read(&fs::cwd::absolute(&path)) else {
-                    return Err(format!("{path}: not found"));
-                };
+                let (dev, reader) = open_for_read(&fs::cwd::absolute(&path))
+                    .map_err(|e| format!("{path}: {}", errmsg(e)))?;
                 FileDescriptor::File(dev, Rc::new(RefCell::new(reader)))
             }
             StdioRedirect::Out { path, append } => {
-                let Ok((dev, writer)) = open_for_write(&fs::cwd::absolute(&path), append) else {
-                    return Err(format!("{path}: cannot create"));
-                };
+                let (dev, writer) = open_for_write(&fs::cwd::absolute(&path), append)
+                    .map_err(|e| format!("{path}: {}", errmsg(e)))?;
                 FileDescriptor::FileWrite(dev, Rc::new(RefCell::new(writer)))
             }
             StdioRedirect::Dup(target) => match streams.get(target as usize) {
@@ -441,43 +459,34 @@ pub fn with_inherited_stdio<R>(overrides: Stdio, f: impl FnOnce() -> R) -> Resul
 }
 
 /// Opens the file or directory at the user-space path `ptr`/`len` (resolved against the working
-/// directory first, `fs::cwd::absolute`) on `system.img` (blk0 -- no path/mount resolution across
-/// volumes yet, see `fs::path`'s own doc comment), returning the lowest free fd number (never one
-/// of the standard three) or `-1`. `O_RDONLY` also opens a
-/// directory (the root included, for `""`/`"/"`), for `getdents` rather than `read`/`write`.
-/// `O_WRONLY` creates the file if it's missing, or truncates it to empty if it already exists as
-/// a plain file (a directory is refused) -- or, combined with `O_APPEND`, opens it positioned at
-/// its current end instead (still creating it fresh if it didn't exist); no read-only-bit check
-/// yet (`chmod`'s own `ATTR_READ_ONLY` isn't consulted here). Also `-1` for any other `flags`
-/// value, a missing path (`O_RDONLY` only -- `O_WRONLY` creates it instead), a path that isn't
-/// valid UTF-8, or every fd slot already in use.
+/// directory first, `fs::cwd::absolute`), returning the lowest free fd number (never one of the
+/// standard three) or a negated errno. `O_RDONLY` also opens a directory (the root included, for
+/// `""`/`"/"`), for `getdents` rather than `read`/`write`. `O_WRONLY` creates the file if it's
+/// missing, or truncates it to empty if it already exists as a plain file (`EISDIR` for a
+/// directory) -- or, combined with `O_APPEND`, opens it positioned at its current end instead
+/// (still creating it fresh if it didn't exist); no read-only-bit check yet (`chmod`'s own
+/// `ATTR_READ_ONLY` isn't consulted here). `EINVAL` for any other `flags` value or a path that
+/// isn't valid UTF-8, `ENOENT`/`ENOTDIR` for a path that doesn't resolve (`O_RDONLY` only --
+/// `O_WRONLY` creates it instead), `EMFILE` when every fd slot is already in use, and whatever
+/// else the volume says (`ENOSPC`, `EIO`, ...).
 pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
+    ret(open_inner(ptr, len, flags))
+}
+
+fn open_inner(ptr: usize, len: usize, flags: usize) -> Result<isize, isize> {
     let append = flags & O_APPEND != 0;
     let base = flags & !O_APPEND;
     if base != O_RDONLY && base != O_WRONLY {
-        return EBADF;
-    }
-    if !validate(ptr, len) {
-        return EBADF;
+        return Err(EINVAL);
     }
     // The read below touches a page marked USER, which PAN would otherwise forbid; kept alive for
     // the rest of this function, since `path` (below) is a zero-copy view straight into it.
     let _user = mmu::user_access();
-    // SAFETY: validated above to lie entirely within the user window.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    let Ok(path) = core::str::from_utf8(bytes) else {
-        return EBADF;
-    };
-    let path = fs::cwd::absolute(path);
-
-    let Some((dev, vol, rest)) = fs::path::volume_for(&path) else {
-        return EBADF;
-    };
+    let path = fs::cwd::absolute(user_str(ptr, len)?);
+    let (dev, vol, rest) = fs::path::volume_for(&path).ok_or(EIO)?;
 
     let descriptor = if base == O_WRONLY {
-        let Ok((dev, writer)) = open_for_write(&path, append) else {
-            return EBADF;
-        };
+        let (dev, writer) = open_for_write(&path, append)?;
         FileDescriptor::FileWrite(dev, Rc::new(RefCell::new(writer)))
     } else if let Ok(dir) = fs::path::resolve_dir(vol, rest) {
         // Tried first: a path through directories only (the empty/root path included) opens for
@@ -491,41 +500,35 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
             next: 0,
         }
     } else {
-        let Ok(entry) = fs::path::resolve(vol, rest) else {
-            return EBADF;
-        };
-        let Ok(reader) = vol.read_file(&entry) else {
-            return EBADF;
-        };
+        let entry = fs::path::resolve(vol, rest)?;
+        let reader = vol.read_file(&entry).map_err(|e| from_fat(&e))?;
         FileDescriptor::File(dev, Rc::new(RefCell::new(reader)))
     };
 
     let table = table();
-    let Some(fd) = table
+    let fd = table
         .iter()
         .skip(3)
         .position(Option::is_none)
         .map(|i| i + 3)
-    else {
-        return EBADF;
-    };
+        .ok_or(EMFILE)?;
     table[fd] = Some(descriptor);
-    fd as isize
+    Ok(fd as isize)
 }
 
 /// Closes `fd`: the slot is emptied, dropping whatever it held. For a `FileWrite`, this also
 /// commits its final size to disk (`FileWriter::finish`) -- but only once every fd sharing it
 /// (`bind_stdio`'s `Dup`) has been closed, this one included; while another still holds it, this
 /// just lets go of *this* fd's own clone, leaving the other fully usable (`FileDescriptor::
-/// FileWrite`'s own doc comment). `-1` for an already-closed or never-opened fd, or a `finish`
-/// that failed; closing a standard fd (0/1/2) is allowed, same as a real `close` -- it's just
-/// gone for the rest of this program's run.
+/// FileWrite`'s own doc comment). `EBADF` for an already-closed or never-opened fd, or whatever
+/// the volume says if the `finish` failed (`ENOSPC`, `EIO`); closing a standard fd (0/1/2) is
+/// allowed, same as a real `close` -- it's just gone for the rest of this program's run.
 pub fn close(fd: usize) -> isize {
     match table().get_mut(fd).and_then(Option::take) {
         Some(FileDescriptor::FileWrite(_, writer)) => match Rc::try_unwrap(writer) {
             Ok(writer) => match writer.into_inner().finish() {
                 Ok(()) => 0,
-                Err(_) => EBADF,
+                Err(e) => from_fat(&e),
             },
             Err(_) => 0, // another fd still shares it; that one's own close finishes it
         },
@@ -535,104 +538,89 @@ pub fn close(fd: usize) -> isize {
 }
 
 /// Creates an empty directory at the user-space path `ptr`/`len` (resolved against the working
-/// directory first). `-1` if the path's parent doesn't exist or isn't a directory, if something
-/// already exists at that name, or if `path` has no components at all (the root always exists).
+/// directory first). `ENOENT`/`ENOTDIR` if the path's parent doesn't exist or isn't a directory,
+/// `EEXIST` if something already exists at that name (the root always does), `ENOSPC` when the
+/// volume is full.
 pub fn mkdir(ptr: usize, len: usize) -> isize {
-    if !validate(ptr, len) {
-        return EBADF;
-    }
+    ret(mkdir_inner(ptr, len))
+}
+
+fn mkdir_inner(ptr: usize, len: usize) -> Result<isize, isize> {
     let _user = mmu::user_access();
-    // SAFETY: validated above to lie entirely within the user window.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    let Ok(path) = core::str::from_utf8(bytes) else {
-        return EBADF;
+    let path = fs::cwd::absolute(user_str(ptr, len)?);
+    let (_, vol, rest) = fs::path::volume_for(&path).ok_or(EIO)?;
+    let (parent, leaf) = match fs::path::split(vol, rest) {
+        Err(EINVAL) => return Err(EEXIST), // the root, or a mount point
+        other => other?,
     };
-    let path = fs::cwd::absolute(path);
-    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
-        return EBADF;
-    };
-    let Ok((parent, leaf)) = fs::path::split(vol, rest) else {
-        return EBADF;
-    };
-    match vol.create_dir(&parent, leaf) {
-        Ok(_) => 0,
-        Err(_) => EBADF,
+    if fs::path::find_entry(&parent, leaf).is_some() {
+        return Err(EEXIST);
     }
+    vol.create_dir(&parent, leaf).map_err(|e| from_fat(&e))?;
+    Ok(0)
 }
 
 /// Removes the file, or empty directory, at the user-space path `ptr`/`len` (resolved against the
 /// working directory first) -- one call for both (`hadris_fat::FatVolume::delete`'s own behavior;
-/// no `AT_REMOVEDIR` flag to distinguish them, unlike Linux's real `unlinkat`), refusing only a
-/// *non-empty* directory. `-1` for a missing path or a non-empty directory.
+/// no `AT_REMOVEDIR` flag to distinguish them, unlike Linux's real `unlinkat`). `ENOENT` for a
+/// missing path, `ENOTEMPTY` for a non-empty directory, `EBUSY` for the root, a mount point or a
+/// directory with one inside it.
 pub fn unlink(ptr: usize, len: usize) -> isize {
-    if !validate(ptr, len) {
-        return EBADF;
-    }
+    ret(unlink_inner(ptr, len))
+}
+
+fn unlink_inner(ptr: usize, len: usize) -> Result<isize, isize> {
     let _user = mmu::user_access();
-    // SAFETY: validated above to lie entirely within the user window.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    let Ok(path) = core::str::from_utf8(bytes) else {
-        return EBADF;
-    };
-    let path = fs::cwd::absolute(path);
-    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
-        return EBADF;
-    };
-    let Ok(entry) = fs::path::resolve(vol, rest) else {
-        return EBADF;
-    };
-    match vol.delete(&entry) {
-        Ok(()) => 0,
-        Err(_) => EBADF,
+    let path = fs::cwd::absolute(user_str(ptr, len)?);
+    if fs::mounts::table().covers_a_mount(&path) {
+        return Err(EBUSY);
     }
+    let (_, vol, rest) = fs::path::volume_for(&path).ok_or(EIO)?;
+    let entry = match fs::path::resolve(vol, rest) {
+        Err(EINVAL) => return Err(EBUSY), // the root
+        other => other?,
+    };
+    vol.delete(&entry).map_err(|e| from_fat(&e))?;
+    Ok(0)
 }
 
 /// Renames or moves the entry at the user-space path `old_ptr`/`old_len` to `new_ptr`/`new_len`
 /// (each resolved against the working directory first), within one volume -- a thin wrap of
-/// `hadris_fat::FatVolume::rename` (which refuses moving a directory into its own descendant),
-/// plus replacing an existing plain-file destination, as POSIX `rename` does. `EXDEV` if the two
-/// paths are on different volumes (a program copies and removes instead), `EBUSY` if either side is
-/// a mount point (or the source has one inside it); `-1` for any other failure: either path fails to resolve, a directory is on either side of a replacement, or the
-/// two paths name the same file.
+/// `hadris_fat::FatVolume::rename` (which refuses moving a directory into its own descendant:
+/// `EINVAL`), plus replacing an existing plain-file destination, as POSIX `rename` does. `EXDEV` if
+/// the two paths are on different volumes (a program copies and removes instead), `EBUSY` if either
+/// side is a mount point (or the source has one inside it), `ENOENT`/`ENOTDIR` for a path that
+/// doesn't resolve. A directory on either side of a replacement, or the very same file spelled
+/// another way, is `EEXIST` (`EISDIR` for a file replaced by a directory is not told apart: the
+/// name is taken either way).
 pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) -> isize {
-    if !validate(old_ptr, old_len) || !validate(new_ptr, new_len) {
-        return EBADF;
-    }
+    ret(rename_inner(old_ptr, old_len, new_ptr, new_len))
+}
+
+fn rename_inner(
+    old_ptr: usize,
+    old_len: usize,
+    new_ptr: usize,
+    new_len: usize,
+) -> Result<isize, isize> {
     let _user = mmu::user_access();
-    // SAFETY: both ranges validated above to lie entirely within the user window.
-    let old_bytes = unsafe { core::slice::from_raw_parts(old_ptr as *const u8, old_len) };
-    let new_bytes = unsafe { core::slice::from_raw_parts(new_ptr as *const u8, new_len) };
-    let (Ok(old_path), Ok(new_path)) = (
-        core::str::from_utf8(old_bytes),
-        core::str::from_utf8(new_bytes),
-    ) else {
-        return EBADF;
-    };
-    let old_path = fs::cwd::absolute(old_path);
-    let new_path = fs::cwd::absolute(new_path);
+    let old_path = fs::cwd::absolute(user_str(old_ptr, old_len)?);
+    let new_path = fs::cwd::absolute(user_str(new_ptr, new_len)?);
     // A mount point cannot be moved or replaced, nor can a directory with one inside it: the
     // volume's own root has no directory entry to rename. Checked before the volumes, so that
     // `mv` does not take `EXDEV` for "copy it" and empty a mounted volume.
     if fs::mounts::table().covers_a_mount(&old_path)
         || fs::mounts::table().is_mount_point(&new_path)
     {
-        return EBUSY;
+        return Err(EBUSY);
     }
-    let (Some((old_dev, vol, old_rest)), Some((new_dev, _, new_rest))) = (
-        fs::path::volume_for(&old_path),
-        fs::path::volume_for(&new_path),
-    ) else {
-        return EBADF;
-    };
+    let (old_dev, vol, old_rest) = fs::path::volume_for(&old_path).ok_or(EIO)?;
+    let (new_dev, _, new_rest) = fs::path::volume_for(&new_path).ok_or(EIO)?;
     if old_dev != new_dev {
-        return EXDEV; // a rename cannot move an entry between volumes: `mv` copies and removes
+        return Err(EXDEV); // a rename cannot move an entry between volumes: `mv` copies and removes
     }
-    let Ok(old_entry) = fs::path::resolve(vol, old_rest) else {
-        return EBADF;
-    };
-    let Ok((new_parent, new_leaf)) = fs::path::split(vol, new_rest) else {
-        return EBADF;
-    };
+    let old_entry = fs::path::resolve(vol, old_rest)?;
+    let (new_parent, new_leaf) = fs::path::split(vol, new_rest)?;
     // An existing plain file at the destination is replaced (POSIX `rename`), but only once
     // everything above has checked out -- `hadris_fat`'s own `rename` refuses an existing name,
     // and a caller that removed the target first would lose it whenever the rename then failed.
@@ -643,45 +631,45 @@ pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) ->
             || old_entry.is_directory()
             || old_path.eq_ignore_ascii_case(&new_path)
         {
-            return EBADF;
+            return Err(EEXIST);
         }
-        if vol.delete(&existing).is_err() {
-            return EBADF;
-        }
+        vol.delete(&existing).map_err(|e| from_fat(&e))?;
     }
-    match vol.rename(&old_entry, &new_parent, new_leaf) {
-        Ok(moved) => {
-            // `hadris_fat` stamps a renamed entry with the clock; a move is not a modification
-            // (POSIX leaves the time alone), so put the old one back. Failing to is not failing
-            // the rename, which has already happened.
-            let _ = vol.set_times(&moved, Some(old_entry.modified()), None, None);
-            0
-        }
-        Err(_) => EBADF,
-    }
+    let moved = vol
+        .rename(&old_entry, &new_parent, new_leaf)
+        .map_err(|e| from_fat(&e))?;
+    // `hadris_fat` stamps a renamed entry with the clock; a move is not a modification
+    // (POSIX leaves the time alone), so put the old one back. Failing to is not failing
+    // the rename, which has already happened.
+    let _ = vol.set_times(&moved, Some(old_entry.modified()), None, None);
+    Ok(0)
 }
 
 /// Copies the working directory's absolute path into the user buffer `ptr`/`len` (no terminating
-/// NUL). Returns its length, or `-1` if `buf` is too small.
+/// NUL). Returns its length, or `ERANGE` if `buf` is too small.
 pub fn getcwd(ptr: usize, len: usize) -> isize {
+    ret(getcwd_inner(ptr, len))
+}
+
+fn getcwd_inner(ptr: usize, len: usize) -> Result<isize, isize> {
     if !validate(ptr, len) {
-        return EBADF;
+        return Err(EFAULT);
     }
     let _user = mmu::user_access();
     let cwd = fs::cwd::get();
     if cwd.len() > len {
-        return EBADF;
+        return Err(ERANGE);
     }
     // SAFETY: validated above to lie entirely within the user window, and `cwd.len() <= len`.
     let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, cwd.len()) };
     buf.copy_from_slice(cwd.as_bytes());
-    cwd.len() as isize
+    Ok(cwd.len() as isize)
 }
 
 /// Writes every field a FAT directory entry actually stores for the user-space path `ptr`/`len`
 /// (resolved against the working directory first) into the `STAT_SIZE`-byte buffer at `out_ptr`
-/// -- see `abi::STAT_SIZE`'s own doc comment for the exact layout. `-1` if the path doesn't
-/// resolve, or if `out_ptr`/`STAT_SIZE` isn't valid user memory.
+/// -- see `abi::STAT_SIZE`'s own doc comment for the exact layout. `ENOENT`/`ENOTDIR` if the path
+/// doesn't resolve, `EFAULT` if `out_ptr`/`STAT_SIZE` isn't valid user memory.
 ///
 /// Unlike `open`, this doesn't need a "try as a directory first" branch: `fs::path::resolve`
 /// (unlike `resolve_dir`) already returns a real `FileEntry` for *any* named directory, not just
@@ -689,19 +677,16 @@ pub fn getcwd(ptr: usize, len: usize) -> isize {
 /// parent directory lists it). That's the one case needing synthetic values; every other
 /// directory or file reads every field straight off the real entry.
 pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
-    if !validate(ptr, len) || !validate(out_ptr, STAT_SIZE) {
-        return EBADF;
+    ret(stat_inner(ptr, len, out_ptr))
+}
+
+fn stat_inner(ptr: usize, len: usize, out_ptr: usize) -> Result<isize, isize> {
+    if !validate(out_ptr, STAT_SIZE) {
+        return Err(EFAULT);
     }
     let _user = mmu::user_access();
-    // SAFETY: validated above to lie entirely within the user window.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    let Ok(path) = core::str::from_utf8(bytes) else {
-        return EBADF;
-    };
-    let path = fs::cwd::absolute(path);
-    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
-        return EBADF;
-    };
+    let path = fs::cwd::absolute(user_str(ptr, len)?);
+    let (_, vol, rest) = fs::path::volume_for(&path).ok_or(EIO)?;
 
     let (size, attrs, created, modified, accessed_date) = if rest.trim_matches('/').is_empty() {
         // A volume's own root (`/`, or a mount point) has no `FileEntry` of its own -- nothing
@@ -715,9 +700,7 @@ pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
             FatDateTime::EPOCH.date,
         )
     } else {
-        let Ok(entry) = fs::path::resolve(vol, rest) else {
-            return EBADF;
-        };
+        let entry = fs::path::resolve(vol, rest)?;
         (
             entry.len() as u32,
             entry.attributes().bits(),
@@ -737,7 +720,7 @@ pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
     out[10..12].copy_from_slice(&modified.date.to_le_bytes());
     out[12..14].copy_from_slice(&modified.time.to_le_bytes());
     out[14..16].copy_from_slice(&accessed_date.to_le_bytes());
-    0
+    Ok(0)
 }
 
 /// The only attribute bits a program may change via `chmod` -- `ATTR_DIRECTORY`/`VOLUME_ID`
@@ -748,65 +731,51 @@ pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
 const CHMOD_BITS: u8 = ATTR_READ_ONLY | ATTR_EXEC;
 
 /// Sets `set`'s bits and clears `clear`'s bits of the user-space path `ptr`/`len`'s attribute
-/// byte (resolved against the working directory first). `-1` if `set`/`clear` name anything
-/// outside `CHMOD_BITS`, the path doesn't resolve (this also refuses the bare root, which
-/// `fs::path::resolve` already has no entry to return for -- no separate check needed), or the
-/// underlying `set_attributes` call fails.
+/// byte (resolved against the working directory first). `EINVAL` if `set`/`clear` name anything
+/// outside `CHMOD_BITS` or the path is the bare root (which has no entry to change), `ENOENT`/
+/// `ENOTDIR` if the path doesn't resolve, and whatever the underlying `set_attributes` says.
 pub fn chmod(ptr: usize, len: usize, set: usize, clear: usize) -> isize {
-    if !validate(ptr, len) {
-        return EBADF;
-    }
+    ret(chmod_inner(ptr, len, set, clear))
+}
+
+fn chmod_inner(ptr: usize, len: usize, set: usize, clear: usize) -> Result<isize, isize> {
     if set > u8::MAX as usize || clear > u8::MAX as usize {
-        return EBADF;
+        return Err(EINVAL);
     }
     let (set, clear) = (set as u8, clear as u8);
     if (set | clear) & !CHMOD_BITS != 0 {
-        return EBADF;
+        return Err(EINVAL);
     }
     let _user = mmu::user_access();
-    // SAFETY: validated above to lie entirely within the user window.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    let Ok(path) = core::str::from_utf8(bytes) else {
-        return EBADF;
-    };
-    let path = fs::cwd::absolute(path);
-    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
-        return EBADF;
-    };
-    let Ok(entry) = fs::path::resolve(vol, rest) else {
-        return EBADF;
-    };
+    let path = fs::cwd::absolute(user_str(ptr, len)?);
+    let (_, vol, rest) = fs::path::volume_for(&path).ok_or(EIO)?;
+    let entry = fs::path::resolve(vol, rest)?;
     let attrs = (entry.attributes().bits() | set) & !clear;
-    match vol.set_attributes(&entry, DirEntryAttrFlags::from_bits_retain(attrs)) {
-        Ok(()) => 0,
-        Err(_) => EBADF,
-    }
+    vol.set_attributes(&entry, DirEntryAttrFlags::from_bits_retain(attrs))
+        .map_err(|e| from_fat(&e))?;
+    Ok(0)
 }
 
 /// Sets the modify time of the user-space path `ptr`/`len` (resolved against the working
 /// directory first) from the second of the two `timespec`s at `times_ptr` -- the first, the access
 /// time, is checked and ignored: FAT stores an access *date* only, nothing here reads it, and a
 /// timestamp that coarse is not worth a behavior. A null `times_ptr` is `UTIME_NOW` for both.
-/// FAT keeps the modify time to 2 seconds and holds 1980-2107: a time outside that, a `tv_nsec`
-/// that is neither a real fraction of a second nor one of the two special values, a path that
-/// doesn't resolve, and the bare root (which has no directory entry to hold a time) are all `-1`.
-/// The creation time is never touched. The file need not be writable.
+/// FAT keeps the modify time to 2 seconds and holds 1980-2107: a time outside that and a `tv_nsec`
+/// that is neither a real fraction of a second nor one of the two special values are `EINVAL`, as
+/// is the bare root (which has no directory entry to hold a time); a path that doesn't resolve is
+/// `ENOENT`/`ENOTDIR`. The creation time is never touched. The file need not be writable.
 pub fn utimensat(ptr: usize, len: usize, times_ptr: usize) -> isize {
-    if !validate(ptr, len) {
-        return EBADF;
-    }
+    ret(utimensat_inner(ptr, len, times_ptr))
+}
+
+fn utimensat_inner(ptr: usize, len: usize, times_ptr: usize) -> Result<isize, isize> {
     let _user = mmu::user_access();
-    // SAFETY: validated above to lie entirely within the user window.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    let Ok(path) = core::str::from_utf8(bytes) else {
-        return EBADF;
-    };
-    let path = fs::cwd::absolute(path);
+    let path = fs::cwd::absolute(user_str(ptr, len)?);
     let mtime = if times_ptr == 0 {
         TimeChoice::Now
     } else {
         if !validate(times_ptr, UTIMES_SIZE) {
-            return EBADF;
+            return Err(EFAULT);
         }
         // SAFETY: validated above to lie entirely within the user window.
         let raw = unsafe { core::slice::from_raw_parts(times_ptr as *const u8, UTIMES_SIZE) };
@@ -817,29 +786,24 @@ pub fn utimensat(ptr: usize, len: usize, times_ptr: usize) -> isize {
         };
         match (read(0), read(16)) {
             (Some(_), Some(mtime)) => mtime,
-            _ => return EBADF,
+            _ => return Err(EINVAL),
         }
     };
     let modified = match mtime {
         TimeChoice::Omit => None,
         TimeChoice::Now => Some(RTC_TIME.now()),
-        TimeChoice::At(unix) => match fattime::checked_fields(unix) {
-            Some(f) => Some(FatDateTime::new(
+        TimeChoice::At(unix) => {
+            let f = fattime::checked_fields(unix).ok_or(EINVAL)?;
+            Some(FatDateTime::new(
                 f.year, f.month, f.day, f.hour, f.minute, f.second,
-            )),
-            None => return EBADF,
-        },
+            ))
+        }
     };
-    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
-        return EBADF;
-    };
-    let Ok(entry) = fs::path::resolve(vol, rest) else {
-        return EBADF;
-    };
-    match vol.set_times(&entry, modified, None, None) {
-        Ok(()) => 0,
-        Err(_) => EBADF,
-    }
+    let (_, vol, rest) = fs::path::volume_for(&path).ok_or(EIO)?;
+    let entry = fs::path::resolve(vol, rest)?;
+    vol.set_times(&entry, modified, None, None)
+        .map_err(|e| from_fat(&e))?;
+    Ok(0)
 }
 
 /// Whether any open fd refers to a file or directory on device `dev`: what `umount` refuses on.

@@ -82,10 +82,13 @@ fn count(args: Args) -> Result<ExitCode, ExitCode> {
     let mut status = 0;
     let mut total = Counts::default();
     let mut handle = |path: &str| {
-        let Some(data) = progs::read_operand(path) else {
-            cli::report("wc", &alloc::format!("{path}: cannot open"));
-            status = 1;
-            return;
+        let data = match progs::read_operand(path) {
+            Ok(data) => data,
+            Err(e) => {
+                cli::report_errno("wc", path, e);
+                status = 1;
+                return;
+            }
         };
         let counts = Counts::of(&data);
         total.add(&counts);

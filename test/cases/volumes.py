@@ -15,17 +15,17 @@ def run(ctx):
 
     # ------------------------------------------------------------ mv across volumes
     check("mv a file to the other volume", s.run("mv /tmp/onsys.txt /root/moved.txt") + s.run("cat /root/moved.txt"), "sys\n")
-    check("...the source is gone", s.run("ls /tmp/onsys.txt"), "ls: /tmp/onsys.txt: cannot open\n")
+    check("...the source is gone", s.run("ls /tmp/onsys.txt"), "ls: /tmp/onsys.txt: No such file or directory\n")
     check("...and no temporary is left", s.run("ls -a /root"), "copied.txt\ninhome.txt\nmoved.txt\ntree\n")
     s.run("echo old > /tmp/target")
     s.run("echo new > /root/src")
     check("mv replaces an existing file on the other volume", s.run("mv /root/src /tmp/target") + s.run("cat /tmp/target"), "new\n")
     s.run("echo keep > /tmp/keep")
     check("a mv that fails keeps the target", s.run("mv /root/nosuch /tmp/keep") + s.run("cat /tmp/keep"),
-          "mv: cannot stat '/root/nosuch'\nkeep\n")
+          "mv: cannot stat '/root/nosuch': No such file or directory\nkeep\n")
     check("mv a whole tree across volumes", s.run("mv /root/tree /tmp/tree2") + s.run("find /tmp/tree2"),
           "/tmp/tree2\n/tmp/tree2/a\n/tmp/tree2/sub\n/tmp/tree2/sub/b\n")
-    check("...the source tree is gone", s.run("ls /root/tree"), "ls: /root/tree: cannot open\n")
+    check("...the source tree is gone", s.run("ls /root/tree"), "ls: /root/tree: No such file or directory\n")
     s.run("echo 1 > /root/x1")
     s.run("echo 2 > /root/y1")
     s.run("mkdir /tmp/into")

@@ -13,7 +13,6 @@
 
 extern crate alloc;
 
-use alloc::format;
 use alloc::vec::Vec;
 use getargs::Arg;
 use progs::{cli, write_all};
@@ -41,16 +40,22 @@ fn cat_one(path: &str, flags: Flags, state: &mut State) -> bool {
     } else {
         let fd = userlib::open(path, O_RDONLY);
         if fd < 0 {
-            cli::report("cat", &format!("{path}: cannot open"));
+            cli::report_errno("cat", path, fd);
             return false;
         }
         fd as usize
     };
     let mut buf = [0u8; BUF_SIZE];
     let mut shown = Vec::new();
+    let mut ok = true;
     loop {
         let n = userlib::read(fd, &mut buf);
-        if n <= 0 {
+        if n < 0 {
+            cli::report_errno("cat", path, n); // a directory, say
+            ok = false;
+            break;
+        }
+        if n == 0 {
             break;
         }
         let chunk = &buf[..n as usize];
@@ -65,7 +70,7 @@ fn cat_one(path: &str, flags: Flags, state: &mut State) -> bool {
     if path != "-" {
         userlib::close(fd);
     }
-    true
+    ok
 }
 
 fn run(args: Args) -> ExitCode {

@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 use getargs::Arg;
 use userlib::{Args, ExitCode};
@@ -16,10 +17,8 @@ userlib::entry_with_args!(run);
 const USAGE: &str = "mkdir [-p] DIR...";
 const FLAGS: &[(&str, &str)] = &[("-p, --parents", "create missing parent directories too")];
 
-fn report(path: &str) {
-    userlib::write(2, b"mkdir: ");
-    userlib::write(2, path.as_bytes());
-    userlib::write(2, b": cannot create directory\n");
+fn report(path: &str, errno: isize) {
+    progs::cli::report_errno("mkdir", &format!("cannot create directory '{path}'"), errno);
 }
 
 /// Creates `dir`. With `parents`, walks successively longer `/`-joined prefixes of `dir` instead
@@ -28,8 +27,9 @@ fn report(path: &str) {
 /// existing name always is).
 fn mkdir_one(dir: &str, parents: bool) -> bool {
     if !parents {
-        if userlib::mkdir(dir) < 0 {
-            report(dir);
+        let r = userlib::mkdir(dir);
+        if r < 0 {
+            report(dir, r);
             return false;
         }
         return true;
@@ -46,12 +46,13 @@ fn mkdir_one(dir: &str, parents: bool) -> bool {
         match userlib::stat(&prefix) {
             Ok(s) if s.is_dir => continue,
             Ok(_) => {
-                report(&prefix);
+                report(&prefix, abi::errno::EEXIST);
                 return false;
             }
             Err(_) => {
-                if userlib::mkdir(&prefix) < 0 {
-                    report(&prefix);
+                let r = userlib::mkdir(&prefix);
+                if r < 0 {
+                    report(&prefix, r);
                     return false;
                 }
             }

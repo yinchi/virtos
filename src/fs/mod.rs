@@ -30,6 +30,10 @@ pub mod mounts;
 #[cfg(target_os = "none")]
 pub mod volume;
 
+/// `hadris_fat`'s errors as negated errnos.
+#[cfg(target_os = "none")]
+pub mod errno;
+
 /// Resolving a `/`-separated path against one volume's root directory -- no mount table. `cwd`'s
 /// `absolute` handles the working-directory half; everything here still deals in already-absolute
 /// paths.

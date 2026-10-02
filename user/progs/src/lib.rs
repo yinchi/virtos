@@ -32,28 +32,29 @@ pub fn read_fd(fd: usize) -> Vec<u8> {
     data
 }
 
-/// Reads the file at `path` into a freshly allocated `Vec<u8>`. `None` if it can't be opened.
-/// Simplicity over streaming efficiency: fine for this project's small test files, revisit if a
-/// program ever needs to handle one too large to comfortably fit the fixed heap at once.
-pub fn read_file(path: &str) -> Option<Vec<u8>> {
+/// Reads the file at `path` into a freshly allocated `Vec<u8>`. `Err` carries the negated errno
+/// `open` returned. Simplicity over streaming efficiency: fine for this project's small test
+/// files, revisit if a program ever needs to handle one too large to comfortably fit the fixed
+/// heap at once.
+pub fn read_file(path: &str) -> Result<Vec<u8>, isize> {
     let fd = userlib::open(path, O_RDONLY);
     if fd < 0 {
-        return None;
+        return Err(fd);
     }
     let fd = fd as usize;
     let data = read_fd(fd);
     userlib::close(fd);
-    Some(data)
+    Ok(data)
 }
 
 /// `read_file(path)`, except a lone `-` means stdin (`read_fd(0)`, GNU's own convention) --
 /// shared by every program (`head`/`tail`/`wc`/`hexdump`) that reads a list of path operands
-/// whole rather than streaming them the way `cat` does. `None` only for a real path that fails
-/// to open; `-` always succeeds (an empty read is a real, if unlikely, possibility, not a
-/// failure).
-pub fn read_operand(path: &str) -> Option<Vec<u8>> {
+/// whole rather than streaming them the way `cat` does. `Err` (the errno `open` returned) only
+/// for a real path that fails to open; `-` always succeeds (an empty read is a real, if
+/// unlikely, possibility, not a failure).
+pub fn read_operand(path: &str) -> Result<Vec<u8>, isize> {
     if path == "-" {
-        Some(read_fd(0))
+        Ok(read_fd(0))
     } else {
         read_file(path)
     }
@@ -90,22 +91,27 @@ pub fn join(parent: &str, child: &str) -> String {
     format!("{}/{}", parent.trim_end_matches('/'), child)
 }
 
-/// Writes all of `bytes` to `fd`, retrying after a short write. `false` if a write fails.
-pub fn write_all_fd(fd: usize, mut bytes: &[u8]) -> bool {
+/// Writes all of `bytes` to `fd`, retrying after a short write. `Err` is the negated errno of the
+/// write that failed (`ENOSPC` on a full volume; `EIO` for a write that took nothing and said
+/// nothing).
+pub fn write_all_fd(fd: usize, mut bytes: &[u8]) -> Result<(), isize> {
     while !bytes.is_empty() {
         let n = userlib::write(fd, bytes);
-        if n <= 0 {
-            return false;
+        if n < 0 {
+            return Err(n);
+        }
+        if n == 0 {
+            return Err(abi::errno::EIO);
         }
         bytes = &bytes[n as usize..];
     }
-    true
+    Ok(())
 }
 
 /// Writes all of `bytes` to `fd`, retrying after a short write; gives up silently on an error
 /// (there is nowhere left to report a failed write to stdout/stderr).
 pub fn write_all(fd: usize, bytes: &[u8]) {
-    write_all_fd(fd, bytes);
+    let _ = write_all_fd(fd, bytes);
 }
 
 /// A buffered stdout, for the filters that produce many small pieces (a line at a time, a number
@@ -168,20 +174,14 @@ pub struct Entry {
     pub attrs: u8,
 }
 
-/// Why a directory could not be listed: the `open` failed, or a `getdents` did (an fd that is not
-/// a directory, for one). Kept apart because `ls` words them differently.
-pub enum ReadDirError {
-    Open,
-    Read,
-}
-
 /// The whole listing of the directory `path`, in on-disk order, with the fd already closed -- so a
 /// caller that recurses holds no descriptor while it does, and depth is not limited by the number
-/// of files the kernel lets a program keep open.
-pub fn read_dir(path: &str) -> Result<Vec<Entry>, ReadDirError> {
+/// of files the kernel lets a program keep open. `Err` is the negated errno of the `open` or
+/// `getdents` that failed (`ENOENT` for a missing path, `ENOTDIR` for a file).
+pub fn read_dir(path: &str) -> Result<Vec<Entry>, isize> {
     let fd = userlib::open(path, O_RDONLY);
     if fd < 0 {
-        return Err(ReadDirError::Open);
+        return Err(fd);
     }
     let fd = fd as usize;
     let mut entries = Vec::new();
@@ -189,7 +189,7 @@ pub fn read_dir(path: &str) -> Result<Vec<Entry>, ReadDirError> {
     let result = loop {
         let n = userlib::getdents(fd, &mut buf);
         if n < 0 {
-            break Err(ReadDirError::Read);
+            break Err(n);
         }
         if n == 0 {
             break Ok(());

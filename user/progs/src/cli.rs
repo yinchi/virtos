@@ -42,6 +42,15 @@ pub fn report(prog: &str, msg: &str) {
     userlib::write(2, b"\n");
 }
 
+/// `report` for a failed syscall: `<prog>: <what>: <what the errno means>`, `what` being the path
+/// or action that failed (`cat: /nosuch: No such file or directory`).
+pub fn report_errno(prog: &str, what: &str, errno: isize) {
+    report(
+        prog,
+        &alloc::format!("{what}: {}", abi::errno::errmsg(errno)),
+    );
+}
+
 /// Prints `Try '<prog> --help' for more information.` to stderr -- GNU's own trailer on an
 /// argument error, used only by the diagnostics below (new output this project is only just
 /// growing; existing messages elsewhere keep their own wording unchanged).

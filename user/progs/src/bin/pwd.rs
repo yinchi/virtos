@@ -18,7 +18,7 @@ fn run(mut args: Args) -> ExitCode {
     let mut buf = [0u8; PATH_MAX];
     let len = userlib::getcwd(&mut buf);
     if len < 0 {
-        userlib::write(2, b"pwd: cannot get the working directory\n");
+        progs::cli::report_errno("pwd", "cannot get the working directory", len);
         return ExitCode(1);
     }
     userlib::write(1, &buf[..len as usize]);

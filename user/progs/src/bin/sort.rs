@@ -49,9 +49,9 @@ fn sort(args: Args) -> Result<ExitCode, ExitCode> {
     let mut buffers: Vec<Vec<u8>> = Vec::new();
     for name in names {
         match progs::read_operand(name) {
-            Some(data) => buffers.push(data),
-            None => {
-                cli::report("sort", &alloc::format!("cannot read: {name}"));
+            Ok(data) => buffers.push(data),
+            Err(e) => {
+                cli::report_errno("sort", &alloc::format!("cannot read: {name}"), e);
                 return Ok(ExitCode(2));
             }
         }

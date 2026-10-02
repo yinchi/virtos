@@ -47,9 +47,12 @@ fn uniq(args: Args) -> Result<ExitCode, ExitCode> {
     }
 
     let name = file.unwrap_or("-");
-    let Some(data) = progs::read_operand(name) else {
-        cli::report("uniq", &alloc::format!("{name}: cannot open"));
-        return Ok(ExitCode(1));
+    let data = match progs::read_operand(name) {
+        Ok(data) => data,
+        Err(e) => {
+            cli::report_errno("uniq", name, e);
+            return Ok(ExitCode(1));
+        }
     };
     let lines = split_lines(&data);
 

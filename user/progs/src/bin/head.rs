@@ -45,10 +45,13 @@ fn run(args: Args) -> ExitCode {
     let mut ok = true;
     let mut printed = false;
     for path in o.files {
-        let Some(data) = progs::read_operand(path) else {
-            cli::report("head", &format!("{path}: cannot open"));
-            ok = false;
-            continue;
+        let data = match progs::read_operand(path) {
+            Ok(data) => data,
+            Err(e) => {
+                cli::report_errno("head", path, e);
+                ok = false;
+                continue;
+            }
         };
         if show_names {
             let name = if path == "-" { "standard input" } else { path };

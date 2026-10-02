@@ -15,7 +15,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use progs::{Out, ReadDirError, basename, cli, join, read_dir};
+use progs::{Out, basename, cli, join, read_dir};
 use textlib::glob::matches;
 use userlib::{ATTR_DIRECTORY, Args, ExitCode, stat};
 
@@ -61,8 +61,8 @@ fn walk(out: &mut Out, path: &str, is_dir: bool, depth: usize, t: &Tests) -> boo
     }
     let mut entries = match read_dir(path) {
         Ok(entries) => entries,
-        Err(ReadDirError::Open | ReadDirError::Read) => {
-            cli::report("find", &format!("{path}: cannot read directory"));
+        Err(e) => {
+            cli::report_errno("find", path, e);
             return false;
         }
     };
@@ -153,8 +153,8 @@ fn run(args: Args) -> ExitCode {
                     status = 1;
                 }
             }
-            Err(_) => {
-                cli::report("find", &format!("'{path}': cannot open"));
+            Err(e) => {
+                cli::report_errno("find", path, e);
                 status = 1;
             }
         }

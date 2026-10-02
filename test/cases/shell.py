@@ -28,9 +28,9 @@ def run(ctx):
     check("a quoted unset variable is one empty argument", s.run('echo a "$NOSUCH" b'), "a  b\n")
     s.run("W='/nosuch1 /nosuch2'")
     check("an unquoted multi-word value splits into fields",
-          s.run("cat $W"), "cat: /nosuch1: cannot open\ncat: /nosuch2: cannot open\n")
+          s.run("cat $W"), "cat: /nosuch1: No such file or directory\ncat: /nosuch2: No such file or directory\n")
     check("a quoted one stays a single field",
-          s.run('cat "$W"'), "cat: /nosuch1 /nosuch2: cannot open\n")
+          s.run('cat "$W"'), "cat: /nosuch1 /nosuch2: No such file or directory\n")
     check("a $ not followed by a name is literal", s.run("echo $ $-"), "$ $-\n")
     check("a variable can be reassigned", s.run("X=two") + s.run("echo $X"), "two\n")
     check("assignments see earlier ones", s.run("A=1 B=$A") + s.run("echo $A $B"), "1 1\n")
@@ -69,30 +69,30 @@ def run(ctx):
     check(">> creates a missing file", s.run("echo new >> /tmp/r2") + s.run("cat /tmp/r2"), "new\n")
     check("< feeds stdin", s.run("wc -l < /tmp/r"), "2\n")
     check("2> captures stderr", s.run("cat /nosuch 2> /tmp/e") + s.run("cat /tmp/e"),
-          "cat: /nosuch: cannot open\n")
+          "cat: /nosuch: No such file or directory\n")
     check("stderr is not in stdout without 2>&1",
-          s.run("cat /nosuch > /tmp/o"), "cat: /nosuch: cannot open\n")
+          s.run("cat /nosuch > /tmp/o"), "cat: /nosuch: No such file or directory\n")
     check("...so the file is empty", s.run("wc -c < /tmp/o"), "0\n")
     check("2>&1 before > duplicates the old stdout: the message stays on the console",
-          s.run("cat /nosuch 2>&1 > /tmp/o2"), "cat: /nosuch: cannot open\n")
+          s.run("cat /nosuch 2>&1 > /tmp/o2"), "cat: /nosuch: No such file or directory\n")
     check("...and the file is empty", s.run("wc -c < /tmp/o2"), "0\n")
     check("> f 2>&1 sends both to f",
-          s.run("cat /nosuch > /tmp/o3 2>&1") + s.run("cat /tmp/o3"), "cat: /nosuch: cannot open\n")
+          s.run("cat /nosuch > /tmp/o3 2>&1") + s.run("cat /tmp/o3"), "cat: /nosuch: No such file or directory\n")
     check("redirections can come before the command", s.run("> /tmp/r4 echo made") + s.run("cat /tmp/r4"), "made\n")
     check("a redirection alone creates the file", s.run("> /tmp/r5") + s.run("wc -c < /tmp/r5"), "0\n")
-    check("an unreadable < target is reported", s.run("cat < /tmp/nosuch"), "/tmp/nosuch: not found\n")
+    check("an unreadable < target is reported", s.run("cat < /tmp/nosuch"), "/tmp/nosuch: No such file or directory\n")
     check("...with status 1", s.status("cat < /tmp/nosuch")[1], 1)
-    check("an uncreatable > target is reported", s.run("echo x > /tmp/nodir/f"), "/tmp/nodir/f: cannot create\n")
-    check("...for a builtin too", s.run("cd > /tmp/nodir/f"), "/tmp/nodir/f: cannot create\n")
+    check("an uncreatable > target is reported", s.run("echo x > /tmp/nodir/f"), "/tmp/nodir/f: No such file or directory\n")
+    check("...for a builtin too", s.run("cd > /tmp/nodir/f"), "/tmp/nodir/f: No such file or directory\n")
     check("a failed redirect leaves the earlier ones in effect",
-          s.run("echo x > /tmp/ok1 < /tmp/nosuch") + s.run("wc -c < /tmp/ok1"), "/tmp/nosuch: not found\n0\n")
+          s.run("echo x > /tmp/ok1 < /tmp/nosuch") + s.run("wc -c < /tmp/ok1"), "/tmp/nosuch: No such file or directory\n0\n")
     check("a command whose redirect failed does not run", s.run("echo ran > /tmp/ok2 < /tmp/nosuch") and s.run("cat /tmp/ok2"), "")
 
     # ---------------------------------------------------------------- pipelines
     check("a two-stage pipeline", s.run("echo hello | cat"), "hello\n")
     check("a three-stage pipeline", s.run("seq 5 | tail -n 3 | head -n 1"), "3\n")
     check("the pipeline's status is the last stage's", s.status("cat /nosuch | wc -l")[1], 0)
-    check("stderr is not piped", s.run("cat /nosuch | wc -l"), "cat: /nosuch: cannot open\n0\n")
+    check("stderr is not piped", s.run("cat /nosuch | wc -l"), "cat: /nosuch: No such file or directory\n0\n")
     check("2>&1 pipes stderr too", s.run("cat /nosuch 2>&1 | wc -l"), "1\n")
     check("a stage's own redirect beats the pipe", s.run("echo x > /tmp/p1 | wc -c"), "0\n")
     check("an unknown first stage still lets the next run", s.run("nosuchcmd | wc -c"),

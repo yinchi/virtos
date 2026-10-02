@@ -33,7 +33,7 @@ impl TimeSet {
 
 /// Sets the access and modify times of the file or directory at `path`. FAT keeps no access time
 /// beyond a date, so the kernel accepts `atime` and ignores it; the modify time is kept to 2
-/// seconds and must lie in 1980-2107. Returns `0`, or a negative value on error (a missing path,
+/// seconds and must lie in 1980-2107. Returns `0`, or a negated errno on error (a missing path,
 /// the root, a time FAT cannot hold).
 pub fn utimens(path: &str, atime: TimeSet, mtime: TimeSet) -> isize {
     let mut raw = [0u8; abi::UTIMES_SIZE];

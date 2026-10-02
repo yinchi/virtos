@@ -10,7 +10,7 @@ def run(ctx):
 
     check("what the profile prints is on the log before the first prompt", "from-profile\n" in log, True)
     check("a failing line is reported and the profile goes on",
-          "nosuchcmd: command not found\ncat: /nosuch: cannot open\n" in log, True)
+          "nosuchcmd: command not found\ncat: /nosuch: No such file or directory\n" in log, True)
     check("the last line ran", s.run("echo $PR"), "1\n")
     check("$? is the profile's last command's status (an assignment: 0)", s.run("echo $?"), "0\n")
     check("the shell is in HOME", s.run("pwd"), "/root\n")

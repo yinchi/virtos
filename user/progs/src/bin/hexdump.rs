@@ -53,16 +53,17 @@ fn run(args: Args) -> ExitCode {
     };
     let mut ok = true;
     if plain.count == 0 {
-        let data = progs::read_operand("-").expect("stdin never fails to open");
+        let data = progs::read_operand("-").unwrap_or_default();
         dump(&data);
     }
     for path in progs::cli::operands(args) {
-        let Some(data) = progs::read_operand(path) else {
-            userlib::write(2, b"hexdump: ");
-            userlib::write(2, path.as_bytes());
-            userlib::write(2, b": cannot open\n");
-            ok = false;
-            continue;
+        let data = match progs::read_operand(path) {
+            Ok(data) => data,
+            Err(e) => {
+                progs::cli::report_errno("hexdump", path, e);
+                ok = false;
+                continue;
+            }
         };
         dump(&data);
     }

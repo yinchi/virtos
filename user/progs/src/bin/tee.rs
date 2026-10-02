@@ -46,9 +46,7 @@ fn run(args: Args) -> ExitCode {
     for path in progs::cli::operands(args) {
         let fd = userlib::open(path, flags);
         if fd < 0 {
-            userlib::write(2, b"tee: ");
-            userlib::write(2, path.as_bytes());
-            userlib::write(2, b": cannot open\n");
+            progs::cli::report_errno("tee", path, fd);
             status = 1;
             continue;
         }

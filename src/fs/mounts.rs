@@ -10,7 +10,7 @@
 //! shell runs outside interrupts, so nothing else touches it while a call is in progress.
 
 use abi::blk::BLK_MOUNT_MAX;
-use abi::errno::{EBUSY, EINVAL, ENAMETOOLONG, ENODEV, ENOENT, ENOTDIR, ENOTUNIQ};
+use abi::errno::{EBUSY, EINVAL, ENAMETOOLONG, ENODEV, ENOENT, ENOTUNIQ};
 
 use super::mounttable::{FindError, MountError, MountTable, Source, is_within};
 use super::{devices, path, volume};
@@ -54,13 +54,7 @@ pub fn install_root(dev: usize) -> bool {
 fn check_directory(target: &str) -> Result<(), isize> {
     let (dev, rest) = locate(target);
     let vol = volume::get(dev).ok_or(ENOENT)?;
-    if path::resolve_dir(vol, rest).is_ok() {
-        Ok(())
-    } else if path::resolve(vol, rest).is_ok() {
-        Err(ENOTDIR)
-    } else {
-        Err(ENOENT)
-    }
+    path::resolve_dir(vol, rest).map(|_| ())
 }
 
 /// Mounts the volume `source` names (`LABEL=name` or `UUID=XXXX-XXXX`) on the directory `target`,

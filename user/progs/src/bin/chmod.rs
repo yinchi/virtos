@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use userlib::{ATTR_DIRECTORY, Args, DIRENT_SIZE, DirEnt, ExitCode, O_RDONLY};
 
 userlib::entry_with_args!(run);
@@ -17,10 +18,12 @@ const FLAGS: &[(&str, &str)] = &[("-R", "recurse into directory operands")];
 /// Same buffer size as `ls.rs`'s own batched-`getdents` idiom -- one memory page.
 const GETDENTS_BUF_SIZE: usize = 4096;
 
-fn report(path: &str) {
-    userlib::write(2, b"chmod: ");
-    userlib::write(2, path.as_bytes());
-    userlib::write(2, b": cannot change permissions\n");
+fn report(path: &str, errno: isize) {
+    progs::cli::report_errno(
+        "chmod",
+        &format!("cannot change permissions of '{path}'"),
+        errno,
+    );
 }
 
 /// The attribute bits a mode changes -- `(set, clear)` -- for one of the four symbolic modes.
@@ -43,7 +46,7 @@ fn mode_bits(mode: &str) -> Option<(u8, u8)> {
 fn chmod_recursive(path: &str, set: u8, clear: u8) -> bool {
     let fd = userlib::open(path, O_RDONLY);
     if fd < 0 {
-        report(path);
+        report(path, fd);
         return false;
     }
     let fd = fd as usize;
@@ -52,7 +55,7 @@ fn chmod_recursive(path: &str, set: u8, clear: u8) -> bool {
     loop {
         let n = userlib::getdents(fd, &mut buf);
         if n < 0 {
-            report(path);
+            report(path, n);
             ok = false;
             break;
         }
@@ -67,8 +70,9 @@ fn chmod_recursive(path: &str, set: u8, clear: u8) -> bool {
             if ent.attrs & ATTR_DIRECTORY != 0 && !chmod_recursive(&child, set, clear) {
                 ok = false;
             }
-            if userlib::chmod(&child, set, clear) < 0 {
-                report(&child);
+            let r = userlib::chmod(&child, set, clear);
+            if r < 0 {
+                report(&child, r);
                 ok = false;
             }
         }
@@ -184,8 +188,9 @@ fn run(args: Args) -> ExitCode {
         let Item::File(path) = item else { continue };
 
         let mut ok = true;
-        if userlib::chmod(path, set, clear) < 0 {
-            report(path);
+        let r = userlib::chmod(path, set, clear);
+        if r < 0 {
+            report(path, r);
             ok = false;
         }
 
@@ -197,8 +202,8 @@ fn run(args: Args) -> ExitCode {
                     }
                 }
                 Ok(_) => {} // a plain file: -R beyond the chmod already done is a no-op
-                Err(_) => {
-                    report(path);
+                Err(e) => {
+                    report(path, e);
                     ok = false;
                 }
             }

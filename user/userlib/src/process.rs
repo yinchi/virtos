@@ -35,7 +35,7 @@ pub extern "C" fn exit(code: i32) -> ! {
 }
 
 /// Powers off (`LINUX_REBOOT_CMD_POWER_OFF`) or restarts (`LINUX_REBOOT_CMD_RESTART`) the machine.
-/// Never returns on success; returns a negative value if `cmd` isn't recognized.
+/// Never returns on success; returns a negated errno if `cmd` isn't recognized.
 pub fn reboot(cmd: u32) -> isize {
     syscall!(SYS_REBOOT, cmd as usize)
 }

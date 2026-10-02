@@ -43,7 +43,7 @@ fn open(name: &str) -> Option<usize> {
     }
     let fd = userlib::open(name, O_RDONLY);
     if fd < 0 {
-        cli::report("cmp", &format!("{name}: cannot open"));
+        cli::report_errno("cmp", name, fd);
         return None;
     }
     Some(fd as usize)

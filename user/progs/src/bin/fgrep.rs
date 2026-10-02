@@ -82,10 +82,13 @@ fn fgrep(args: Args) -> Result<ExitCode, ExitCode> {
         } else {
             name
         };
-        let Some(data) = progs::read_operand(name) else {
-            cli::report("fgrep", &alloc::format!("{label}: cannot open"));
-            any_error = true;
-            continue;
+        let data = match progs::read_operand(name) {
+            Ok(data) => data,
+            Err(e) => {
+                cli::report_errno("fgrep", label, e);
+                any_error = true;
+                continue;
+            }
         };
 
         let mut selected = 0usize;
