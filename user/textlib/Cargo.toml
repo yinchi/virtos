@@ -1,0 +1,16 @@
+[package]
+name = "textlib"
+version = "0.1.0"
+edition = "2024"
+
+# The pure, host-testable logic behind the text-filter programs in `user/progs` (`sort`'s line
+# comparison, `cut`'s position lists, `tr`'s character sets, line splitting): `no_std` + `alloc`
+# with no dependency on `userlib`, so `just test-host` runs these modules' unit tests as ordinary
+# `cargo test` on the host -- `user/progs` itself can't, since every program there links against
+# `userlib`'s EL0 entry stub. A plain library crate (no `[[bin]]`), same as `abi`: `justfile`'s
+# `build-user` skips it, so it is never mistaken for a program.
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

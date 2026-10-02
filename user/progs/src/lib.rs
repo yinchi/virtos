@@ -12,6 +12,7 @@ pub mod cli;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 use userlib::{ExitCode, O_RDONLY};
 
 /// Reads every remaining byte off `fd` into a freshly allocated `Vec<u8>` -- just the read loop,
@@ -86,4 +87,69 @@ pub fn basename(path: &str) -> &str {
 /// `cp -r`) to build a child's full path from a `getdents` record's own (relative) name.
 pub fn join(parent: &str, child: &str) -> String {
     format!("{}/{}", parent.trim_end_matches('/'), child)
+}
+
+/// Writes all of `bytes` to `fd`, retrying after a short write; gives up silently on an error
+/// (there is nowhere left to report a failed write to stdout/stderr).
+pub fn write_all(fd: usize, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let n = userlib::write(fd, bytes);
+        if n <= 0 {
+            return;
+        }
+        bytes = &bytes[n as usize..];
+    }
+}
+
+/// A buffered stdout, for the filters that produce many small pieces (a line at a time, a number
+/// at a time): every `put`/`write!` appends to a buffer that is sent in one `write` per
+/// `Out::CAPACITY` bytes instead of one per piece. Flushed when it is dropped, so an early
+/// `return` loses nothing; `flush` sends it sooner (before reading stdin interactively, say).
+pub struct Out {
+    buf: Vec<u8>,
+}
+
+impl Out {
+    pub const CAPACITY: usize = 4096;
+
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(Self::CAPACITY),
+        }
+    }
+
+    pub fn put(&mut self, bytes: &[u8]) {
+        if self.buf.len() + bytes.len() > Self::CAPACITY {
+            self.flush();
+        }
+        if bytes.len() > Self::CAPACITY {
+            write_all(1, bytes);
+        } else {
+            self.buf.extend_from_slice(bytes);
+        }
+    }
+
+    pub fn flush(&mut self) {
+        write_all(1, &self.buf);
+        self.buf.clear();
+    }
+}
+
+impl Default for Out {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Write for Out {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.put(s.as_bytes());
+        Ok(())
+    }
+}
+
+impl Drop for Out {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }

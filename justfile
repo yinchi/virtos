@@ -7,6 +7,7 @@ default:
 test-host:
     cargo test --target aarch64-unknown-linux-gnu
     cd user/abi && cargo test --target aarch64-unknown-linux-gnu
+    cd user/textlib && cargo test --target aarch64-unknown-linux-gnu
 
 HOME_IMG := "home.img"
 

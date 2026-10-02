@@ -33,7 +33,7 @@ pub fn opts(args: Args) -> Opts {
 }
 
 /// Prints `<prog>: <msg>` to stderr, GNU's usual shape for an argument error.
-fn report(prog: &str, msg: &str) {
+pub fn report(prog: &str, msg: &str) {
     userlib::write(2, prog.as_bytes());
     userlib::write(2, b": ");
     userlib::write(2, msg.as_bytes());
@@ -43,7 +43,7 @@ fn report(prog: &str, msg: &str) {
 /// Prints `Try '<prog> --help' for more information.` to stderr -- GNU's own trailer on an
 /// argument error, used only by the diagnostics below (new output this project is only just
 /// growing; existing messages elsewhere keep their own wording unchanged).
-fn try_help(prog: &str) {
+pub fn try_help(prog: &str) {
     userlib::write(2, b"Try '");
     userlib::write(2, prog.as_bytes());
     userlib::write(2, b" --help' for more information.\n");
@@ -211,4 +211,26 @@ pub fn line_count(
         }
     }
     Ok((count, paths))
+}
+
+/// Collapses a `Result` whose `Err` is also an exit status (what the `?`-using filters return
+/// through `next`/`value`/`invalid`) into the `ExitCode` a program's `run` returns.
+pub fn status(result: Result<ExitCode, ExitCode>) -> ExitCode {
+    match result {
+        Ok(code) | Err(code) => code,
+    }
+}
+
+/// `<prog>: missing operand`, then the `Try` line; the status to return.
+pub fn missing_operand(prog: &str) -> ExitCode {
+    report(prog, "missing operand");
+    try_help(prog);
+    ExitCode(1)
+}
+
+/// `<prog>: extra operand '<arg>'`, then the `Try` line; the status to return.
+pub fn extra_operand(prog: &str, arg: &str) -> ExitCode {
+    report(prog, &format!("extra operand '{arg}'"));
+    try_help(prog);
+    ExitCode(1)
 }
