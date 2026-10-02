@@ -3,6 +3,8 @@
 //! simply hold the same literal.
 #![no_std]
 
+pub mod blk;
+pub mod errno;
 pub mod keys;
 
 /// Syscall numbers. Linux's real aarch64 numbers -- borrowed for familiarity, no other Linux-ABI-
@@ -25,6 +27,28 @@ pub const SYS_CLOCK_GETTIME: usize = 113; // Linux's `clock_gettime`, but no clo
 pub const SYS_REBOOT: usize = 142;
 pub const SYS_CHMOD: usize = 53; // Linux's `fchmodat`, but plain-path: no dirfd, no flags
 pub const SYS_UTIMENSAT: usize = 88; // Linux's `utimensat`, but plain-path: no dirfd, no flags
+/// `mount(source, source_len, target, target_len)`: mounts the volume `source` names on the
+/// directory `target`. The source is `LABEL=name` or `UUID=XXXX-XXXX` (the spellings of an `fstab`
+/// line) and picks a block device by what its FAT boot sector says; the target must be an existing
+/// directory. Linux's number for `mount`, shape much simplified (no filesystem type, flags or
+/// data: the only type is FAT). Returns `0` or a negated `errno` (`errno`): `EINVAL` for a source
+/// that is neither spelling or a device that is not FAT, `ENODEV` for one no device matches,
+/// `EBUSY` if that device is mounted already or the target is a mount point (or has one inside
+/// it), `ENOENT`/`ENOTDIR` for the target, `ENAMETOOLONG` for a target longer than
+/// `blk::BLK_MOUNT_MAX`.
+pub const SYS_MOUNT: usize = 40;
+/// `umount(target, target_len)`: unmounts the volume mounted exactly at `target`. `EINVAL` if
+/// `target` is not a mount point; `EBUSY` for the root, for a mount with another mounted inside
+/// it, and for a volume with an open file or the working directory inside it. Linux's number for
+/// `umount2`, minus its flags argument.
+pub const SYS_UMOUNT2: usize = 39;
+/// `blkinfo(index, out)`: describes block device `index` (0-based, in the order the kernel found
+/// them) by writing `blk::BLKINFO_SIZE` bytes to `out`: its size, whether it holds a FAT volume
+/// and is the root, the volume's label and ID, and where it is mounted. `ENODEV` for an index past
+/// the last device (so a caller counts devices by asking until it does), `EFAULT` for a bad `out`.
+/// **Not a Linux syscall** -- Linux reports this through `/sys` and `ioctl`s on a device node --
+/// so its number is outside the range Linux uses.
+pub const SYS_BLKINFO: usize = 1001;
 
 /// Longest absolute path this project deals with (`getcwd`'s buffer, `pwd`'s/`stat`'s own stack
 /// buffers) -- an arbitrary but generous bound, not a number `hadris-fat`/FAT itself imposes.
@@ -110,6 +134,7 @@ mod tests {
     fn values_match_what_fd_rs_and_io_rs_assume() {
         assert_eq!(SYS_CHMOD, 53);
         assert_eq!(SYS_UTIMENSAT, 88);
+        assert_eq!((SYS_MOUNT, SYS_UMOUNT2, SYS_BLKINFO), (40, 39, 1001));
         assert_eq!(
             (UTIMES_SIZE, UTIME_NOW, UTIME_OMIT),
             (32, 0x3fff_ffff, 0x3fff_fffe)

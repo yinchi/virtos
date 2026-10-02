@@ -1,13 +1,13 @@
-//! Resolving an already-*absolute* `/`-separated path against a volume's root directory -- the
-//! working-directory half of turning what a program typed into one of these lives in `fs::cwd`'s
-//! `absolute`, called before any function here. No mount table either: every path is walked from
-//! `vol.root_dir()`, on whichever single volume the caller already picked (`syscall::fd::open`
-//! and `shell::run` both currently hardcode volume 0 -- `plans/USERSPACE_PLAN.md`'s note on why
-//! real multi-volume path resolution isn't needed yet).
+//! Resolving a `/`-separated path against one volume's root directory. Which volume a path is on
+//! is the mount table's answer (`volume_for`: `fs::mounts::locate` picks the device, and hands
+//! back what remains of the path for that volume); everything here then deals in the part of the
+//! path *within* that volume. `cwd`'s `absolute` handles the working-directory half; every path
+//! given to `volume_for` is already absolute and normalized.
 
 use hadris_fat::sync::{DirectoryEntry, FatDir, FatVolume, FileEntry};
 
 use super::blkio::BlkIo;
+use super::{mounts, volume};
 
 /// The entry named `name` directly inside `dir`, if there is one. Case-insensitive, matching
 /// FAT's own short-name semantics.
@@ -75,4 +75,13 @@ pub fn split<'a>(
         return Err(());
     }
     Ok((resolve_dir(vol, parent)?, leaf))
+}
+
+/// The volume that answers for the absolute, normalized `path`: its device index, the open
+/// volume, and the rest of the path within it (`""` for the volume's own root, which is what a
+/// mount point resolves to; otherwise starting with `/`). `None` only if the mount table sent the
+/// path to a device with no open volume, which it never does for a mounted one.
+pub fn volume_for(path: &str) -> Option<(usize, &'static mut FatVolume<BlkIo>, &str)> {
+    let (dev, rest) = mounts::locate(path);
+    volume::get(dev).map(|vol| (dev, vol, rest))
 }

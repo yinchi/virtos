@@ -19,8 +19,10 @@
 //! host-tested under both targets, like `fs::sector`/`exec::elfparse`. Everything below them
 //! touches the console, keyboard, or filesystem, so it's bare-metal-only, like `exec::process`.
 
+mod environment;
 mod expand;
 mod frame_stack;
+mod fstab;
 mod lexer;
 mod prompt;
 mod syntax;
@@ -105,21 +107,22 @@ fn set_last_status(code: i32) {
     }
 }
 
-/// Makes `argv[1]` (or `/`, with no argument -- there's no `$HOME` to fall back to yet) the
-/// working directory, if it names a real directory. Unlike every other command, this can't be an
+/// Makes `argv[1]` (or `$HOME`, with no argument; `/` if `HOME` is unset or empty) the working
+/// directory, if it names a real directory. Unlike every other command, this can't be an
 /// ordinary `usr/bin/` program: an EL0 process changing its own working directory would never be
 /// visible to the shell that launched it (real Unix's `cd` is a shell builtin for exactly this
 /// reason), and there's only one working directory to begin with here -- the shell's own, since
 /// at most one program is ever resident (`fs::cwd`'s own doc comment).
 #[cfg(target_os = "none")]
 fn cd(uart: &mut Uart, argv: &[String]) -> i32 {
-    let target = argv.get(1).map_or("/", String::as_str);
-    let Some(vol) = fs::volume::get(0) else {
-        report(uart, "system.img not mounted");
+    let home = frame_stack::var("HOME").filter(|home| !home.is_empty());
+    let target = argv.get(1).map_or(home.unwrap_or("/"), String::as_str);
+    let absolute = fs::cwd::absolute(target);
+    let Some((_, vol, rest)) = fs::path::volume_for(&absolute) else {
+        report(uart, "no volume mounted there");
         return 1;
     };
-    let absolute = fs::cwd::absolute(target);
-    if fs::path::resolve_dir(vol, &absolute).is_err() {
+    if fs::path::resolve_dir(vol, rest).is_err() {
         report(uart, &format!("cd: {target}: not a directory"));
         return 1;
     }
@@ -176,12 +179,12 @@ fn source(uart: &mut Uart, name: &str, argv: &[String], depth: usize) -> i32 {
         report(uart, &format!("{name}: {path}: too many levels of scripts"));
         return 1;
     }
-    let Some(vol) = fs::volume::get(0) else {
-        report(uart, "system.img not mounted");
+    let absolute = fs::cwd::absolute(path);
+    let Some((_, vol, rest)) = fs::path::volume_for(&absolute) else {
+        report(uart, "no volume mounted there");
         return 1;
     };
-    let absolute = fs::cwd::absolute(path);
-    let Ok(entry) = fs::path::resolve(vol, &absolute) else {
+    let Ok(entry) = fs::path::resolve(vol, rest) else {
         report(uart, &format!("{name}: {path}: not found"));
         return 1;
     };
@@ -201,6 +204,15 @@ fn source(uart: &mut Uart, name: &str, argv: &[String], depth: usize) -> i32 {
         report(uart, &format!("{name}: {path}: not valid UTF-8"));
         return 1;
     };
+    run_script_content(uart, content, depth)
+}
+
+/// Runs each line of `content` as if typed at the prompt, one nesting level (`depth`) below
+/// the caller's own, and returns the last line's status -- `0` for an empty file or one of nothing
+/// but blank/comment lines (which leave `$?` alone). Unscoped: whatever the script sets, `cd`s or
+/// exports stays set. Shared by `source`/`.`/`sh` and the start-up `.profile`.
+#[cfg(target_os = "none")]
+fn run_script_content(uart: &mut Uart, content: &str, depth: usize) -> i32 {
     let mut status = 0;
     for line in content.lines() {
         status = run(uart, line, depth + 1);
@@ -270,20 +282,17 @@ fn unset(argv: &[String]) -> i32 {
 /// alone; nothing here needs to know which directory is "the right one" itself.
 #[cfg(target_os = "none")]
 fn apply_redirects_standalone(redirs: &[syntax::Redirection]) -> Result<(), String> {
-    let Some(vol) = fs::volume::get(0) else {
-        return Err("system.img not mounted".into());
-    };
     for redir in redirs {
         match redir {
             syntax::Redirection::In(path) => {
                 let absolute = fs::cwd::absolute(path);
-                if fd::open_for_read(vol, &absolute).is_err() {
+                if fd::open_for_read(&absolute).is_err() {
                     return Err(format!("{path}: not found"));
                 }
             }
             syntax::Redirection::Out { path, append, .. } => {
                 let absolute = fs::cwd::absolute(path);
-                let Ok(writer) = fd::open_for_write(vol, &absolute, *append) else {
+                let Ok((_, writer)) = fd::open_for_write(&absolute, *append) else {
                     return Err(format!("{path}: cannot create"));
                 };
                 if writer.finish().is_err() {
@@ -510,18 +519,19 @@ fn run_segment(
     }
 }
 
-/// Reads `usr/bin/<name>` off `system.img` (blk0) into a freshly allocated `Vec<u8>`. Fetches
-/// `fs::volume::get(0)` itself, used and dropped entirely within this function -- deliberately
-/// never returned or held by a caller across a `run_program` call, which itself fetches the same
-/// volume again internally (via `bind_stdio`): `fs::volume::get` hands back a fresh `&'static
-/// mut` on every call, sound only as long as two such references are never *simultaneously*
-/// live, which holding one across a nested call that fetches its own would risk.
+/// Reads `/usr/bin/<name>` into a freshly allocated `Vec<u8>`. Fetches the volume itself
+/// (`fs::path::volume_for`), used and dropped entirely within this function -- deliberately never
+/// returned or held by a caller across a `run_program` call, which itself fetches the same volume
+/// again internally (via `bind_stdio`): `fs::volume::get` hands back a fresh `&'static mut` on
+/// every call, sound only as long as two such references are never *simultaneously* live, which
+/// holding one across a nested call that fetches its own would risk.
 #[cfg(target_os = "none")]
 fn read_program(name: &str) -> Result<Vec<u8>, String> {
-    let Some(vol) = fs::volume::get(0) else {
-        return Err("system.img not mounted".into());
+    let path = format!("/usr/bin/{name}");
+    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
+        return Err("no volume mounted".into());
     };
-    let Ok(entry) = fs::path::resolve(vol, &format!("usr/bin/{name}")) else {
+    let Ok(entry) = fs::path::resolve(vol, rest) else {
         return Err(format!("{name}: not found"));
     };
     let Ok(mut reader) = vol.read_file(&entry) else {
@@ -566,14 +576,14 @@ static mut PIPE_COUNTER: usize = 0;
 fn next_pipe_path() -> Result<String, String> {
     #[allow(clippy::deref_addrof)]
     let counter = unsafe { &mut *(&raw mut PIPE_COUNTER) };
-    let Some(vol) = fs::volume::get(0) else {
-        return Err("system.img not mounted".into());
-    };
     for _ in 0..MAX_PIPE_NAME_ATTEMPTS {
         let path = format!("{PIPE_PREFIX}{counter}");
         *counter += 1;
-        if fs::path::resolve(vol, &path).is_err() {
-            let Ok(writer) = fd::open_for_write(vol, &path, false) else {
+        let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
+            return Err("no volume mounted".into());
+        };
+        if fs::path::resolve(vol, rest).is_err() {
+            let Ok((_, writer)) = fd::open_for_write(&path, false) else {
                 return Err(format!("{path}: cannot create"));
             };
             return match writer.finish() {
@@ -589,11 +599,11 @@ fn next_pipe_path() -> Result<String, String> {
 /// about a failed cleanup, and the pipeline is already finishing or aborting either way.
 #[cfg(target_os = "none")]
 fn cleanup_temps(paths: &[String]) {
-    let Some(vol) = fs::volume::get(0) else {
-        return;
-    };
     for path in paths {
-        if let Ok(entry) = fs::path::resolve(vol, path) {
+        let Some((_, vol, rest)) = fs::path::volume_for(path) else {
+            continue;
+        };
+        if let Ok(entry) = fs::path::resolve(vol, rest) {
             let _ = vol.delete(&entry);
         }
     }
@@ -667,11 +677,11 @@ fn run_pipeline(uart: &mut Uart, pipeline: &[syntax::Segment], depth: usize) -> 
 /// reason `cd`'s builtin calls `fs::path::resolve_dir` directly instead of going through `open`.
 #[cfg(target_os = "none")]
 fn ensure_tmp_exists(uart: &mut Uart) {
-    let Some(vol) = fs::volume::get(0) else {
-        report(uart, "system.img not mounted, /tmp unavailable");
+    let Some((_, vol, rest)) = fs::path::volume_for("/tmp") else {
+        report(uart, "no root volume mounted, /tmp unavailable");
         return;
     };
-    if fs::path::resolve_dir(vol, "/tmp").is_ok() {
+    if fs::path::resolve_dir(vol, rest).is_ok() {
         return; // already exists as a directory
     }
     let root = vol.root_dir();
@@ -746,6 +756,231 @@ fn run(uart: &mut Uart, line: &str, depth: usize) -> i32 {
     status
 }
 
+/// The environment file: plain `NAME=VALUE` lines (see `environment.rs`), read once at boot.
+#[cfg(target_os = "none")]
+const ENVIRONMENT_FILE: &str = "/etc/environment";
+
+/// More than this is not an environment file or a profile: it is ignored rather than parsed or
+/// run.
+#[cfg(target_os = "none")]
+const START_UP_FILE_MAX: usize = 64 * 1024;
+
+/// What `read_text` found at a path.
+#[cfg(target_os = "none")]
+enum TextFile {
+    /// Nothing there (or a component of the path is not a directory).
+    Missing,
+    Text(String),
+    /// Something is there but it can't be used: the reason, for the serial note.
+    Unusable(&'static str),
+}
+
+/// Reads the file at the absolute path `path` as UTF-8 text of at most `START_UP_FILE_MAX` bytes.
+#[cfg(target_os = "none")]
+fn read_text(path: &str) -> TextFile {
+    let Some((_, vol, rest)) = fs::path::volume_for(path) else {
+        return TextFile::Unusable("no volume mounted there");
+    };
+    let Ok(entry) = fs::path::resolve(vol, rest) else {
+        return TextFile::Missing;
+    };
+    if entry.is_directory() {
+        return TextFile::Unusable("is a directory");
+    }
+    if entry.len() as usize > START_UP_FILE_MAX {
+        return TextFile::Unusable("not a text file of at most 64 KiB");
+    }
+    let Ok(mut reader) = vol.read_file(&entry) else {
+        return TextFile::Unusable("failed to open");
+    };
+    let Ok(bytes) = reader.read_to_vec() else {
+        return TextFile::Unusable("failed to read");
+    };
+    match String::from_utf8(bytes) {
+        Ok(text) => TextFile::Text(text),
+        Err(_) => TextFile::Unusable("not a text file of at most 64 KiB"),
+    }
+}
+
+/// The file systems to mount at start-up: `<source> <mount point> <type> <options>` lines (see
+/// `fstab.rs`).
+#[cfg(target_os = "none")]
+const FSTAB_FILE: &str = "/etc/fstab";
+
+/// Mounts what `/etc/fstab` lists, in file order -- the shell's part of what Linux splits into
+/// `root=` (the kernel mounts the root) and `mount -a` (init mounts the rest) -- and reports on
+/// the UART (the serial log). Nothing here is fatal: a missing or unusable file mounts nothing, a
+/// bad line is skipped (`fstab::parse`), and a line that cannot be mounted (no volume matches, the
+/// mount point is not a directory or is in use, ...) is skipped with the reason. `noauto` lines
+/// are left alone and a `nofail` line says nothing if no volume matches. A line for `/` is only
+/// checked: the root was chosen at boot, by label (`fs::devices`), before this file could be read,
+/// so it must name that volume or it is noted and ignored.
+#[cfg(target_os = "none")]
+fn mount_fstab(uart: &mut Uart) {
+    let text = match read_text(FSTAB_FILE) {
+        TextFile::Text(text) => text,
+        TextFile::Missing => {
+            writeln!(uart, "Fstab: {FSTAB_FILE}: not found -- nothing to mount.").ok();
+            return;
+        }
+        TextFile::Unusable(why) => {
+            writeln!(uart, "Fstab: {FSTAB_FILE}: {why} -- nothing to mount.").ok();
+            return;
+        }
+    };
+    let parsed = fstab::parse(&text);
+    for problem in &parsed.problems {
+        writeln!(
+            uart,
+            "Fstab: {FSTAB_FILE}: line {}: {} -- ignored.",
+            problem.line, problem.why
+        )
+        .ok();
+    }
+    let mut mounted = 0;
+    for entry in parsed.entries.iter().filter(|entry| !entry.noauto) {
+        let point = fs::cwd::absolute(&entry.point);
+        let what = format!("{} on {point}", entry.source_text);
+        let mut note = |result: &str| {
+            writeln!(
+                uart,
+                "Fstab: {FSTAB_FILE}: line {}: {what}: {result}.",
+                entry.line
+            )
+            .ok();
+        };
+        if point == "/" {
+            let root = fs::mounts::table().resolve("/").0;
+            if entry.source.find(&fs::devices::identities()) != Some(root) {
+                note(
+                    "the root is chosen at boot (the volume labelled SYSTEM), not from this file -- ignored",
+                );
+            }
+            continue;
+        }
+        match fs::mounts::mount(&entry.source_text, &point) {
+            0 => mounted += 1,
+            abi::errno::ENODEV if entry.nofail => {}
+            abi::errno::ENODEV => note("no volume has that label or ID -- skipped"),
+            abi::errno::EINVAL => note("not a FAT filesystem -- skipped"),
+            e => note(&format!("{} -- skipped", abi::errno::errmsg(e))),
+        }
+    }
+    writeln!(uart, "Fstab: {mounted} mount(s) from {FSTAB_FILE}.").ok();
+}
+
+/// Reads `/etc/environment` into the shell's variables, every one exported, and reports what it
+/// did on the UART (the serial log, not the console): a missing or unusable file is an empty
+/// environment, and a bad line is skipped, never fatal.
+#[cfg(target_os = "none")]
+fn load_environment(uart: &mut Uart) {
+    let text = match read_text(ENVIRONMENT_FILE) {
+        TextFile::Text(text) => text,
+        TextFile::Missing => {
+            writeln!(
+                uart,
+                "Environment: {ENVIRONMENT_FILE}: not found -- starting empty."
+            )
+            .ok();
+            return;
+        }
+        TextFile::Unusable(why) => {
+            writeln!(
+                uart,
+                "Environment: {ENVIRONMENT_FILE}: {why} -- starting empty."
+            )
+            .ok();
+            return;
+        }
+    };
+    let parsed = environment::parse(&text);
+    for problem in &parsed.problems {
+        writeln!(
+            uart,
+            "Environment: {ENVIRONMENT_FILE}: line {}: {} -- ignored.",
+            problem.line, problem.why
+        )
+        .ok();
+    }
+    for (name, value) in &parsed.vars {
+        let _ = frame_stack::export_var(name, Some(value)); // names were validated by `parse`
+    }
+    writeln!(
+        uart,
+        "Environment: {} variable(s) from {ENVIRONMENT_FILE}.",
+        parsed.vars.len()
+    )
+    .ok();
+}
+
+/// `$HOME` as a path, if it is set and not empty.
+#[cfg(target_os = "none")]
+fn home_dir() -> Option<String> {
+    frame_stack::var("HOME")
+        .filter(|home| !home.is_empty())
+        .map(String::from)
+}
+
+/// Starts the shell in `$HOME`, as a login program would: `chdir` to it. There is no login or
+/// user system, so this is the init shell's own doing, once, at boot, after the environment is
+/// loaded. No `HOME` (or an empty one) leaves the shell in `/`; one that names no directory is
+/// reported on the UART and does the same.
+#[cfg(target_os = "none")]
+fn enter_home(uart: &mut Uart) {
+    let Some(home) = home_dir() else { return };
+    let absolute = fs::cwd::absolute(&home);
+    let is_dir = fs::path::volume_for(&absolute)
+        .is_some_and(|(_, vol, rest)| fs::path::resolve_dir(vol, rest).is_ok());
+    if is_dir {
+        fs::cwd::set(absolute);
+    } else {
+        writeln!(
+            uart,
+            "Environment: cannot enter HOME={home}: not a directory -- staying in /."
+        )
+        .ok();
+    }
+}
+
+/// Runs `$HOME/.profile`, the user's start-up script, if there is one: its lines run in the shell
+/// itself, as `source` would (so its assignments, `export`s, `cd`s and `PS1` changes are the
+/// shell's own), and what it prints appears before the first prompt. No `HOME` or no such file is
+/// silent -- a profile is optional, unlike the environment file. One that is a directory, is not
+/// UTF-8 text, or is over `START_UP_FILE_MAX` is a note on the UART and is skipped. A failing
+/// line reports and the script goes on, as any script does. `$?` is left as the profile's last
+/// command set it, as in bash and dash.
+#[cfg(target_os = "none")]
+fn run_profile(uart: &mut Uart) {
+    let Some(home) = home_dir() else { return };
+    let path = fs::cwd::absolute(&format!("{}/.profile", home.trim_end_matches('/')));
+    match read_text(&path) {
+        TextFile::Missing => {}
+        TextFile::Unusable(why) => {
+            writeln!(uart, "Profile: {path}: {why} -- skipped.").ok();
+        }
+        TextFile::Text(content) => {
+            run_script_content(uart, &content, 0);
+        }
+    }
+}
+
+/// What the init shell does for itself before it reads its first line, in this order: seed `PS1`,
+/// mount the file systems in `/etc/fstab` (before anything else, so that `/etc/environment` and
+/// `$HOME` may live on one), load the environment (which may replace `PS1`), enter `$HOME`, run its `.profile`. The notes go to
+/// the UART (the serial log); what the profile prints goes to the console. All of it comes before
+/// the first prompt is drawn.
+#[cfg(target_os = "none")]
+fn start_up(uart: &mut Uart) {
+    // The prompt this shell has always shown, now just a variable like any other: `PS1=` or
+    // `unset PS1` falls back to `prompt::DEFAULT_PROMPT`. Seeded first so `/etc/environment` and
+    // `.profile` can replace it.
+    let _ = frame_stack::set_var("PS1", prompt::DEFAULT_SHELL_PS1);
+    mount_fstab(uart);
+    load_environment(uart);
+    enter_home(uart);
+    run_profile(uart);
+}
+
 /// Reads one line at a time from the keyboard queue, echoing to the console, and runs whatever
 /// name was typed against `usr/bin/` on `system.img`. Never returns -- replaces both the
 /// boot-time hardcoded `hello`/`scratch` run and the dumb 15-second typing test that came before
@@ -763,10 +998,7 @@ pub fn run_forever(uart: &mut Uart) -> ! {
         }
     }
     ensure_tmp_exists(uart);
-    // The prompt this shell has always shown, now just a variable like any other: `PS1=` or
-    // `unset PS1` falls back to `prompt::DEFAULT_PROMPT`. (Seeded here rather than from a startup
-    // file -- there isn't one yet.)
-    let _ = frame_stack::set_var("PS1", prompt::DEFAULT_SHELL_PS1);
+    start_up(uart);
 
     loop {
         // Scoped so `console`/`gpu_dev` are dropped before `run` below: it calls `run_program`,

@@ -169,3 +169,21 @@ pub fn chmod(path: &str, set: u8, clear: u8) -> isize {
 pub fn clear() -> isize {
     syscall!(SYS_CLEAR)
 }
+
+/// Mounts the volume `source` names (`LABEL=name` or `UUID=XXXX-XXXX`) on the existing directory
+/// `target`. Returns `0`, or a negated errno -- see `abi::SYS_MOUNT` for which.
+pub fn mount(source: &str, target: &str) -> isize {
+    syscall!(
+        abi::SYS_MOUNT,
+        source.as_ptr() as usize,
+        source.len(),
+        target.as_ptr() as usize,
+        target.len()
+    )
+}
+
+/// Unmounts the volume mounted at `target`. Returns `0`, or a negated errno -- see
+/// `abi::SYS_UMOUNT2`.
+pub fn umount(target: &str) -> isize {
+    syscall!(abi::SYS_UMOUNT2, target.as_ptr() as usize, target.len())
+}

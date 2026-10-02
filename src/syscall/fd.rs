@@ -30,6 +30,8 @@ use crate::fs::blkio::BlkIo;
 use crate::fs::fattime::{self, TimeChoice};
 use crate::fs::rtc_time::RTC_TIME;
 use crate::keyboard::stdin;
+use abi::blk::BLKINFO_SIZE;
+use abi::errno::{EFAULT, ENODEV};
 use abi::{
     ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, DIRENT_SIZE, NAME_MAX, O_APPEND, O_RDONLY, O_WRONLY,
     STAT_SIZE, UTIMES_SIZE,
@@ -48,8 +50,9 @@ const MAX_FDS: usize = 3 + 8;
 enum FileDescriptor {
     Keyboard,
     Console,
-    /// An open file, read-only.
-    File(FileReader<'static, BlkIo>),
+    /// An open file, read-only, and the device it is on (`umount` refuses while a file is open
+    /// on the volume).
+    File(usize, FileReader<'static, BlkIo>),
     /// An open file, write-only (`abi::O_WRONLY`) -- created fresh or truncated to empty at open
     /// time (`open`'s own doc comment), or opened positioned at its current end for `>>`
     /// (`open_for_write`). `Rc<RefCell<_>>`, not owned outright, so `bind_stdio`'s `Dup` (`>&`)
@@ -64,13 +67,14 @@ enum FileDescriptor {
     /// contract); a program that never calls `close` on it, or that faults first, still gets this
     /// from `end_launch`, so a redirected stdout/stderr is never left with the wrong size for the
     /// next reader (a pipeline stage, or a later `cat`) to find.
-    FileWrite(Rc<RefCell<FileWriter<'static, BlkIo>>>),
+    FileWrite(usize, Rc<RefCell<FileWriter<'static, BlkIo>>>),
     /// An open directory: `entries` captured whole when it was opened (unlike a file, FAT gives no
     /// way to resume a directory walk at an arbitrary byte offset) -- each entry's name, size, and
     /// attribute byte, so `getdents` can hand a child's type back to a caller (`chmod -R`'s own
     /// recursion, eventually `ls -l`/`-F`) without it needing a separate `stat` call per entry.
     /// `next` is how many `getdents` has already returned.
     Dir {
+        dev: usize,
         entries: Vec<(String, u32, u8)>,
         next: usize,
     },
@@ -133,7 +137,7 @@ pub fn reset_for_launch() {
 /// through this loop finishes it instead once it, in turn, is the last one left.
 pub fn end_launch() {
     for slot in table().iter_mut() {
-        if let Some(FileDescriptor::FileWrite(writer)) = slot.take()
+        if let Some(FileDescriptor::FileWrite(_, writer)) = slot.take()
             && let Ok(writer) = Rc::try_unwrap(writer)
         {
             let _ = writer.into_inner().finish();
@@ -161,11 +165,11 @@ impl FileDescriptor {
                 let _ = uart.write_str(text);
                 bytes.len() as isize
             }
-            Self::FileWrite(writer) => writer
+            Self::FileWrite(_, writer) => writer
                 .borrow_mut()
                 .write(bytes)
                 .map_or(EBADF, |n| n as isize),
-            Self::Keyboard | Self::File(_) | Self::Dir { .. } => EBADF,
+            Self::Keyboard | Self::File(..) | Self::Dir { .. } => EBADF,
         }
     }
 
@@ -176,8 +180,8 @@ impl FileDescriptor {
     fn read(&mut self, buf: &mut [u8]) -> isize {
         match self {
             Self::Keyboard => stdin::read(buf),
-            Self::Console | Self::FileWrite(_) | Self::Dir { .. } => EBADF,
-            Self::File(reader) => reader.read(buf).map_or(EBADF, |n| n as isize),
+            Self::Console | Self::FileWrite(..) | Self::Dir { .. } => EBADF,
+            Self::File(_, reader) => reader.read(buf).map_or(EBADF, |n| n as isize),
         }
     }
 
@@ -186,7 +190,7 @@ impl FileDescriptor {
     /// directory, and if `buf` can't even hold one record -- otherwise the `0` that means "buffer
     /// too small" couldn't be told apart from "listing exhausted".
     fn getdents(&mut self, buf: &mut [u8]) -> isize {
-        let Self::Dir { entries, next } = self else {
+        let Self::Dir { entries, next, .. } = self else {
             return EBADF;
         };
         if buf.len() < DIRENT_SIZE {
@@ -275,40 +279,41 @@ pub fn getdents(fd: usize, ptr: usize, len: usize) -> isize {
 }
 
 /// Opens `path` (already absolute) for reading -- an ordinary file only, never a directory (a
-/// redirected stdin can't be one either). Shared by `open`'s `O_RDONLY` path, `bind_stdio`'s
-/// `In`, and `shell`'s own standalone redirect application (`cd`/an empty-argv segment).
-pub(crate) fn open_for_read(
-    vol: &'static FatVolume<BlkIo>,
-    path: &str,
-) -> Result<FileReader<'static, BlkIo>, ()> {
-    let entry = fs::path::resolve(vol, path).map_err(|_| ())?;
-    vol.read_file(&entry).map_err(|_| ())
+/// redirected stdin can't be one either). Returns the file and the device it is on. Shared by
+/// `open`'s `O_RDONLY` path, `bind_stdio`'s `In`, and `shell`'s own standalone redirect
+/// application (`cd`/an empty-argv segment).
+pub(crate) fn open_for_read(path: &str) -> Result<(usize, FileReader<'static, BlkIo>), ()> {
+    let (dev, vol, rest) = fs::path::volume_for(path).ok_or(())?;
+    let vol: &'static FatVolume<BlkIo> = vol;
+    let entry = fs::path::resolve(vol, rest).map_err(|_| ())?;
+    Ok((dev, vol.read_file(&entry).map_err(|_| ())?))
 }
 
 /// Opens `path` (already absolute) for writing: creates it if missing, or truncates it to empty
 /// unless `append` -- in which case an existing file is instead opened positioned at its current
 /// end (`FileWriter::new_append`, not wrapped by `FatVolumeWriteExt`'s own convenience method,
 /// which is always create-or-truncate; a missing file with `append` set is still created fresh,
-/// since there is nothing yet to append to). A directory at `path` is refused either way. Shared
-/// by `open`'s `O_WRONLY` path (never `append`, since nothing exposes that flag yet),
-/// `bind_stdio`'s `Out`, and `shell`'s own standalone redirect application (`cd`/an empty-argv
-/// segment).
+/// since there is nothing yet to append to). A directory at `path` is refused either way. Returns
+/// the writer and the device it is on. Shared by `open`'s `O_WRONLY` path, `bind_stdio`'s `Out`,
+/// and `shell`'s own standalone redirect application (`cd`/an empty-argv segment).
 pub(crate) fn open_for_write(
-    vol: &'static FatVolume<BlkIo>,
     path: &str,
     append: bool,
-) -> Result<FileWriter<'static, BlkIo>, ()> {
-    let (parent, leaf) = fs::path::split(vol, path).map_err(|_| ())?;
+) -> Result<(usize, FileWriter<'static, BlkIo>), ()> {
+    let (dev, vol, rest) = fs::path::volume_for(path).ok_or(())?;
+    let vol: &'static FatVolume<BlkIo> = vol;
+    let (parent, leaf) = fs::path::split(vol, rest).map_err(|_| ())?;
     let entry = match fs::path::find_entry(&parent, leaf) {
         Some(entry) if entry.is_directory() => return Err(()),
         Some(entry) => entry,
         None => vol.create_file(&parent, leaf).map_err(|_| ())?,
     };
-    if append {
-        FileWriter::new_append(vol, &entry).map_err(|_| ())
+    let writer = if append {
+        FileWriter::new_append(vol, &entry).map_err(|_| ())?
     } else {
-        vol.write_file(&entry).map_err(|_| ())
-    }
+        vol.write_file(&entry).map_err(|_| ())?
+    };
+    Ok((dev, writer))
 }
 
 /// One redirection to apply to a program's stdio before it starts -- built by `shell`'s own
@@ -348,21 +353,22 @@ pub enum StdioRedirect {
 /// target doesn't hold one of the three expected kinds; nothing already bound earlier in the same
 /// call is undone, since the caller never launches the program at all on `Err`.
 pub fn bind_stdio(overrides: [Option<StdioRedirect>; 3]) -> Result<(), ()> {
-    let vol = fs::volume::get(0).ok_or(())?;
     for (fd, redirect) in overrides.into_iter().enumerate() {
         let Some(redirect) = redirect else { continue };
         let descriptor = match redirect {
             StdioRedirect::In(path) => {
-                FileDescriptor::File(open_for_read(vol, &fs::cwd::absolute(&path))?)
+                let (dev, reader) = open_for_read(&fs::cwd::absolute(&path))?;
+                FileDescriptor::File(dev, reader)
             }
-            StdioRedirect::Out { path, append } => FileDescriptor::FileWrite(Rc::new(
-                RefCell::new(open_for_write(vol, &fs::cwd::absolute(&path), append)?),
-            )),
+            StdioRedirect::Out { path, append } => {
+                let (dev, writer) = open_for_write(&fs::cwd::absolute(&path), append)?;
+                FileDescriptor::FileWrite(dev, Rc::new(RefCell::new(writer)))
+            }
             StdioRedirect::Dup(target) => match table().get(target as usize) {
                 Some(Some(FileDescriptor::Console)) => FileDescriptor::Console,
                 Some(Some(FileDescriptor::Keyboard)) => FileDescriptor::Keyboard,
-                Some(Some(FileDescriptor::FileWrite(writer))) => {
-                    FileDescriptor::FileWrite(writer.clone())
+                Some(Some(FileDescriptor::FileWrite(dev, writer))) => {
+                    FileDescriptor::FileWrite(*dev, writer.clone())
                 }
                 _ => return Err(()),
             },
@@ -402,33 +408,34 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
     };
     let path = fs::cwd::absolute(path);
 
-    let Some(vol) = fs::volume::get(0) else {
+    let Some((dev, vol, rest)) = fs::path::volume_for(&path) else {
         return EBADF;
     };
 
     let descriptor = if base == O_WRONLY {
-        let Ok(writer) = open_for_write(vol, &path, append) else {
+        let Ok((dev, writer)) = open_for_write(&path, append) else {
             return EBADF;
         };
-        FileDescriptor::FileWrite(Rc::new(RefCell::new(writer)))
-    } else if let Ok(dir) = fs::path::resolve_dir(vol, &path) {
+        FileDescriptor::FileWrite(dev, Rc::new(RefCell::new(writer)))
+    } else if let Ok(dir) = fs::path::resolve_dir(vol, rest) {
         // Tried first: a path through directories only (the empty/root path included) opens for
         // `getdents`. If it fails, the same path is tried as an ordinary file below --
         // `resolve_dir` and `resolve` walk identically up to the last component, so this only
         // succeeds here for a path `resolve` would otherwise have resolved to a directory entry
         // it doesn't know what to do with.
         FileDescriptor::Dir {
+            dev,
             entries: list_dir(&dir),
             next: 0,
         }
     } else {
-        let Ok(entry) = fs::path::resolve(vol, &path) else {
+        let Ok(entry) = fs::path::resolve(vol, rest) else {
             return EBADF;
         };
         let Ok(reader) = vol.read_file(&entry) else {
             return EBADF;
         };
-        FileDescriptor::File(reader)
+        FileDescriptor::File(dev, reader)
     };
 
     let table = table();
@@ -453,7 +460,7 @@ pub fn open(ptr: usize, len: usize, flags: usize) -> isize {
 /// gone for the rest of this program's run.
 pub fn close(fd: usize) -> isize {
     match table().get_mut(fd).and_then(Option::take) {
-        Some(FileDescriptor::FileWrite(writer)) => match Rc::try_unwrap(writer) {
+        Some(FileDescriptor::FileWrite(_, writer)) => match Rc::try_unwrap(writer) {
             Ok(writer) => match writer.into_inner().finish() {
                 Ok(()) => 0,
                 Err(_) => EBADF,
@@ -479,10 +486,10 @@ pub fn mkdir(ptr: usize, len: usize) -> isize {
         return EBADF;
     };
     let path = fs::cwd::absolute(path);
-    let Some(vol) = fs::volume::get(0) else {
+    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
         return EBADF;
     };
-    let Ok((parent, leaf)) = fs::path::split(vol, &path) else {
+    let Ok((parent, leaf)) = fs::path::split(vol, rest) else {
         return EBADF;
     };
     match vol.create_dir(&parent, leaf) {
@@ -506,10 +513,10 @@ pub fn unlink(ptr: usize, len: usize) -> isize {
         return EBADF;
     };
     let path = fs::cwd::absolute(path);
-    let Some(vol) = fs::volume::get(0) else {
+    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
         return EBADF;
     };
-    let Ok(entry) = fs::path::resolve(vol, &path) else {
+    let Ok(entry) = fs::path::resolve(vol, rest) else {
         return EBADF;
     };
     match vol.delete(&entry) {
@@ -539,13 +546,19 @@ pub fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) ->
     };
     let old_path = fs::cwd::absolute(old_path);
     let new_path = fs::cwd::absolute(new_path);
-    let Some(vol) = fs::volume::get(0) else {
+    let (Some((old_dev, vol, old_rest)), Some((new_dev, _, new_rest))) = (
+        fs::path::volume_for(&old_path),
+        fs::path::volume_for(&new_path),
+    ) else {
         return EBADF;
     };
-    let Ok(old_entry) = fs::path::resolve(vol, &old_path) else {
+    if old_dev != new_dev {
+        return EBADF; // a rename cannot move a file between volumes
+    }
+    let Ok(old_entry) = fs::path::resolve(vol, old_rest) else {
         return EBADF;
     };
-    let Ok((new_parent, new_leaf)) = fs::path::split(vol, &new_path) else {
+    let Ok((new_parent, new_leaf)) = fs::path::split(vol, new_rest) else {
         return EBADF;
     };
     match vol.rename(&old_entry, &new_parent, new_leaf) {
@@ -598,13 +611,14 @@ pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
         return EBADF;
     };
     let path = fs::cwd::absolute(path);
-    let Some(vol) = fs::volume::get(0) else {
+    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
         return EBADF;
     };
 
-    let (size, attrs, created, modified, accessed_date) = if path.trim_matches('/').is_empty() {
-        // The true root has no `FileEntry` of its own -- nothing lists it -- so there's nothing
-        // real to read; report it as an empty directory at the FAT epoch.
+    let (size, attrs, created, modified, accessed_date) = if rest.trim_matches('/').is_empty() {
+        // A volume's own root (`/`, or a mount point) has no `FileEntry` of its own -- nothing
+        // lists it -- so there's nothing real to read; report it as an empty directory at the
+        // FAT epoch.
         (
             0u32,
             ATTR_DIRECTORY,
@@ -613,7 +627,7 @@ pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
             FatDateTime::EPOCH.date,
         )
     } else {
-        let Ok(entry) = fs::path::resolve(vol, &path) else {
+        let Ok(entry) = fs::path::resolve(vol, rest) else {
             return EBADF;
         };
         (
@@ -668,10 +682,10 @@ pub fn chmod(ptr: usize, len: usize, set: usize, clear: usize) -> isize {
         return EBADF;
     };
     let path = fs::cwd::absolute(path);
-    let Some(vol) = fs::volume::get(0) else {
+    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
         return EBADF;
     };
-    let Ok(entry) = fs::path::resolve(vol, &path) else {
+    let Ok(entry) = fs::path::resolve(vol, rest) else {
         return EBADF;
     };
     let attrs = (entry.attributes().bits() | set) & !clear;
@@ -728,16 +742,74 @@ pub fn utimensat(ptr: usize, len: usize, times_ptr: usize) -> isize {
             None => return EBADF,
         },
     };
-    let Some(vol) = fs::volume::get(0) else {
+    let Some((_, vol, rest)) = fs::path::volume_for(&path) else {
         return EBADF;
     };
-    let Ok(entry) = fs::path::resolve(vol, &path) else {
+    let Ok(entry) = fs::path::resolve(vol, rest) else {
         return EBADF;
     };
     match vol.set_times(&entry, modified, None, None) {
         Ok(()) => 0,
         Err(_) => EBADF,
     }
+}
+
+/// Whether any open fd refers to a file or directory on device `dev`: what `umount` refuses on.
+fn open_on(dev: usize) -> bool {
+    table().iter().flatten().any(|fd| match fd {
+        FileDescriptor::File(d, _)
+        | FileDescriptor::FileWrite(d, _)
+        | FileDescriptor::Dir { dev: d, .. } => *d == dev,
+        FileDescriptor::Keyboard | FileDescriptor::Console => false,
+    })
+}
+
+/// Reads the user-space string `ptr`/`len`. `EFAULT` for a range outside the user window,
+/// `EINVAL` for one that isn't UTF-8. The caller holds `mmu::user_access()` for as long as the
+/// returned view is used.
+fn user_str<'a>(ptr: usize, len: usize) -> Result<&'a str, isize> {
+    if !validate(ptr, len) {
+        return Err(EFAULT);
+    }
+    // SAFETY: validated above to lie entirely within the user window.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    core::str::from_utf8(bytes).map_err(|_| abi::errno::EINVAL)
+}
+
+/// `mount(source, target)`: see `abi::SYS_MOUNT` and `fs::mounts::mount`. The target is resolved
+/// against the working directory first; the source (`LABEL=...`/`UUID=...`) is not a path.
+pub fn mount(src_ptr: usize, src_len: usize, target_ptr: usize, target_len: usize) -> isize {
+    let _user = mmu::user_access();
+    let (source, target) = match (user_str(src_ptr, src_len), user_str(target_ptr, target_len)) {
+        (Ok(source), Ok(target)) => (source, target),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    fs::mounts::mount(source, &fs::cwd::absolute(target))
+}
+
+/// `umount(target)`: see `abi::SYS_UMOUNT2` and `fs::mounts::umount`.
+pub fn umount(ptr: usize, len: usize) -> isize {
+    let _user = mmu::user_access();
+    match user_str(ptr, len) {
+        Ok(target) => fs::mounts::umount(&fs::cwd::absolute(target), open_on),
+        Err(e) => e,
+    }
+}
+
+/// `blkinfo(index, out)`: see `abi::SYS_BLKINFO`. Writes `BLKINFO_SIZE` bytes to `out`, or
+/// `ENODEV` for an index past the last device, `EFAULT` for a bad `out`.
+pub fn blkinfo(index: usize, out_ptr: usize) -> isize {
+    if !validate(out_ptr, BLKINFO_SIZE) {
+        return EFAULT;
+    }
+    let Some(info) = fs::devices::blkinfo(index) else {
+        return ENODEV;
+    };
+    let _user = mmu::user_access();
+    // SAFETY: validated above to lie entirely within the user window.
+    let out = unsafe { core::slice::from_raw_parts_mut(out_ptr as *mut u8, BLKINFO_SIZE) };
+    out.copy_from_slice(&info.encode());
+    0
 }
 
 /// Clears the console -- both the graphical one (if a GPU device exists) and, via an ANSI escape

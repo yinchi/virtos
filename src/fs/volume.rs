@@ -17,25 +17,35 @@ use crate::drivers::virtio::blk::{self, MAX_BLK};
 /// One open volume per `blk` device, indexed the same way `blk::get` is.
 static mut VOLUMES: [Option<FatVolume<BlkIo>>; MAX_BLK] = [const { None }; MAX_BLK];
 
-/// Opens the FAT volume on `blk` device `dev`.
-///
-/// # Panics
-/// If `dev` holds no valid FAT filesystem.
-pub fn open(dev: usize) {
+/// Opens the FAT volume on `blk` device `dev`, stamping new and changed entries from the
+/// real-time clock (UTC, not the FAT epoch). `false` if it holds no filesystem `hadris_fat` can
+/// open.
+pub fn open(dev: usize) -> bool {
     let io = BlkIo::new(blk::get(dev));
-    let vol = FatVolumeBuilder::new(io)
-        .time_provider(&RTC_TIME)
-        .open()
-        .expect("failed to open FAT volume");
+    let Ok(vol) = FatVolumeBuilder::new(io).time_provider(&RTC_TIME).open() else {
+        return false;
+    };
     // SAFETY: sole writer, and `get` is only ever called for a `dev` some earlier `open` call
     // already populated.
     #[allow(clippy::deref_addrof)]
     unsafe {
         (&mut *(&raw mut VOLUMES))[dev] = Some(vol)
     };
+    true
 }
 
-/// The FAT volume open on `blk` device `dev`, if `open` has been called for it.
+/// Closes the volume on `dev` (`umount`): nothing refers to it any more, the caller having
+/// checked that no file is open on it.
+pub fn close(dev: usize) {
+    // SAFETY: see `open`.
+    #[allow(clippy::deref_addrof)]
+    unsafe {
+        (&mut *(&raw mut VOLUMES))[dev] = None
+    };
+}
+
+/// The FAT volume open on `blk` device `dev`, if there is one (the mount table only ever sends a
+/// path to a device that is mounted, so `None` is a bug or a stale index).
 #[allow(clippy::deref_addrof)]
 pub fn get(dev: usize) -> Option<&'static mut FatVolume<BlkIo>> {
     // SAFETY: see `open`.

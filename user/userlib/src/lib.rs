@@ -21,11 +21,13 @@ extern crate alloc;
 // modules that follow it.
 #[macro_use]
 mod syscall;
+mod blk;
 mod heap;
 mod io;
 mod process;
 mod time;
 
+pub use blk::blkinfo;
 pub use heap::init_heap;
 pub use io::*;
 pub use process::*;
