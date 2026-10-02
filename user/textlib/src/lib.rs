@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod countspec;
 pub mod cutlist;
+pub mod glob;
 pub mod headtail;
 pub mod human;
 pub mod sortkey;
