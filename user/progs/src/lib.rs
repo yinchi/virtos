@@ -13,7 +13,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
-use userlib::{ExitCode, O_RDONLY};
+use userlib::{DIRENT_SIZE, DirEnt, ExitCode, O_RDONLY};
 
 /// Reads every remaining byte off `fd` into a freshly allocated `Vec<u8>` -- just the read loop,
 /// no open/close, so it works equally for an already-open fd (stdin's `0`, or a `-` operand) and
@@ -152,4 +152,51 @@ impl Drop for Out {
     fn drop(&mut self) {
         self.flush();
     }
+}
+
+/// One entry of a directory listing: what `getdents` reports.
+pub struct Entry {
+    pub name: String,
+    pub size: u32,
+    pub attrs: u8,
+}
+
+/// Why a directory could not be listed: the `open` failed, or a `getdents` did (an fd that is not
+/// a directory, for one). Kept apart because `ls` words them differently.
+pub enum ReadDirError {
+    Open,
+    Read,
+}
+
+/// The whole listing of the directory `path`, in on-disk order, with the fd already closed -- so a
+/// caller that recurses holds no descriptor while it does, and depth is not limited by the number
+/// of files the kernel lets a program keep open.
+pub fn read_dir(path: &str) -> Result<Vec<Entry>, ReadDirError> {
+    let fd = userlib::open(path, O_RDONLY);
+    if fd < 0 {
+        return Err(ReadDirError::Open);
+    }
+    let fd = fd as usize;
+    let mut entries = Vec::new();
+    let mut buf = [0u8; DIRENT_SIZE * 15]; // one memory page's worth of records per call
+    let result = loop {
+        let n = userlib::getdents(fd, &mut buf);
+        if n < 0 {
+            break Err(ReadDirError::Read);
+        }
+        if n == 0 {
+            break Ok(());
+        }
+        for raw in buf[..n as usize].as_chunks::<DIRENT_SIZE>().0 {
+            if let Some(ent) = DirEnt::parse(raw) {
+                entries.push(Entry {
+                    name: String::from(ent.name),
+                    size: ent.size,
+                    attrs: ent.attrs,
+                });
+            }
+        }
+    };
+    userlib::close(fd);
+    result.map(|()| entries)
 }

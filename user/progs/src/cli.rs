@@ -22,6 +22,8 @@ use core::iter::Skip;
 use alloc::format;
 use alloc::vec::Vec;
 use getargs::{Arg, Error, Opt, Options};
+use textlib::countspec::{self, Sign};
+use textlib::headtail::Mode;
 use userlib::{Args, ExitCode};
 
 /// A parser over a program's arguments after `argv[0]`.
@@ -175,42 +177,76 @@ pub fn plain(
     Ok(summary)
 }
 
-/// Parses `head`'s and `tail`'s shared shape: an optional `-n`/`--lines COUNT` (attached or
-/// separate, `-n5`/`-n 5`/`--lines=5`/`--lines 5` all work), defaulting to `default` if absent,
-/// followed by the remaining positional arguments (the file list). One single pass, building the
-/// file list as positionals are seen -- *not* `next` followed by a separate `operands` walk: `-n`
-/// takes a value, and `operands`'s own "skip options" pass never calls `value` to consume it, so
-/// it would see that value as a stray positional of its own (this module's own doc comment notes
-/// exactly this is why `count_args`-shaped parsing can't reuse `operands`). A flag written after
-/// a file name (`head file.txt -n 5`) is still recognized either way, the same as any other GNU
-/// program. `Err` is the exit status to return, already reported (or, for `--help`, already
-/// printed, exit `0`).
-pub fn line_count(
+/// What `head` and `tail` were asked for: `-n`/`-c` with their count, `-q`/`-v` for the file-name
+/// headers, and the file list.
+pub struct CountArgs {
+    pub mode: Mode,
+    pub sign: Sign,
+    pub count: usize,
+    pub quiet: bool,
+    pub verbose: bool,
+    pub files: Vec<&'static str>,
+}
+
+/// Parses `head`'s and `tail`'s shared shape: an optional `-n`/`--lines COUNT` or `-c`/`--bytes
+/// COUNT` (attached or separate, `-n5`/`-n 5`/`--lines=5`/`--lines 5` all work; the count may
+/// carry a sign, see `textlib::countspec`), `-q`/`-v`, and the remaining positional arguments (the
+/// file list), defaulting to `default` lines. One single pass, building the file list as
+/// positionals are seen -- *not* `next` followed by a separate `operands` walk: `-n` takes a
+/// value, and `operands`'s own "skip options" pass never calls `value` to consume it, so it would
+/// see that value as a stray positional of its own. A flag written after a file name (`head
+/// file.txt -n 5`) is still recognized, the same as any other GNU program. `Err` is the exit
+/// status to return, already reported (or, for `--help`, already printed, exit `0`).
+pub fn count_args(
     prog: &str,
     usage: &str,
     flags: &[(&str, &str)],
     args: Args,
     default: usize,
-) -> Result<(usize, Vec<&'static str>), ExitCode> {
+) -> Result<CountArgs, ExitCode> {
     let mut opts = opts(args);
-    let mut count = default;
-    let mut paths = Vec::new();
+    let mut parsed = CountArgs {
+        mode: Mode::Lines,
+        sign: Sign::None,
+        count: default,
+        quiet: false,
+        verbose: false,
+        files: Vec::new(),
+    };
+    let mut chosen = false;
     while let Some(arg) = next(prog, &mut opts)? {
-        match arg {
+        let (mode, noun) = match arg {
             Arg::Long("help") => return Err(crate::help(usage, flags)),
-            Arg::Short('n') | Arg::Long("lines") => {
-                let text = value(prog, &mut opts)?;
-                let Ok(n) = text.parse() else {
-                    report(prog, &format!("invalid number of lines: '{text}'"));
-                    return Err(ExitCode(1));
-                };
-                count = n;
+            Arg::Short('n') | Arg::Long("lines") => (Mode::Lines, "lines"),
+            Arg::Short('c') | Arg::Long("bytes") => (Mode::Bytes, "bytes"),
+            Arg::Short('q') | Arg::Long("quiet" | "silent") => {
+                parsed.quiet = true;
+                continue;
             }
-            Arg::Positional(operand) => paths.push(operand),
+            Arg::Short('v') | Arg::Long("verbose") => {
+                parsed.verbose = true;
+                continue;
+            }
+            Arg::Positional(operand) => {
+                parsed.files.push(operand);
+                continue;
+            }
             other => return Err(invalid(prog, other)),
+        };
+        if chosen {
+            report(prog, "options '-n' and '-c' are mutually exclusive");
+            try_help(prog);
+            return Err(ExitCode(1));
         }
+        chosen = true;
+        let text = value(prog, &mut opts)?;
+        let Some((sign, count)) = countspec::parse(text) else {
+            report(prog, &format!("invalid number of {noun}: '{text}'"));
+            return Err(ExitCode(1));
+        };
+        (parsed.mode, parsed.sign, parsed.count) = (mode, sign, count);
     }
-    Ok((count, paths))
+    Ok(parsed)
 }
 
 /// Collapses a `Result` whose `Err` is also an exit status (what the `?`-using filters return

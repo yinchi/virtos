@@ -6,7 +6,10 @@
 #[cfg_attr(test, macro_use)]
 extern crate alloc;
 
+pub mod countspec;
 pub mod cutlist;
+pub mod headtail;
+pub mod human;
 pub mod sortkey;
 pub mod textutil;
 pub mod trset;

@@ -1,7 +1,8 @@
 //! `rm [-r] PATH...` -- removes each named file, or directory. Without `-r`/`-R`/`--recursive`, a
 //! non-empty directory is a reported error, not silently skipped or recursed into; with it, the
-//! directory and everything under it is removed. No `-f` (ignore missing operands) or
-//! `-i`/prompting yet -- later additions if ever needed.
+//! directory and everything under it is removed. `-f`/`--force` ignores an operand that does not
+//! exist (no report, no failing status) and a missing operand list; the `.`/`..`/`/` guard still
+//! applies. No `-i`/prompting.
 #![no_std]
 #![no_main]
 
@@ -12,11 +13,14 @@ use userlib::{ATTR_DIRECTORY, Args, DIRENT_SIZE, DirEnt, ExitCode, O_RDONLY};
 
 userlib::entry_with_args!(run);
 
-const USAGE: &str = "rm [-r] PATH...";
-const FLAGS: &[(&str, &str)] = &[(
-    "-r, -R, --recursive",
-    "remove directories and their contents",
-)];
+const USAGE: &str = "rm [-r] [-f] PATH...";
+const FLAGS: &[(&str, &str)] = &[
+    (
+        "-r, -R, --recursive",
+        "remove directories and their contents",
+    ),
+    ("-f, --force", "ignore nonexistent operands"),
+];
 
 /// Same buffer size as `ls.rs`'s/`chmod.rs`'s own batched-`getdents` idiom -- one memory page.
 const GETDENTS_BUF_SIZE: usize = 4096;
@@ -105,6 +109,7 @@ fn remove_recursive(path: &str) -> bool {
 
 fn run(args: Args) -> ExitCode {
     let mut recursive = false;
+    let mut force = false;
     let mut any = false;
     let mut opts = progs::cli::opts(args);
     loop {
@@ -116,9 +121,13 @@ fn run(args: Args) -> ExitCode {
         match arg {
             Arg::Long("help") => return progs::help(USAGE, FLAGS),
             Arg::Short('r') | Arg::Short('R') | Arg::Long("recursive") => recursive = true,
+            Arg::Short('f') | Arg::Long("force") => force = true,
             Arg::Positional(_) => any = true,
             other => return progs::cli::invalid("rm", other),
         }
+    }
+    if !any && force {
+        return ExitCode(0);
     }
     if !any {
         userlib::write(2, b"rm: missing operand\n");
@@ -132,6 +141,9 @@ fn run(args: Args) -> ExitCode {
             continue;
         }
         let result = match userlib::stat(path) {
+            // `-f`: an operand that cannot be examined is treated as nonexistent (this project's
+            // `stat` has no separate "no such file" error to tell the cases apart).
+            Err(_) if force => true,
             Err(_) => {
                 report(path);
                 false

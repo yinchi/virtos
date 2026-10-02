@@ -1,5 +1,6 @@
 **/target
-*.img
-*.elf
-/plans
+**/*.img
+**/*.img.bak
+**/*.elf
 /disks/system/**/bin
+/plans

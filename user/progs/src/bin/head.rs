@@ -1,53 +1,61 @@
-//! Prints the first N lines (`-n`/`--lines`, default 10) of each named file, in order. No
-//! operand, or a lone `-` as one, reads stdin (`progs::read_operand`'s own doc comment).
+//! `head [-q] [-v] [-n N | -c N] [file...]`: prints the first N lines (`-n`/`--lines`, default
+//! 10) or bytes (`-c`/`--bytes`) of each named file, in order. A negative count (`-n -5`) is
+//! everything but the last five. With several files each is preceded by a `==> name <==` header
+//! (`-q` for none, `-v` for one even with a single file). No operand, or a lone `-` as one, reads
+//! stdin (`progs::read_operand`'s own doc comment). The whole input is read first, then sliced
+//! (`textlib::headtail`).
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::format;
+use alloc::vec::Vec;
+use progs::{Out, cli};
+use textlib::headtail;
 use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
 
 const DEFAULT_LINES: usize = 10;
-const USAGE: &str = "head [-n N] [file...]";
-const FLAGS: &[(&str, &str)] = &[("-n N, --lines N", "print the first N lines (default 10)")];
-
-/// The first `n` lines of `data` -- up through and including the `n`th `\n`, or the whole slice if
-/// it has fewer than `n` newlines at all (matches a real `head`: a short file just prints whole).
-/// Empty if `n` is `0`.
-fn head_lines(data: &[u8], n: usize) -> &[u8] {
-    if n == 0 {
-        return &data[..0];
-    }
-    let mut seen = 0;
-    for (i, &b) in data.iter().enumerate() {
-        if b == b'\n' {
-            seen += 1;
-            if seen == n {
-                return &data[..=i];
-            }
-        }
-    }
-    data
-}
+const USAGE: &str = "head [-q] [-v] [-n N | -c N] [file...]";
+const FLAGS: &[(&str, &str)] = &[
+    (
+        "-n N, --lines N",
+        "print the first N lines (default 10); -n -N prints all but the last N",
+    ),
+    (
+        "-c N, --bytes N",
+        "print the first N bytes; -c -N prints all but the last N",
+    ),
+    ("-q", "never print headers giving file names"),
+    ("-v", "always print headers giving file names"),
+];
 
 fn run(args: Args) -> ExitCode {
-    let (n, mut paths) = match progs::cli::line_count("head", USAGE, FLAGS, args, DEFAULT_LINES) {
-        Ok(v) => v,
+    let mut o = match cli::count_args("head", USAGE, FLAGS, args, DEFAULT_LINES) {
+        Ok(o) => o,
         Err(status) => return status,
     };
-    if paths.is_empty() {
-        paths.push("-");
+    let show_names = o.verbose || (o.files.len() > 1 && !o.quiet);
+    if o.files.is_empty() {
+        o.files = Vec::from(["-"]);
     }
+    let mut out = Out::new();
     let mut ok = true;
-    for path in paths {
+    let mut printed = false;
+    for path in o.files {
         let Some(data) = progs::read_operand(path) else {
-            userlib::write(2, b"head: ");
-            userlib::write(2, path.as_bytes());
-            userlib::write(2, b": cannot open\n");
+            cli::report("head", &format!("{path}: cannot open"));
             ok = false;
             continue;
         };
-        userlib::write(1, head_lines(&data, n));
+        if show_names {
+            let name = if path == "-" { "standard input" } else { path };
+            out.put(format!("{}==> {name} <==\n", if printed { "\n" } else { "" }).as_bytes());
+        }
+        printed = true;
+        out.put(headtail::head(&data, o.mode, o.sign, o.count));
     }
     if ok { ExitCode(0) } else { ExitCode(1) }
 }
