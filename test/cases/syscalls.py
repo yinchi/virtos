@@ -124,4 +124,11 @@ def run(ctx):
         check(f"{what} is a segmentation fault", out.startswith("Segmentation fault (address "), True)
         check(f"...status 139", status, 139)
         check(f"...and the shell goes on", s.run("echo ok"), "ok\n")
+    # Not memory faults, but the program's own doing all the same: it ends, the machine does not.
+    for how, what, text, code in (("undef", "an undefined instruction", "Illegal instruction", 132),
+                                  ("brk", "a breakpoint instruction", "Trace/breakpoint trap", 133)):
+        out, status = s.status(f"/tests/fault {how}")
+        check(f"{what} ends the program", out.startswith(f"{text} (ESR_EL1 "), True)
+        check(f"...status {code}", status, code)
+        check("...and the shell goes on", s.run("echo ok"), "ok\n")
     check("without an argument it does nothing and exits 2", s.status("/tests/fault"), ("", 2))

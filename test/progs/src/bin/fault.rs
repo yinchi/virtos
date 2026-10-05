@@ -1,5 +1,5 @@
 //! Faults on purpose, the way its first argument says: `null` writes to address 0, `jump` runs
-//! code at address 0, `kernel` reads kernel memory, `below` reads the byte just under the program's own memory.
+//! code at address 0, `undef` runs an undefined instruction, `brk` a breakpoint instruction, `kernel` reads kernel memory, `below` reads the byte just under the program's own memory.
 //! The kernel is expected to report a segmentation fault and give the shell status 139, and to
 //! run the next command as if nothing had happened.
 #![no_std]
@@ -14,6 +14,8 @@ fn run(mut args: Args) -> ExitCode {
     match args.nth(1) {
         Some("null") => unsafe { write_volatile(core::ptr::null_mut::<u8>(), 1) },
         Some("jump") => unsafe { core::arch::asm!("br {0}", in(reg) 0usize, options(noreturn)) },
+        Some("undef") => unsafe { core::arch::asm!("udf #0", options(noreturn)) },
+        Some("brk") => unsafe { core::arch::asm!("brk #0") },
         Some("kernel") => {
             let _ = unsafe { read_volatile(0x4000_0000 as *const u8) };
         }

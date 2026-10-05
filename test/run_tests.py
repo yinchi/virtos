@@ -121,7 +121,7 @@ def run_once(module, args):
                 module.verify_disk(ctx)
             for name, img in (("system", system_img), ("home", home_img), *[(f"extra{i}", p) for i, p in enumerate(extra_imgs)]):
                 if img:
-                    fsck = subprocess.run(["fsck.fat", "-n", img], capture_output=True, text=True)
+                    fsck = subprocess.run(["fsck.fat", "-n", img], capture_output=True, text=True, stdin=subprocess.DEVNULL)
                     check(f"fsck.fat -n is clean on the {name} image",
                           0 if fsck.returncode == 0 else (fsck.returncode, fsck.stdout + fsck.stderr), 0)
         except Exception:

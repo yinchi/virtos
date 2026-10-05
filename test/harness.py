@@ -70,7 +70,7 @@ class Session:
              "-monitor", f"unix:{self.sock_path},server,nowait",
              "-device", "virtio-gpu-device", "-device", "virtio-keyboard-device",
              *drives, "-kernel", elf],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self.sock = socket.socket(socket.AF_UNIX)
         deadline = time.time() + TIMEOUT
         while True:
@@ -194,21 +194,24 @@ class Session:
 
 # ------------------------------------------------------------------------ disk fixtures
 # Edits to a group's own private copy of an image, made with mtools before QEMU boots (or after
-# it has quit): never to an image QEMU has open.
+# it has quit): never to an image QEMU has open. Every call has no stdin and a session of its own
+# (no controlling terminal): mtools asks on /dev/tty, not stdin, what to do about a name that
+# exists already (`mmd` of an existing directory), and a suite run from a terminal then waits
+# forever for an answer.
 
 def _mtools(*args):
-    subprocess.run(args, check=True, capture_output=True)
+    subprocess.run(args, check=True, capture_output=True, stdin=subprocess.DEVNULL, start_new_session=True)
 
 
 def put_file(img, path, content):
     """Puts `content` (str or bytes) at `path` on `img`, creating parent directories; `None`
     removes the file."""
     if content is None:
-        subprocess.run(["mdel", "-i", img, f"::{path}"], capture_output=True)  # absent is fine
+        subprocess.run(["mdel", "-i", img, f"::{path}"], capture_output=True, stdin=subprocess.DEVNULL, start_new_session=True)  # absent is fine
         return
     parts = path.strip("/").split("/")
     for i in range(1, len(parts)):
-        subprocess.run(["mmd", "-i", img, "::" + "/".join(parts[:i])], capture_output=True)  # exists is fine
+        subprocess.run(["mmd", "-i", img, "::" + "/".join(parts[:i])], capture_output=True, stdin=subprocess.DEVNULL, start_new_session=True)  # exists is fine
     local = img + ".stage"
     with open(local, "wb") as f:
         f.write(content.encode() if isinstance(content, str) else content)
@@ -218,7 +221,7 @@ def put_file(img, path, content):
 
 def get_file(img, path):
     """The bytes of `path` on `img`, or None if it is not there."""
-    r = subprocess.run(["mcopy", "-i", img, f"::{path}", "-"], capture_output=True)
+    r = subprocess.run(["mcopy", "-i", img, f"::{path}", "-"], capture_output=True, stdin=subprocess.DEVNULL, start_new_session=True)
     return r.stdout if r.returncode == 0 else None
 
 
@@ -237,7 +240,7 @@ def make_home_image(mkimage, path, workdir, files, label="HOME", volume_id="5e6f
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "wb") as f:
             f.write(content.encode() if isinstance(content, str) else content)
-    subprocess.run([mkimage, path, "64M", label, volume_id, seed], check=True, capture_output=True)
+    subprocess.run([mkimage, path, "64M", label, volume_id, seed], check=True, capture_output=True, stdin=subprocess.DEVNULL, start_new_session=True)
 
 
 class Context:

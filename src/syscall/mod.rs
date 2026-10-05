@@ -26,10 +26,31 @@ use abi::{
 const EC_SVC64: u8 = 0x15;
 const EC_IABT_LOWER: u8 = 0x20;
 const EC_DABT_LOWER: u8 = 0x24;
+// The rest the program itself can cause (see `signal_exit_code`).
+const EC_SP_ALIGN: u8 = 0x26;
+const EC_PC_ALIGN: u8 = 0x22;
+const EC_FP: u8 = 0x2c;
+const EC_BRK: u8 = 0x3c;
 
-/// The exit status a caught fault reports as its "`exit` code" -- `128 + SIGSEGV`, matching the
-/// reference lab's own convention (a real Unix exit status for a signal-killed process).
+/// The exit status a caught memory fault reports as its "`exit` code" -- `128 + SIGSEGV`,
+/// matching the reference lab's own convention (a real Unix exit status for a signal-killed
+/// process).
 const FAULT_EXIT_CODE: i32 = 139;
+
+/// What a synchronous exception from EL0 that is neither a syscall nor an abort is called, and the
+/// status that ends the program with: `128 +` the signal Unix would have killed it with. An
+/// instruction the CPU does not know (or a BRK, an alignment fault, a floating-point trap) is the
+/// program's own doing, so it ends that program, never the machine.
+fn signal_of(ec: u8) -> (&'static str, i32) {
+    match ec {
+        EC_PC_ALIGN | EC_SP_ALIGN => ("Bus error", 128 + 7),
+        EC_BRK => ("Trace/breakpoint trap", 128 + 5),
+        EC_FP => ("Floating point exception", 128 + 8),
+        // 0x00, "unknown reason", is what an undefined instruction reports; anything not named
+        // above is called the same.
+        _ => ("Illegal instruction", 128 + 4),
+    }
+}
 
 /// Mirrors `kernel_entry`'s stack layout exactly (`vectors.s`): `x0`-`x29`, then the `ELR_EL1`/
 /// `SPSR_EL1` pair, then `x30` (padded to keep the frame 16-byte aligned). `sync_el0_64` passes
@@ -111,13 +132,15 @@ extern "C" fn sync_el0_handler(regs: *mut TrapFrame) {
             unsafe { process::resume_kernel(FAULT_EXIT_CODE) }
         }
 
-        // Anything else (FP exceptions, alignment faults, ...) -- deliberately narrow decoding,
-        // not a general fault-handling framework. `8` is `sync_el0_64`'s own index into
-        // `unexpected_exception`'s vector-name table.
-        _ => unsafe { unexpected_exception(8) },
+        // Anything else a program can do to itself -- an undefined instruction, a BRK, an
+        // alignment or floating-point fault -- is reported and ends that program, like an abort.
+        // Deliberately narrow decoding, not a general fault-handling framework.
+        ec => {
+            let (name, code) = signal_of(ec);
+            let mut uart = crate::bare_metal::get_uart();
+            let _ = writeln!(uart, "{name} (ESR_EL1 {esr:?})");
+            // SAFETY: as in the `SYS_EXIT` arm above.
+            unsafe { process::resume_kernel(code) }
+        }
     }
-}
-
-unsafe extern "C" {
-    fn unexpected_exception(vector: usize) -> !;
 }
