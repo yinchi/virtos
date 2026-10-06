@@ -51,6 +51,16 @@ def run(ctx):
     check("cp does not keep the time", s.run("stat /tmp/cp1").split("\n")[3].startswith("Modify: 2021"), False)
     check("cp -p keeps it", s.run("cp -p /root/plainfile /tmp/cp2") + s.run("stat /tmp/cp2").split("\n")[3], "Modify: 2021-01-02 03:04:06 UTC")
 
+    # ------------------------------------------------------------ mv's flags across volumes
+    s.run("echo one > /tmp/xv")
+    s.run("echo two > /root/xv")
+    check("mv -n will not replace on the other volume", s.status("mv -n /tmp/xv /root/xv"), ("mv: not replacing '/root/xv'\n", 1))
+    check("mv -bv across volumes keeps the old file beside the new one",
+          s.run("mv -bv /tmp/xv /root/xv") + s.run("cat /root/xv /root/xv~"),
+          "renamed '/tmp/xv' -> '/root/xv' (backup: '/root/xv~')\none\ntwo\n")
+    check("...and the source is gone", s.run("ls /tmp/xv"), "ls: /tmp/xv: No such file or directory\n")
+    s.run("rm /root/xv /root/xv~")
+
     # ------------------------------------------------------------ mount points cannot be moved
     check("a mount point cannot be moved", s.run("mv /root /tmp/r"), "mv: cannot move '/root' to '/tmp/r': Device or resource busy\n")
     check("moving into a mount point is fine: it is the directory the volume's root is",

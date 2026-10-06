@@ -171,7 +171,7 @@ def run(ctx):
     s.run("mkdir /tmp/cd/ff")
     check("mv refuses to replace a directory with a file", s.run("mv /tmp/ff /tmp/cd"),
           "mv: cannot overwrite directory '/tmp/cd/ff' with non-directory\n")
-    check("mv a directory into itself is refused", s.run("mv /tmp/t1 /tmp/t1/b/x"), "mv: cannot move '/tmp/t1' to '/tmp/t1/b/x': Invalid argument\n")
+    check("mv a directory into itself is refused", s.run("mv /tmp/t1 /tmp/t1/b/x"), "mv: cannot move '/tmp/t1' to a subdirectory of itself, '/tmp/t1/b/x'\n")
     check("mv a file onto itself is refused", s.run("mv /tmp/ff /tmp/ff"), "mv: '/tmp/ff' and '/tmp/ff' are the same file\n")
     check("mv moves a directory with its contents", s.run("mv /tmp/t1 /tmp/t2") + s.run("ls /tmp/t2/b"), "c.txt\n")
 

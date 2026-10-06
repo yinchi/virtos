@@ -1,4 +1,4 @@
-"""`true`, `false`, `crash`, and the `-v`/`-n`/`-d` flags of `mkdir`, `rm` and `cp`."""
+"""`true`, `false`, `crash`, the `-v`/`-n`/`-d` flags of `mkdir`, `rm` and `cp`, and `mv`'s flags."""
 
 SYSTEM_FILES = {
     "data/tree/a.txt": "A\n",
@@ -74,3 +74,87 @@ def run(ctx):
     check("cp -rn merges, keeping what is there",
           s.run("cp -rn /data/tree /tmp/c2") + s.run("cat /tmp/c2/a.txt"), "mine\n")
     check("--no-clobber and --verbose are the long forms", s.run("cp --no-clobber --verbose /data/one /tmp/new"), "")
+
+    # ------------------------------------------------------------------ mv flags
+    def put(path, text="x"):
+        s.run(f"echo {text} > {path}")
+
+    s.run("mkdir /tmp/m")
+    put("/tmp/m/a", "new")
+    put("/tmp/m/b", "old")
+    check("mv -v says each move", s.run("mv -v /tmp/m/a /tmp/m/c"), "renamed '/tmp/m/a' -> '/tmp/m/c'\n")
+    s.run("mv /tmp/m/c /tmp/m/a")
+
+    # -n
+    check("mv -n will not replace a file", s.status("mv -n /tmp/m/a /tmp/m/b"), ("mv: not replacing '/tmp/m/b'\n", 1))
+    check("...and moves nothing", s.run("cat /tmp/m/a /tmp/m/b"), "new\nold\n")
+    check("mv -n moves to a name that is free", s.run("mv -n /tmp/m/a /tmp/m/free") + s.run("cat /tmp/m/free"), "new\n")
+    s.run("mv /tmp/m/free /tmp/m/a")
+    check("the last of -n and -f wins", s.run("mv -n -f /tmp/m/a /tmp/m/b") + s.run("cat /tmp/m/b"), "new\n")
+    put("/tmp/m/a", "new")
+    put("/tmp/m/b", "old")
+    check("...-f then -n", s.status("mv -f -n /tmp/m/a /tmp/m/b"), ("mv: not replacing '/tmp/m/b'\n", 1))
+    check("--no-clobber is -n", s.status("mv --no-clobber /tmp/m/a /tmp/m/b")[1], 1)
+
+    # -i (the answer comes from stdin)
+    check("mv -i asks, and y replaces", s.run("echo y | mv -i /tmp/m/a /tmp/m/b") + s.run("cat /tmp/m/b"),
+          "mv: overwrite '/tmp/m/b'? new\n")
+    put("/tmp/m/a", "newer")
+    check("anything but y declines (status 1, nothing moves)",
+          s.status("echo n | mv -i /tmp/m/a /tmp/m/b")[1], 1)
+    check("...", s.run("cat /tmp/m/a /tmp/m/b"), "newer\nnew\n")
+    check("mv -i says nothing when the target is free", s.run("mv -i /tmp/m/a /tmp/m/free") + s.run("cat /tmp/m/free"), "newer\n")
+    s.run("rm /tmp/m/free")
+    put("/tmp/m/a", "new")
+    put("/tmp/m/b", "old")
+
+    # -u
+    s.run("touch -d @1000000000 /tmp/m/old.txt")
+    s.run("touch -d @1500000000 /tmp/m/new.txt")
+    s.run("touch -d @1500000000 /tmp/m/same.txt")
+    check("mv -u skips a source that is older, silently and with status 0", s.status("mv -u /tmp/m/old.txt /tmp/m/new.txt"), ("", 0))
+    check("...both are still there", s.run("ls /tmp/m"), "a\nb\nnew.txt\nold.txt\nsame.txt\n")
+    check("mv -u skips one that is as old", s.status("mv -u /tmp/m/same.txt /tmp/m/new.txt"), ("", 0))
+    check("mv -u replaces an older target", s.run("mv -u /tmp/m/new.txt /tmp/m/old.txt") + s.run("ls /tmp/m"), "a\nb\nold.txt\nsame.txt\n")
+    check("mv -u moves to a free name", s.run("mv -u /tmp/m/same.txt /tmp/m/free") + s.run("ls /tmp/m"), "a\nb\nfree\nold.txt\n")
+    s.run("rm /tmp/m/free /tmp/m/old.txt")
+
+    # -b
+    check("mv -b keeps the replaced file as NAME~", s.run("mv -b /tmp/m/a /tmp/m/b") + s.run("cat /tmp/m/b /tmp/m/b~"), "new\nold\n")
+    put("/tmp/m/a", "n2")
+    check("mv -bv says so", s.run("mv -bv /tmp/m/a /tmp/m/b"), "renamed '/tmp/m/a' -> '/tmp/m/b' (backup: '/tmp/m/b~')\n")
+    check("...the older backup is replaced by the newer", s.run("cat /tmp/m/b /tmp/m/b~"), "n2\nnew\n")
+    put("/tmp/m/a", "n3")
+    check("mv -b to a free name makes no backup", s.run("mv -b /tmp/m/a /tmp/m/free") + s.run("ls /tmp/m"), "b\nb~\nfree\n")
+    s.run("rm /tmp/m/free /tmp/m/b~")
+
+    # -t and -T
+    s.run("mkdir /tmp/m/dir")
+    put("/tmp/m/p")
+    put("/tmp/m/q")
+    check("mv -t moves every operand into the directory", s.run("mv -t /tmp/m/dir /tmp/m/p /tmp/m/q") + s.run("ls /tmp/m/dir"), "p\nq\n")
+    check("mv --target-directory is -t", s.run("mv --target-directory=/tmp/m /tmp/m/dir/p") + s.run("ls /tmp/m"), "b\ndir\np\n")
+    check("mv -t needs a directory", s.status("mv -t /tmp/m/b /tmp/m/p"),
+          ("mv: target directory '/tmp/m/b': Not a directory\n", 1))
+    check("...that exists", s.status("mv -t /tmp/m/nodir /tmp/m/p"),
+          ("mv: target directory '/tmp/m/nodir': No such file or directory\n", 1))
+    check("mv -t with no source", s.run("mv -t /tmp/m/dir").startswith("mv: missing file operand\n"), True)
+    check("-t and -T together are refused", s.run("mv -t /tmp/m/dir -T /tmp/m/p").startswith(
+        "mv: cannot combine --target-directory (-t) and --no-target-directory (-T)\n"), True)
+    check("mv -T will not move into a directory", s.run("mv -T /tmp/m/p /tmp/m/dir"),
+          "mv: cannot overwrite directory '/tmp/m/dir' with non-directory\n")
+    check("mv -T renames to a free name", s.run("mv -T /tmp/m/p /tmp/m/p2") + s.run("ls /tmp/m"), "b\ndir\np2\n")
+    check("mv -T takes one source only", s.run("mv -T /tmp/m/p2 /tmp/m/b /tmp/m/x").startswith("mv: extra operand '/tmp/m/b'\n"), True)
+    check("a destination with a trailing slash must be a directory", s.run("mv /tmp/m/p2 /tmp/m/b/"),
+          "mv: cannot move '/tmp/m/p2' to '/tmp/m/b/': Not a directory\n")
+    check("...a directory's is fine", s.run("mv /tmp/m/p2 /tmp/m/dir/") + s.run("ls /tmp/m/dir"), "p2\nq\n")
+
+    # -u, -n and -v together, and a directory in the way whatever the flags
+    put("/tmp/m/k", "k")
+    check("mv -nuv: the target exists and is not older: not replaced", s.status("mv -nuv /tmp/m/k /tmp/m/b")[1], 1)
+    s.run("mkdir /tmp/m/dd")
+    check("a directory in the way is refused with -f (-T: else k would move into it)", s.run("mv -fT /tmp/m/k /tmp/m/dd"),
+          "mv: cannot overwrite directory '/tmp/m/dd' with non-directory\n")
+    check("...and with -b", s.run("mv -bT /tmp/m/k /tmp/m/dd") + s.run("ls /tmp/m"),
+          "mv: cannot overwrite directory '/tmp/m/dd' with non-directory\nb\ndd\ndir\nk\n")
+    check("a failing move with -b keeps the target in place", s.run("mv -b /tmp/m/nosuch /tmp/m/b").startswith("mv: cannot move"), True)
