@@ -34,11 +34,21 @@ pub struct Copier {
     pub prog: &'static str,
     /// Keep the executable and read-only bits, and the modify time.
     pub preserve: bool,
+    /// Leave a file that already exists at the destination alone, without a word (`cp -n`).
+    pub no_clobber: bool,
+    /// Say each copy made: `'src' -> 'dst'` (`cp -v`).
+    pub verbose: bool,
 }
 
 const BUF_SIZE: usize = 512;
 
 impl Copier {
+    fn announce(&self, src: &str, dst: &str) {
+        if self.verbose {
+            cli::say(&format!("'{src}' -> '{dst}'"));
+        }
+    }
+
     fn fail(&self, what: &str) -> Reported {
         cli::report(self.prog, what);
         Reported
@@ -77,6 +87,9 @@ impl Copier {
     /// first chunk is read before `dst` is opened -- and so truncated: a source that can't be read
     /// at all (a directory, say) must not destroy an existing destination first.
     pub fn file(&self, src: &str, dst: &str) -> Result<(), Reported> {
+        if self.no_clobber && stat(dst).is_ok() {
+            return Ok(());
+        }
         let input = open(src, O_RDONLY);
         if input < 0 {
             return Err(self.fail_errno(src, input));
@@ -123,7 +136,9 @@ impl Copier {
         if from.size != to.size {
             return Err(self.fail(&format!("{dst}: the copy is not the size of the original")));
         }
-        self.preserve_from(&from, dst)
+        self.preserve_from(&from, dst)?;
+        self.announce(src, dst);
+        Ok(())
     }
 
     /// Copies the directory `src` to `dst` and everything under it: `dst` is created if it
@@ -145,6 +160,7 @@ impl Copier {
                 }
             }
         }
+        self.announce(src, dst);
         let mut entries = read_dir(src).map_err(|e| self.fail_errno(src, e))?;
         entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         let mut result = Ok(());
@@ -166,26 +182,36 @@ impl Copier {
     }
 }
 
+/// Says a removal was made, for `rm -v` (`removed 'f'`, `removed directory 'd'`).
+pub fn removed(path: &str, is_dir: bool, verbose: bool) {
+    if verbose {
+        cli::say(&format!(
+            "removed {}'{path}'",
+            if is_dir { "directory " } else { "" }
+        ));
+    }
+}
+
 /// Removes the file or directory `path`, and everything under a directory: every entry is
 /// attempted even after a failure, a directory's own removal last. Reports each failure as
 /// `<prog>: cannot remove '<path>': <why>`.
-pub fn remove_tree(prog: &str, path: &str) -> Result<(), Reported> {
+pub fn remove_tree(prog: &str, path: &str, verbose: bool) -> Result<(), Reported> {
     let mut result = Ok(());
-    if let Ok(info) = stat(path)
-        && info.is_dir
-    {
+    let is_dir = matches!(stat(path), Ok(info) if info.is_dir);
+    if is_dir {
         match read_dir(path) {
             Ok(entries) => {
                 for ent in entries {
                     let child = join(path, &ent.name);
                     let removed = if ent.attrs & userlib::ATTR_DIRECTORY != 0 {
-                        remove_tree(prog, &child)
+                        remove_tree(prog, &child, verbose)
                     } else {
                         let r = unlink(&child);
                         if r < 0 {
                             cli::report_errno(prog, &format!("cannot remove '{child}'"), r);
                             Err(Reported)
                         } else {
+                            removed(&child, false, verbose);
                             Ok(())
                         }
                     };
@@ -206,6 +232,8 @@ pub fn remove_tree(prog: &str, path: &str) -> Result<(), Reported> {
         if r < 0 {
             cli::report_errno(prog, &format!("cannot remove '{path}'"), r);
             result = Err(Reported);
+        } else {
+            removed(path, is_dir, verbose);
         }
     }
     result

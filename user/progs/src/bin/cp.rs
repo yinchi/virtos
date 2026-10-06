@@ -6,7 +6,8 @@
 //! source: `dst` is created fresh, or merged into if it already names a directory. `-p` keeps each
 //! copy's modify time and a file's executable and read-only bits. Every copy's size is checked
 //! once it is closed. The copying itself is `progs::copy::Copier`, shared with `mv`'s copy across
-//! volumes. Stdin/stdout (`-`) is a later addition if ever needed.
+//! volumes. `-n` leaves a destination file that exists alone, silently; `-v` says each copy.
+//! Stdin/stdout (`-`) is a later addition if ever needed.
 #![no_std]
 #![no_main]
 
@@ -21,9 +22,14 @@ use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
 
-const USAGE: &str = "cp [-p] [-r] src... dst";
+const USAGE: &str = "cp [-p] [-r] [-n] [-v] src... dst";
 const FLAGS: &[(&str, &str)] = &[
     ("-r, -R, --recursive", "copy directories recursively"),
+    (
+        "-n, --no-clobber",
+        "do not overwrite an existing file (silently)",
+    ),
+    ("-v, --verbose", "say what is copied"),
     (
         "-p, --preserve",
         "keep modify times and the executable and read-only bits",
@@ -81,6 +87,8 @@ fn copy_operand(copier: &Copier, src: &str, dst: &str, dst_is_dir: bool, recursi
 fn run(args: Args) -> ExitCode {
     let mut recursive = false;
     let mut preserve = false;
+    let mut no_clobber = false;
+    let mut verbose = false;
     let mut count = 0usize;
     let mut first = None;
     let mut last = None;
@@ -95,6 +103,8 @@ fn run(args: Args) -> ExitCode {
             Arg::Long("help") => return progs::help(USAGE, FLAGS),
             Arg::Short('r') | Arg::Short('R') | Arg::Long("recursive") => recursive = true,
             Arg::Short('p') | Arg::Long("preserve") => preserve = true,
+            Arg::Short('n') | Arg::Long("no-clobber") => no_clobber = true,
+            Arg::Short('v') | Arg::Long("verbose") => verbose = true,
             Arg::Positional(operand) => {
                 count += 1;
                 first.get_or_insert(operand);
@@ -128,6 +138,8 @@ fn run(args: Args) -> ExitCode {
     let copier = Copier {
         prog: "cp",
         preserve,
+        no_clobber,
+        verbose,
     };
     let mut ok = true;
     for (i, src) in cli::operands(args).enumerate() {

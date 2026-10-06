@@ -42,6 +42,12 @@ pub fn report(prog: &str, msg: &str) {
     userlib::write(2, b"\n");
 }
 
+/// Prints `msg` and a newline to stdout (what `-v` says).
+pub fn say(msg: &str) {
+    userlib::write(1, msg.as_bytes());
+    userlib::write(1, b"\n");
+}
+
 /// `report` for a failed syscall: `<prog>: <what>: <what the errno means>`, `what` being the path
 /// or action that failed (`cat: /nosuch: No such file or directory`).
 pub fn report_errno(prog: &str, what: &str, errno: isize) {

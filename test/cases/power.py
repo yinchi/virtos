@@ -21,6 +21,14 @@ def run(ctx):
     check("files written before the reboot survive it", s.run("cat /root/before"), "survives\n")
     check("the clock is still real after a reboot", s.run("date -u +%Y", timeout=90).strip().isdigit(), True)
 
+    # ------------------------------------------------------ poweroff --reboot
+    s.start("poweroff --reboot")
+    s.wait_until(lambda t: t.count("Hello Uart!") >= 1, "the kernel to boot again")
+    s.wait_prompt()
+    check("poweroff --reboot restarts the machine too (a third boot banner)", s.log().count("Hello Uart!"), 3)
+    check("poweroff with a bad flag does neither", s.run("poweroff --nosuch").startswith("poweroff: "), True)
+    check("...and the shell is still there", s.run("echo up"), "up\n")
+
     # ---------------------------------------------------------------- poweroff
     s.start("poweroff")
     deadline = time.time() + 20

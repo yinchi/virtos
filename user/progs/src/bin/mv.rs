@@ -56,6 +56,8 @@ fn move_across(src: &str, target: &str) -> bool {
     let copier = Copier {
         prog: "mv",
         preserve: true,
+        no_clobber: false,
+        verbose: false,
     };
     let copied = if info.is_dir {
         copier.tree(src, &partial)
@@ -64,17 +66,17 @@ fn move_across(src: &str, target: &str) -> bool {
     };
     if copied.is_err() {
         // The source is untouched; take the half-made copy away again.
-        let _ = remove_tree("mv", &partial);
+        let _ = remove_tree("mv", &partial, false);
         return false;
     }
     let renamed = userlib::rename(&partial, target);
     if renamed < 0 {
-        let _ = remove_tree("mv", &partial);
+        let _ = remove_tree("mv", &partial, false);
         cli::report_errno("mv", &format!("cannot move '{src}' to '{target}'"), renamed);
         return false;
     }
     // The destination is complete: what is left is taking the source away.
-    if remove_tree("mv", src).is_err() {
+    if remove_tree("mv", src, false).is_err() {
         cli::report(
             "mv",
             &format!("'{target}' is complete, but '{src}' could not be removed entirely"),

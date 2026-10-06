@@ -1,7 +1,7 @@
 //! `mkdir [-p] DIR...` -- creates each named directory. `-p`/`--parents` creates missing parent
 //! components too, treating an already-existing directory -- at any level, including the final
 //! one -- as success rather than an error (GNU's own `-p` semantics); an existing *file* at any
-//! component is still an error.
+//! component is still an error. `-v`/`--verbose` says each directory it makes.
 #![no_std]
 #![no_main]
 
@@ -14,8 +14,11 @@ use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
 
-const USAGE: &str = "mkdir [-p] DIR...";
-const FLAGS: &[(&str, &str)] = &[("-p, --parents", "create missing parent directories too")];
+const USAGE: &str = "mkdir [-p] [-v] DIR...";
+const FLAGS: &[(&str, &str)] = &[
+    ("-p, --parents", "create missing parent directories too"),
+    ("-v, --verbose", "say each directory created"),
+];
 
 fn report(path: &str, errno: isize) {
     progs::cli::report_errno("mkdir", &format!("cannot create directory '{path}'"), errno);
@@ -25,13 +28,19 @@ fn report(path: &str, errno: isize) {
 /// of `dir` itself directly -- `stat`ing each first so an already-existing directory at any level
 /// is skipped rather than re-created (or reported as an error, the way a plain `mkdir` on an
 /// existing name always is).
-fn mkdir_one(dir: &str, parents: bool) -> bool {
+fn mkdir_one(dir: &str, parents: bool, verbose: bool) -> bool {
+    let created = |path: &str| {
+        if verbose {
+            progs::cli::say(&format!("mkdir: created directory '{path}'"));
+        }
+    };
     if !parents {
         let r = userlib::mkdir(dir);
         if r < 0 {
             report(dir, r);
             return false;
         }
+        created(dir);
         return true;
     }
     let mut prefix = String::new();
@@ -55,6 +64,7 @@ fn mkdir_one(dir: &str, parents: bool) -> bool {
                     report(&prefix, r);
                     return false;
                 }
+                created(&prefix);
             }
         }
     }
@@ -63,6 +73,7 @@ fn mkdir_one(dir: &str, parents: bool) -> bool {
 
 fn run(args: Args) -> ExitCode {
     let mut parents = false;
+    let mut verbose = false;
     let mut any = false;
     let mut opts = progs::cli::opts(args);
     loop {
@@ -74,6 +85,7 @@ fn run(args: Args) -> ExitCode {
         match arg {
             Arg::Long("help") => return progs::help(USAGE, FLAGS),
             Arg::Short('p') | Arg::Long("parents") => parents = true,
+            Arg::Short('v') | Arg::Long("verbose") => verbose = true,
             Arg::Positional(_) => any = true,
             other => return progs::cli::invalid("mkdir", other),
         }
@@ -84,7 +96,7 @@ fn run(args: Args) -> ExitCode {
     }
     let mut ok = true;
     for dir in progs::cli::operands(args) {
-        if !mkdir_one(dir, parents) {
+        if !mkdir_one(dir, parents, verbose) {
             ok = false;
         }
     }

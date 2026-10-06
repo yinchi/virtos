@@ -1,8 +1,9 @@
-//! `rm [-r] PATH...` -- removes each named file, or directory. Without `-r`/`-R`/`--recursive`, a
+//! `rm [-r] [-f] [-v] [-d] PATH...` -- removes each named file, or directory. Without `-r`/`-R`/`--recursive`, a
 //! non-empty directory is a reported error, not silently skipped or recursed into; with it, the
 //! directory and everything under it is removed. `-f`/`--force` ignores an operand that does not
 //! exist (no report, no failing status) and a missing operand list; the `.`/`..`/`/` guard still
-//! applies. No `-i`/prompting.
+//! applies. `-v` says each removal; `-d` removes an empty directory without `-r`. No
+//! `-i`/prompting.
 #![no_std]
 #![no_main]
 
@@ -14,13 +15,15 @@ use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
 
-const USAGE: &str = "rm [-r] [-f] PATH...";
+const USAGE: &str = "rm [-r] [-f] [-v] [-d] PATH...";
 const FLAGS: &[(&str, &str)] = &[
     (
         "-r, -R, --recursive",
         "remove directories and their contents",
     ),
     ("-f, --force", "ignore nonexistent operands"),
+    ("-d, --dir", "remove empty directories"),
+    ("-v, --verbose", "say each removal"),
 ];
 
 fn report(path: &str, errno: isize) {
@@ -57,6 +60,8 @@ fn refuse(path: &str, recursive: bool) -> bool {
 fn run(args: Args) -> ExitCode {
     let mut recursive = false;
     let mut force = false;
+    let mut verbose = false;
+    let mut empty_dirs = false;
     let mut any = false;
     let mut opts = progs::cli::opts(args);
     loop {
@@ -69,6 +74,8 @@ fn run(args: Args) -> ExitCode {
             Arg::Long("help") => return progs::help(USAGE, FLAGS),
             Arg::Short('r') | Arg::Short('R') | Arg::Long("recursive") => recursive = true,
             Arg::Short('f') | Arg::Long("force") => force = true,
+            Arg::Short('v') | Arg::Long("verbose") => verbose = true,
+            Arg::Short('d') | Arg::Long("dir") => empty_dirs = true,
             Arg::Positional(_) => any = true,
             other => return progs::cli::invalid("rm", other),
         }
@@ -96,7 +103,16 @@ fn run(args: Args) -> ExitCode {
             }
             Ok(info) if info.is_dir => {
                 if recursive {
-                    progs::copy::remove_tree("rm", path).is_ok()
+                    progs::copy::remove_tree("rm", path, verbose).is_ok()
+                } else if empty_dirs {
+                    // The kernel's `unlink` takes an empty directory and refuses a full one.
+                    let r = userlib::unlink(path);
+                    if r < 0 {
+                        report(path, r);
+                    } else {
+                        progs::copy::removed(path, true, verbose);
+                    }
+                    r >= 0
                 } else {
                     report(path, abi::errno::EISDIR);
                     false
@@ -106,6 +122,8 @@ fn run(args: Args) -> ExitCode {
                 let r = userlib::unlink(path);
                 if r < 0 {
                     report(path, r);
+                } else {
+                    progs::copy::removed(path, false, verbose);
                 }
                 r >= 0
             }
