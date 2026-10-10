@@ -11,7 +11,57 @@
 use aarch64_paging::descriptor::El1Attributes;
 
 use super::elfparse::{self, ElfError, PAGE_SIZE, PF_W, PF_X, Segment};
+use super::usermem::UserMemory;
 use crate::arch::mmu::{self, USER_BASE, USER_IMAGE_END};
+
+/// What is mapped in the user window right now, for a syscall to check a user pointer against.
+/// Written by `load`, `program_break` and `process::run_program` (the stack); read by syscalls.
+///
+/// SAFETY (every access): single core, and neither a load nor a syscall runs while the other does.
+static mut USER_MEMORY: UserMemory = UserMemory::new();
+
+/// The memory the running program has mapped (see `usermem`).
+#[allow(clippy::deref_addrof)]
+pub fn user_memory() -> &'static UserMemory {
+    // SAFETY: see USER_MEMORY.
+    unsafe { &*(&raw const USER_MEMORY) }
+}
+
+#[allow(clippy::deref_addrof)]
+fn user_memory_mut() -> &'static mut UserMemory {
+    // SAFETY: see USER_MEMORY.
+    unsafe { &mut *(&raw mut USER_MEMORY) }
+}
+
+/// Records `start..end` as mapped writable -- for the stack, which `process::run_program` maps
+/// itself.
+pub(super) fn note_writable(start: usize, end: usize) {
+    user_memory_mut().add(start, end, true);
+}
+
+/// The running program's heap: where it starts (the page-aligned end of its image, `.bss`
+/// included), the program break as it last set it (byte-exact), and the page-aligned end of what is
+/// mapped for it. Reset by every `load`.
+///
+/// SAFETY (every access, via `heap_break`): single core, and neither `load` nor a syscall runs
+/// while the other does.
+struct Break {
+    start: usize,
+    current: usize,
+    mapped_end: usize,
+}
+
+static mut BREAK: Break = Break {
+    start: 0,
+    current: 0,
+    mapped_end: 0,
+};
+
+#[allow(clippy::deref_addrof)]
+fn heap_break() -> &'static mut Break {
+    // SAFETY: see BREAK.
+    unsafe { &mut *(&raw mut BREAK) }
+}
 
 /// Rounds `vaddr..vaddr+memsz` out to whole pages, since permissions are per page (`elfparse`
 /// already refused any two segments that would need to share one).
@@ -92,6 +142,7 @@ pub fn load(elf_bytes: &[u8]) -> Result<usize, ElfError> {
     let _user = mmu::user_access();
 
     // 1. Nothing of the previous program stays mapped.
+    user_memory_mut().clear();
     mmu::set_user_pages(USER_BASE, USER_IMAGE_END, None).map_err(|_| ElfError::MapFailed)?;
 
     // 2. Each segment's pages, writable while they are filled: zeroed whole (a page is never left
@@ -115,10 +166,24 @@ pub fn load(elf_bytes: &[u8]) -> Result<usize, ElfError> {
         let (start, end) = pages(seg);
         mmu::set_user_pages(start, end, Some(final_attributes(seg.flags)))
             .map_err(|_| ElfError::MapFailed)?;
+        user_memory_mut().add(start, end, seg.flags & PF_W != 0);
         if seg.flags & PF_X != 0 {
             sync_instruction_cache(seg.vaddr, seg.vaddr + seg.memsz);
         }
     }
+
+    // The heap begins where the image ends; nothing of it is mapped until the program asks.
+    let image_end = parsed
+        .segments
+        .iter()
+        .map(|seg| pages(seg).1)
+        .max()
+        .unwrap_or(USER_BASE);
+    *heap_break() = Break {
+        start: image_end,
+        current: image_end,
+        mapped_end: image_end,
+    };
 
     // A broad TLB invalidate (every EL1&0 entry, not just this window's pages) rather than a
     // precise per-page one: this runs once per program load, not on any hot path, so simplicity --
@@ -129,4 +194,47 @@ pub fn load(elf_bytes: &[u8]) -> Result<usize, ElfError> {
     }
 
     Ok(parsed.entry)
+}
+
+/// `brk`: moves the program break to `request` and returns it -- or, if that cannot be done,
+/// returns it unchanged (`0`, or the current break, just asks). The heap can neither go below where
+/// it starts nor up into the stack's guard (`USER_IMAGE_END`). Growing maps and zeroes the new pages
+/// (writable, never executable, like the stack); shrinking unmaps the pages above the new break and
+/// zeroes the rest of the page it lands in, so memory grown again is always zero.
+///
+/// A program's whole image area is unmapped at the start of the next `load`, so nothing here has to
+/// outlive the program that grew it.
+pub fn program_break(request: usize) -> usize {
+    let brk = heap_break();
+    if request == 0 || request == brk.current {
+        return brk.current;
+    }
+    if request < brk.start || request > USER_IMAGE_END {
+        return brk.current;
+    }
+    let want_end = (request + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    // The kernel zeroes user pages below, which PAN would otherwise forbid.
+    let _user = mmu::user_access();
+
+    if want_end > brk.mapped_end {
+        if mmu::set_user_pages(brk.mapped_end, want_end, Some(data_attributes())).is_err() {
+            return brk.current;
+        }
+        // SAFETY: just mapped writable; nothing else uses them.
+        unsafe { core::ptr::write_bytes(brk.mapped_end as *mut u8, 0, want_end - brk.mapped_end) };
+        user_memory_mut().add(brk.mapped_end, want_end, true);
+    } else if want_end < brk.mapped_end {
+        if mmu::set_user_pages(want_end, brk.mapped_end, None).is_err() {
+            // Leaves the pages mapped; the next load unmaps the whole image area anyway.
+            return brk.current;
+        }
+        user_memory_mut().remove(want_end, brk.mapped_end);
+        // SAFETY: the page `request` lands in is still mapped writable.
+        unsafe { core::ptr::write_bytes(request as *mut u8, 0, want_end - request) };
+        // SAFETY: barriers and a TLB invalidate, no memory effects.
+        unsafe { core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
+    }
+    brk.mapped_end = want_end;
+    brk.current = request;
+    request
 }

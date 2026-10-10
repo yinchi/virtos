@@ -5,6 +5,7 @@
 // Pure logic, no hardware dependency: builds and runs under both targets, like `fs::sector`.
 pub mod argplan;
 pub mod elfparse;
+pub mod usermem;
 
 // Hardware-only: touches the page table / system registers, or exists only to serve code that
 // does -- see `fs/mod.rs` for the same split applied to the filesystem.

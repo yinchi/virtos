@@ -113,15 +113,13 @@ pub const UTIME_OMIT: i64 = 0x3fff_fffe;
 pub const LINUX_REBOOT_CMD_RESTART: u32 = 0x0123_4567;
 pub const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321_FEDC;
 
-/// The fixed userspace heap's lowest address, and its size. No `brk` syscall exists to discover
-/// this at runtime (`plans/USERSPACE_PLAN.md`'s divergence #6: a fixed heap needs no syscall
-/// support, only a `brk`-style *growable* one would) -- the kernel (which maps this range before
-/// entering a program) and `userlib` (which hands it straight to a global allocator) each need
-/// their own copy of the same two numbers, so this is where that copy lives. Sized generously for
-/// an ordinary utility program; see `arch::mmu`'s own layout for where this sits relative to the
-/// image, guard and stack (a compile-time assertion there keeps the two in sync).
-pub const USER_HEAP_BOTTOM: usize = 0x45DF_0000;
-pub const USER_HEAP_SIZE: usize = 0x0010_0000; // 1 MiB
+/// `brk(addr)`: moves the program break -- the end of the heap, which starts at the page-aligned
+/// end of the program's image -- to `addr` and returns the resulting break. Linux's number *and*
+/// convention: it returns the break, not an errno, and a request it cannot grant (below where the
+/// heap starts, or past the stack's guard) returns the old break unchanged; `brk(0)` asks where it
+/// is. Growing maps zeroed pages, shrinking unmaps them (and zeroes the rest of the page the new
+/// break lands in), so memory grown again always reads as zero.
+pub const SYS_BRK: usize = 214;
 
 #[cfg(test)]
 mod tests {
@@ -133,6 +131,7 @@ mod tests {
     #[test]
     fn values_match_what_fd_rs_and_io_rs_assume() {
         assert_eq!(SYS_CHMOD, 53);
+        assert_eq!(SYS_BRK, 214);
         assert_eq!(SYS_UTIMENSAT, 88);
         assert_eq!((SYS_MOUNT, SYS_UMOUNT2, SYS_BLKINFO), (40, 39, 1001));
         assert_eq!(

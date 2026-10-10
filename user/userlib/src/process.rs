@@ -82,7 +82,6 @@ macro_rules! entry {
     ($run:path) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn main() -> ! {
-            $crate::init_heap();
             $crate::terminate($run())
         }
     };
@@ -150,7 +149,6 @@ macro_rules! entry_with_args {
         // API that could be handed an arbitrary pointer.
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
-            $crate::init_heap();
             // SAFETY: `_start` (start.s) forwards these straight from the kernel's `eret`,
             // upholding `args`'s contract by construction.
             $crate::terminate($run(unsafe { $crate::args(argc, argv) }))
@@ -213,7 +211,6 @@ macro_rules! entry_with_env {
         #[unsafe(no_mangle)]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn main(argc: usize, argv: *const *const u8, envp: *const *const u8) -> ! {
-            $crate::init_heap();
             // SAFETY: as in `entry_with_args!`, both `args` and `env`'s contracts hold by
             // construction for whatever `_start` forwards straight from the kernel's `eret`.
             $crate::terminate($run(unsafe { $crate::args(argc, argv) }, unsafe {

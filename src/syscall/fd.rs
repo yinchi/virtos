@@ -30,6 +30,7 @@ use crate::arch::mmu::{self, USER_BASE, USER_STACK_TOP};
 use crate::console;
 use crate::console::utf8::Utf8Decoder;
 use crate::drivers::virtio::gpu;
+use crate::exec::elf;
 use crate::fs;
 use crate::fs::blkio::BlkIo;
 use crate::fs::errno::from_fat;
@@ -259,14 +260,17 @@ impl FileDescriptor {
     }
 }
 
-/// Bounds-checks `ptr`/`len` against the user window before trusting them: the MMU's `USER`
-/// attribute bit gates *EL0's* access, not EL1's, so a buggy or malicious pointer aimed at kernel
-/// memory is otherwise still readable/writable by the kernel and must be rejected in software.
+/// Checks `ptr`/`len` before the kernel touches them: the whole range must lie in the user window
+/// *and* in memory the running program actually has mapped (writable too, if the kernel is about to
+/// write there). The MMU's `USER` attribute gates *EL0's* access, not EL1's, so a pointer aimed at
+/// kernel memory would otherwise be readable by the kernel; and with the MMU on, the kernel faults
+/// too on an unmapped page (the gap after the image, the stack's guard, heap above the break) or a
+/// write to a read-only one (the program's own code) -- a data abort in the kernel, not a refusal.
 /// `len == 0` is always valid regardless of `ptr`: a zero-length access touches no memory, and
 /// Rust's own empty `&str`/`&[u8]` values carry a dangling sentinel pointer by convention (e.g.
 /// `""`'s), not a real address inside the user window at all -- an empty path (`ls`'s own "use the
 /// working directory" default) would otherwise fail this check before ever reaching `fs::cwd`.
-fn validate(ptr: usize, len: usize) -> bool {
+fn validate(ptr: usize, len: usize, write: bool) -> bool {
     if len == 0 {
         // Still reject a literal null: `core::slice::from_raw_parts` requires a non-null pointer
         // even for a zero-length slice, unlike the dangling-but-non-null one Rust's own empty
@@ -276,11 +280,11 @@ fn validate(ptr: usize, len: usize) -> bool {
     let Some(end) = ptr.checked_add(len) else {
         return false;
     };
-    ptr >= USER_BASE && end <= USER_STACK_TOP
+    ptr >= USER_BASE && end <= USER_STACK_TOP && elf::user_memory().allows(ptr, len, write)
 }
 
 pub fn write(fd: usize, ptr: usize, len: usize) -> isize {
-    if !validate(ptr, len) {
+    if !validate(ptr, len, false) {
         return EFAULT;
     }
     // The read below touches a page marked USER, which PAN would otherwise forbid.
@@ -295,7 +299,7 @@ pub fn write(fd: usize, ptr: usize, len: usize) -> isize {
 }
 
 pub fn read(fd: usize, ptr: usize, len: usize) -> isize {
-    if !validate(ptr, len) {
+    if !validate(ptr, len, true) {
         return EFAULT;
     }
     // The write below touches a page marked USER, which PAN would otherwise forbid.
@@ -310,7 +314,7 @@ pub fn read(fd: usize, ptr: usize, len: usize) -> isize {
 
 /// `getdents` on `fd`, into the user-space buffer `ptr`/`len` -- see `FileDescriptor::getdents`.
 pub fn getdents(fd: usize, ptr: usize, len: usize) -> isize {
-    if !validate(ptr, len) {
+    if !validate(ptr, len, true) {
         return EFAULT;
     }
     // The write below touches a page marked USER, which PAN would otherwise forbid.
@@ -686,7 +690,7 @@ pub fn getcwd(ptr: usize, len: usize) -> isize {
 }
 
 fn getcwd_inner(ptr: usize, len: usize) -> Result<isize, isize> {
-    if !validate(ptr, len) {
+    if !validate(ptr, len, true) {
         return Err(EFAULT);
     }
     let _user = mmu::user_access();
@@ -715,7 +719,7 @@ pub fn stat(ptr: usize, len: usize, out_ptr: usize) -> isize {
 }
 
 fn stat_inner(ptr: usize, len: usize, out_ptr: usize) -> Result<isize, isize> {
-    if !validate(out_ptr, STAT_SIZE) {
+    if !validate(out_ptr, STAT_SIZE, true) {
         return Err(EFAULT);
     }
     let _user = mmu::user_access();
@@ -808,7 +812,7 @@ fn utimensat_inner(ptr: usize, len: usize, times_ptr: usize) -> Result<isize, is
     let mtime = if times_ptr == 0 {
         TimeChoice::Now
     } else {
-        if !validate(times_ptr, UTIMES_SIZE) {
+        if !validate(times_ptr, UTIMES_SIZE, false) {
             return Err(EFAULT);
         }
         // SAFETY: validated above to lie entirely within the user window.
@@ -854,7 +858,7 @@ fn open_on(dev: usize) -> bool {
 /// `EINVAL` for one that isn't UTF-8. The caller holds `mmu::user_access()` for as long as the
 /// returned view is used.
 fn user_str<'a>(ptr: usize, len: usize) -> Result<&'a str, isize> {
-    if !validate(ptr, len) {
+    if !validate(ptr, len, false) {
         return Err(EFAULT);
     }
     // SAFETY: validated above to lie entirely within the user window.
@@ -885,7 +889,7 @@ pub fn umount(ptr: usize, len: usize) -> isize {
 /// `blkinfo(index, out)`: see `abi::SYS_BLKINFO`. Writes `BLKINFO_SIZE` bytes to `out`, or
 /// `ENODEV` for an index past the last device, `EFAULT` for a bad `out`.
 pub fn blkinfo(index: usize, out_ptr: usize) -> isize {
-    if !validate(out_ptr, BLKINFO_SIZE) {
+    if !validate(out_ptr, BLKINFO_SIZE, true) {
         return EFAULT;
     }
     let Some(info) = fs::devices::blkinfo(index) else {

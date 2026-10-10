@@ -14,7 +14,7 @@ use super::argplan;
 use super::elf;
 use super::elfparse::ElfError;
 use crate::arch::irq;
-use crate::arch::mmu::{self, USER_HEAP_BOTTOM, USER_HEAP_TOP, USER_STACK_BOTTOM, USER_STACK_TOP};
+use crate::arch::mmu::{self, USER_STACK_BOTTOM, USER_STACK_TOP};
 
 /// The most stack a program's initial `argv` and `envp` together (strings plus pointer arrays)
 /// may take -- far more than a typed line and a sensible environment can ever produce, and an
@@ -174,9 +174,8 @@ fn lens(items: &[&str]) -> Vec<usize> {
 }
 
 /// Maps `start..end` read/write (never executable -- `elf::data_attributes`) and zeroes it. Used
-/// for both the stack and the fixed heap: neither gets a segment's "final, more restrictive" pass
-/// the way `elf::load`'s own mappings do, since both stay read/write for as long as the program
-/// runs.
+/// for the stack: it gets no segment-style "final, more restrictive" pass, since it stays
+/// read/write for as long as the program runs.
 fn map_and_zero(start: usize, end: usize) -> Result<(), ElfError> {
     mmu::set_user_pages(start, end, Some(elf::data_attributes()))
         .map_err(|_| ElfError::MapFailed)?;
@@ -216,14 +215,12 @@ pub fn run_program(
 
     let entry = elf::load(elf_bytes)?;
 
-    // The stack and the fixed heap, mapped and zeroed the same way a segment is while being
-    // filled -- see `elf::data_attributes`. Neither is locked down afterward the way a segment is:
-    // both are always read/write, never executable, for as long as the program runs. The heap has
-    // nothing in it yet (`userlib`'s allocator starts empty and only ever grows into it), but
-    // zeroing it anyway costs nothing and means a program can never read a previous program's
-    // leftover heap bytes if it somehow reads before writing.
+    // The stack, mapped and zeroed the same way a segment is while being filled -- see
+    // `elf::data_attributes`. Not locked down afterward the way a segment is: always read/write,
+    // never executable, for as long as the program runs. There is no heap to map: it starts empty
+    // and `brk` maps (and zeroes) pages as the program asks for them.
     map_and_zero(USER_STACK_BOTTOM, USER_STACK_TOP)?;
-    map_and_zero(USER_HEAP_BOTTOM, USER_HEAP_TOP)?;
+    elf::note_writable(USER_STACK_BOTTOM, USER_STACK_TOP);
 
     let (argv, envp) = {
         // The writes inside `push_strings` touch pages marked USER, which PAN would otherwise
