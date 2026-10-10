@@ -13,11 +13,11 @@ def run(ctx):
           "SIZE      LABEL   UUID       MOUNTPOINT\n67108864  SYSTEM  0000-0000  /\n67108864  HOME    5E6F-7A8B  /root\n")
     check("mount with no operands lists the mounts", s.run("mount"),
           "LABEL=SYSTEM on / type vfat\nLABEL=HOME on /root type vfat\n")
-    check("the root volume's own contents", s.run("ls /"), "README\netc\nroot\ntest\ntmp\nusr\n")
-    check("the HOME volume answers for /root", s.run("ls /root"), "dir\nhello.txt\n")
+    check("the root volume's own contents", s.run("ls -1 /"), "README\netc\nroot\ntest\ntmp\nusr\n")
+    check("the HOME volume answers for /root", s.run("ls -1 /root"), "dir\nhello.txt\n")
     check("...and reads work through the mount", s.run("cat /root/hello.txt /root/dir/inner.txt"), "from home\ninner\n")
     check("stat of the mount point is a directory", s.run("stat /root").split("\n")[1], "  Size: 0            Type: directory")
-    check("a mount point is not a file to remove", s.run("rm -r /root/dir") + s.run("ls /root"), "hello.txt\n")
+    check("a mount point is not a file to remove", s.run("rm -r /root/dir") + s.run("ls -1 /root"), "hello.txt\n")
 
     # ------------------------------------------------------------ busy
     check("umount is refused while the working directory is in the volume",
@@ -35,16 +35,16 @@ def run(ctx):
     check("umount works once nothing holds the volume", s.run("umount /root"), "")
     check("the mount is gone from the list", s.run("mount"), "LABEL=SYSTEM on / type vfat\n")
     check("...and lsblk shows no mount point", s.run("lsblk").endswith("64M   HOME    5E6F-7A8B\n"), True)
-    check("/root is the image's empty directory again", s.run("ls /root"), "")
-    check("mount by label", s.run("mount LABEL=HOME /root") + s.run("ls /root"),
+    check("/root is the image's empty directory again", s.run("ls -1 /root"), "")
+    check("mount by label", s.run("mount LABEL=HOME /root") + s.run("ls -1 /root"),
           "hello.txt\nlog\n")  # `log` is the file the busy umount's redirect created
     check("a mount already made cannot be repeated", s.run("mount LABEL=HOME /tmp"),
           "mount: LABEL=HOME on /tmp: Device or resource busy\n")
     s.run("cd /")
     s.run("umount /root")
     s.run("mkdir /mnt")
-    check("mount by UUID, at another directory", s.run("mount UUID=5E6F-7A8B /mnt") + s.run("ls /mnt"), "hello.txt\nlog\n")
-    check("a volume is mounted once: its old place is empty", s.run("ls /root"), "")
+    check("mount by UUID, at another directory", s.run("mount UUID=5E6F-7A8B /mnt") + s.run("ls -1 /mnt"), "hello.txt\nlog\n")
+    check("a volume is mounted once: its old place is empty", s.run("ls -1 /root"), "")
     check("mount lists the new place", s.run("mount"), "LABEL=SYSTEM on / type vfat\nLABEL=HOME on /mnt type vfat\n")
     s.run("umount /mnt")
 

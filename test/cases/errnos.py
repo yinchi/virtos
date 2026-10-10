@@ -45,7 +45,7 @@ def run(ctx):
     check("rename into a missing directory: ENOENT", s.run("mv /tmp/f /tmp/nodir/g"), f"mv: cannot move '/tmp/f' to '/tmp/nodir/g': {NOENT}\n")
     check("a directory over a file: EEXIST", s.run("mv /tmp/d /tmp/f"), "mv: cannot move '/tmp/d' to '/tmp/f': File exists\n")
     check("a directory into itself: EINVAL", s.run("mv /tmp/d /tmp/d/x"), "mv: cannot move '/tmp/d' to a subdirectory of itself, '/tmp/d/x'\n")
-    check("none of that changed anything", s.run("ls /tmp"), "d\nf\n")
+    check("none of that changed anything", s.run("ls -1 /tmp"), "d\nf\n")
 
     # ------------------------------------------------------------------ chmod, touch, cd
     check("chmod of nothing: ENOENT", s.run("chmod +x /data/nosuch"), f"chmod: cannot change permissions of '/data/nosuch': {NOENT}\n")

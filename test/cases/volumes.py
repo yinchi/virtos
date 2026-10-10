@@ -15,8 +15,8 @@ def run(ctx):
 
     # ------------------------------------------------------------ mv across volumes
     check("mv a file to the other volume", s.run("mv /tmp/onsys.txt /root/moved.txt") + s.run("cat /root/moved.txt"), "sys\n")
-    check("...the source is gone", s.run("ls /tmp/onsys.txt"), "ls: /tmp/onsys.txt: No such file or directory\n")
-    check("...and no temporary is left", s.run("ls -a /root"), "copied.txt\ninhome.txt\nmoved.txt\ntree\n")
+    check("...the source is gone", s.run("ls -1 /tmp/onsys.txt"), "ls: /tmp/onsys.txt: No such file or directory\n")
+    check("...and no temporary is left", s.run("ls -1 -a /root"), "copied.txt\ninhome.txt\nmoved.txt\ntree\n")
     s.run("echo old > /tmp/target")
     s.run("echo new > /root/src")
     check("mv replaces an existing file on the other volume", s.run("mv /root/src /tmp/target") + s.run("cat /tmp/target"), "new\n")
@@ -25,12 +25,12 @@ def run(ctx):
           "mv: cannot stat '/root/nosuch': No such file or directory\nkeep\n")
     check("mv a whole tree across volumes", s.run("mv /root/tree /tmp/tree2") + s.run("find /tmp/tree2"),
           "/tmp/tree2\n/tmp/tree2/a\n/tmp/tree2/sub\n/tmp/tree2/sub/b\n")
-    check("...the source tree is gone", s.run("ls /root/tree"), "ls: /root/tree: No such file or directory\n")
+    check("...the source tree is gone", s.run("ls -1 /root/tree"), "ls: /root/tree: No such file or directory\n")
     s.run("echo 1 > /root/x1")
     s.run("echo 2 > /root/y1")
     s.run("mkdir /tmp/into")
     check("mv several files into a directory on the other volume",
-          s.run("mv /root/x1 /root/y1 /tmp/into") + s.run("ls /tmp/into"), "x1\ny1\n")
+          s.run("mv /root/x1 /root/y1 /tmp/into") + s.run("ls -1 /tmp/into"), "x1\ny1\n")
     check("mv a directory into a directory on the other volume",
           s.run("mkdir /root/d") + s.run("echo q > /root/d/q") + s.run("mv /root/d /tmp/into") + s.run("cat /tmp/into/d/q"), "q\n")
     s.run("echo f > /root/f")
@@ -58,14 +58,14 @@ def run(ctx):
     check("mv -bv across volumes keeps the old file beside the new one",
           s.run("mv -bv /tmp/xv /root/xv") + s.run("cat /root/xv /root/xv~"),
           "renamed '/tmp/xv' -> '/root/xv' (backup: '/root/xv~')\none\ntwo\n")
-    check("...and the source is gone", s.run("ls /tmp/xv"), "ls: /tmp/xv: No such file or directory\n")
+    check("...and the source is gone", s.run("ls -1 /tmp/xv"), "ls: /tmp/xv: No such file or directory\n")
     s.run("rm /root/xv /root/xv~")
 
     # ------------------------------------------------------------ mount points cannot be moved
     check("a mount point cannot be moved", s.run("mv /root /tmp/r"), "mv: cannot move '/root' to '/tmp/r': Device or resource busy\n")
     check("moving into a mount point is fine: it is the directory the volume's root is",
           s.run("mv /tmp/cp1 /root") + s.run("cat /root/cp1"), "x\n")
-    check("the volume is intact", s.run("ls /root").split("\n")[:2], ["copied.txt", "cp1"])
+    check("the volume is intact", s.run("ls -1 /root").split("\n")[:2], ["copied.txt", "cp1"])
 
     # ------------------------------------------------------------ persistence
     s.run("echo persistent > /root/persist.txt")

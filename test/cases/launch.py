@@ -33,7 +33,7 @@ def run(ctx):
     s.run("cd /root")
     write_script(s, "/root/bin/ls", "echo shadowed ls")
     s.run("chmod +x /root/bin/ls")
-    check("an earlier PATH entry shadows a later one", s.run("ls /usr/bin | head -n 1"), "ls: too many arguments\n")
+    check("an earlier PATH entry shadows a later one", s.run("ls -1 /usr/bin | head -n 1"), "ls: too many arguments\n")
     check("...and the real one is still reachable by path", s.run("/usr/bin/ls /usr/bin | head -n 1"), "cat\n")
     s.run("rm /root/bin/ls")
 

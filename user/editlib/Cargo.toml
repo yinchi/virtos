@@ -13,9 +13,9 @@ edition = "2024"
 
 [dependencies]
 abi = { path = "../abi" }
-# The exact glyph widths the console renders with (the kernel's `console/font.rs` depends on it
-# too) -- so the editor's line wrapping agrees with what `CONSOLE_DRAW` puts on screen.
-unifont = "1.1.0"
+# Display widths (`textlib::width`, generated from the console's own font data) -- so the editor's
+# line wrapping agrees with what `CONSOLE_DRAW` puts on screen.
+textlib = { path = "../textlib" }
 
 [profile.dev]
 panic = "abort"

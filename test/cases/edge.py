@@ -34,14 +34,14 @@ def run(ctx):
 
     # ---------------------------------------------------------------- names
     check("lookups are case-insensitive", s.run("cat /DATA/LONG.TXT | head -n 1"), "line 1\n")
-    check("...and a name keeps its case as stored", s.run("ls /data").split("\n")[0], "MixedCase.TXT")
+    check("...and a name keeps its case as stored", s.run("ls -1 /data").split("\n")[0], "MixedCase.TXT")
     check("a mixed-case name is found in any case", s.run("cat /data/mixedcase.txt"), "mixed\n")
     check("a name with a blank, quoted", s.run("echo spaced > '/tmp/a b'") + s.run("cat '/tmp/a b'"), "spaced\n")
-    check("...and ls shows it", s.run("ls /tmp"), "a b\nlong2\n")
+    check("...and ls shows it", s.run("ls -1 /tmp"), "a b\nlong2\n")
     check("a name with a blank, escaped", s.run("cat /tmp/a\\ b"), "spaced\n")
     long_name = "a-rather-long-file-name-that-needs-a-long-entry.txt"
     check("a long name works", s.run(f"echo long > /tmp/{long_name}") + s.run(f"cat /tmp/{long_name}"), "long\n")
-    check("...and is listed whole", s.run("ls /tmp"), f"a b\n{long_name}\nlong2\n")
+    check("...and is listed whole", s.run("ls -1 /tmp"), f"a b\n{long_name}\nlong2\n")
     check("a name with dots and dashes", s.run("echo d > /tmp/x.y-z_1") + s.run("cat /tmp/x.y-z_1"), "d\n")
     check("two names differing only in case are the same file", s.run("echo one > /tmp/Same") + s.run("echo two > /tmp/SAME") + s.run("cat /tmp/same"), "two\n")
 

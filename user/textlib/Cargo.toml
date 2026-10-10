@@ -14,6 +14,11 @@ edition = "2024"
 # Calendar arithmetic only (`stamp`): no clock, no time-zone database.
 chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
 
+[build-dependencies]
+# The same font data the kernel's console renders with: `build.rs` reads which glyphs are wide
+# from it (see `src/width.rs`).
+unifont = "1.1.0"
+
 [profile.dev]
 panic = "abort"
 [profile.release]

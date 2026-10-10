@@ -44,7 +44,7 @@ def run(ctx):
     check("rm -d refuses a full one", s.run("rm -d /tmp/v1"), "rm: cannot remove '/tmp/v1': Directory not empty\n")
     check("rm without -d refuses a directory", s.run("mkdir /tmp/v3") + s.run("rm /tmp/v3"),
           "rm: cannot remove '/tmp/v3': Is a directory\n")
-    check("rm -d of a plain file works too", s.run("echo y > /tmp/f2") + s.run("rm -d /tmp/f2") + s.run("ls /tmp/f2"),
+    check("rm -d of a plain file works too", s.run("echo y > /tmp/f2") + s.run("rm -d /tmp/f2") + s.run("ls -1 /tmp/f2"),
           "ls: /tmp/f2: No such file or directory\n")
     check("rm -rv says each, contents before their directory",
           s.run("rm -rv /tmp/v1").splitlines(),
@@ -113,10 +113,10 @@ def run(ctx):
     s.run("touch -d @1500000000 /tmp/m/new.txt")
     s.run("touch -d @1500000000 /tmp/m/same.txt")
     check("mv -u skips a source that is older, silently and with status 0", s.status("mv -u /tmp/m/old.txt /tmp/m/new.txt"), ("", 0))
-    check("...both are still there", s.run("ls /tmp/m"), "a\nb\nnew.txt\nold.txt\nsame.txt\n")
+    check("...both are still there", s.run("ls -1 /tmp/m"), "a\nb\nnew.txt\nold.txt\nsame.txt\n")
     check("mv -u skips one that is as old", s.status("mv -u /tmp/m/same.txt /tmp/m/new.txt"), ("", 0))
-    check("mv -u replaces an older target", s.run("mv -u /tmp/m/new.txt /tmp/m/old.txt") + s.run("ls /tmp/m"), "a\nb\nold.txt\nsame.txt\n")
-    check("mv -u moves to a free name", s.run("mv -u /tmp/m/same.txt /tmp/m/free") + s.run("ls /tmp/m"), "a\nb\nfree\nold.txt\n")
+    check("mv -u replaces an older target", s.run("mv -u /tmp/m/new.txt /tmp/m/old.txt") + s.run("ls -1 /tmp/m"), "a\nb\nold.txt\nsame.txt\n")
+    check("mv -u moves to a free name", s.run("mv -u /tmp/m/same.txt /tmp/m/free") + s.run("ls -1 /tmp/m"), "a\nb\nfree\nold.txt\n")
     s.run("rm /tmp/m/free /tmp/m/old.txt")
 
     # -b
@@ -125,15 +125,15 @@ def run(ctx):
     check("mv -bv says so", s.run("mv -bv /tmp/m/a /tmp/m/b"), "renamed '/tmp/m/a' -> '/tmp/m/b' (backup: '/tmp/m/b~')\n")
     check("...the older backup is replaced by the newer", s.run("cat /tmp/m/b /tmp/m/b~"), "n2\nnew\n")
     put("/tmp/m/a", "n3")
-    check("mv -b to a free name makes no backup", s.run("mv -b /tmp/m/a /tmp/m/free") + s.run("ls /tmp/m"), "b\nb~\nfree\n")
+    check("mv -b to a free name makes no backup", s.run("mv -b /tmp/m/a /tmp/m/free") + s.run("ls -1 /tmp/m"), "b\nb~\nfree\n")
     s.run("rm /tmp/m/free /tmp/m/b~")
 
     # -t and -T
     s.run("mkdir /tmp/m/dir")
     put("/tmp/m/p")
     put("/tmp/m/q")
-    check("mv -t moves every operand into the directory", s.run("mv -t /tmp/m/dir /tmp/m/p /tmp/m/q") + s.run("ls /tmp/m/dir"), "p\nq\n")
-    check("mv --target-directory is -t", s.run("mv --target-directory=/tmp/m /tmp/m/dir/p") + s.run("ls /tmp/m"), "b\ndir\np\n")
+    check("mv -t moves every operand into the directory", s.run("mv -t /tmp/m/dir /tmp/m/p /tmp/m/q") + s.run("ls -1 /tmp/m/dir"), "p\nq\n")
+    check("mv --target-directory is -t", s.run("mv --target-directory=/tmp/m /tmp/m/dir/p") + s.run("ls -1 /tmp/m"), "b\ndir\np\n")
     check("mv -t needs a directory", s.status("mv -t /tmp/m/b /tmp/m/p"),
           ("mv: target directory '/tmp/m/b': Not a directory\n", 1))
     check("...that exists", s.status("mv -t /tmp/m/nodir /tmp/m/p"),
@@ -143,11 +143,11 @@ def run(ctx):
         "mv: cannot combine --target-directory (-t) and --no-target-directory (-T)\n"), True)
     check("mv -T will not move into a directory", s.run("mv -T /tmp/m/p /tmp/m/dir"),
           "mv: cannot overwrite directory '/tmp/m/dir' with non-directory\n")
-    check("mv -T renames to a free name", s.run("mv -T /tmp/m/p /tmp/m/p2") + s.run("ls /tmp/m"), "b\ndir\np2\n")
+    check("mv -T renames to a free name", s.run("mv -T /tmp/m/p /tmp/m/p2") + s.run("ls -1 /tmp/m"), "b\ndir\np2\n")
     check("mv -T takes one source only", s.run("mv -T /tmp/m/p2 /tmp/m/b /tmp/m/x").startswith("mv: extra operand '/tmp/m/b'\n"), True)
     check("a destination with a trailing slash must be a directory", s.run("mv /tmp/m/p2 /tmp/m/b/"),
           "mv: cannot move '/tmp/m/p2' to '/tmp/m/b/': Not a directory\n")
-    check("...a directory's is fine", s.run("mv /tmp/m/p2 /tmp/m/dir/") + s.run("ls /tmp/m/dir"), "p2\nq\n")
+    check("...a directory's is fine", s.run("mv /tmp/m/p2 /tmp/m/dir/") + s.run("ls -1 /tmp/m/dir"), "p2\nq\n")
 
     # -u, -n and -v together, and a directory in the way whatever the flags
     put("/tmp/m/k", "k")
@@ -155,6 +155,6 @@ def run(ctx):
     s.run("mkdir /tmp/m/dd")
     check("a directory in the way is refused with -f (-T: else k would move into it)", s.run("mv -fT /tmp/m/k /tmp/m/dd"),
           "mv: cannot overwrite directory '/tmp/m/dd' with non-directory\n")
-    check("...and with -b", s.run("mv -bT /tmp/m/k /tmp/m/dd") + s.run("ls /tmp/m"),
+    check("...and with -b", s.run("mv -bT /tmp/m/k /tmp/m/dd") + s.run("ls -1 /tmp/m"),
           "mv: cannot overwrite directory '/tmp/m/dd' with non-directory\nb\ndd\ndir\nk\n")
     check("a failing move with -b keeps the target in place", s.run("mv -b /tmp/m/nosuch /tmp/m/b").startswith("mv: cannot move"), True)

@@ -48,7 +48,7 @@ def run(ctx):
         out = run(f"{tz}stat {path}").split("\n")
         return [l for l in out if l.startswith(label)][0]
 
-    check("touch creates a file", run("touch /tmp/t1") + run("ls /tmp"), "t1\n")
+    check("touch creates a file", run("touch /tmp/t1") + run("ls -1 /tmp"), "t1\n")
     check("...empty", run("stat /tmp/t1").split("\n")[1], "  Size: 0            Type: regular file")
     year = run("date -u +%Y").strip()
     check("a new file is stamped with the clock (now, not 1980)", stat_line("/tmp/t1", "Create").startswith(f"Create: {year}"), True)
@@ -63,7 +63,7 @@ def run(ctx):
     check("touch -d @N", stat_line("/tmp/t1", "Modify"), "Modify: 2001-09-09 01:46:40 UTC")
     run("touch -r /tmp/t1 /tmp/t2")
     check("touch -r copies a time (and creates the file)", stat_line("/tmp/t2", "Modify"), "Modify: 2001-09-09 01:46:40 UTC")
-    check("touch -c does not create", run("touch -c /tmp/t3") + run("ls /tmp"), "t1\nt2\n")
+    check("touch -c does not create", run("touch -c /tmp/t3") + run("ls -1 /tmp"), "t1\nt2\n")
     run("touch -c /tmp/t1")
     check("touch -c on an existing file touches it", stat_line("/tmp/t1", "Modify").startswith(f"Modify: {year}"), True)
     check("an odd second is dropped (FAT keeps two-second steps)", run("touch -d @1000000001 /tmp/t1") + stat_line("/tmp/t1", "Modify"), "Modify: 2001-09-09 01:46:40 UTC")

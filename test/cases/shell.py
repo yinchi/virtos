@@ -97,7 +97,7 @@ def run(ctx):
     check("a stage's own redirect beats the pipe", s.run("echo x > /tmp/p1 | wc -c"), "0\n")
     check("an unknown first stage still lets the next run", s.run("nosuchcmd | wc -c"),
           "nosuchcmd: command not found\n0\n")
-    check("pipelines leave no temporary files behind", s.run("ls -a /tmp").count(".pipe"), 0)
+    check("pipelines leave no temporary files behind", s.run("ls -1 -a /tmp").count(".pipe"), 0)
 
     # ---------------------------------------------------------------- syntax errors
     check("a redirection with no target", s.run("echo >"), "no file name after '>'\n")

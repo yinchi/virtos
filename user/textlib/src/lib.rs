@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod catshow;
+pub mod columns;
 pub mod countspec;
 pub mod cutlist;
 pub mod escape;
@@ -20,3 +21,4 @@ pub mod table;
 pub mod textutil;
 pub mod trset;
 pub mod wccount;
+pub mod width;

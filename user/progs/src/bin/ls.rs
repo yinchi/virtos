@@ -1,5 +1,5 @@
-//! `ls [-1] [-a] [-d] [-F] [-h] [-l] [-R] [-r] [-S] [-t] [FILE...]`: lists the names in each named
-//! directory, one per line (`-1` is accepted and changes nothing), **sorted by name** bytewise
+//! `ls [-1] [-C] [-x] [-a] [-d] [-F] [-h] [-l] [-R] [-r] [-S] [-t] [FILE...]`: lists the names in
+//! each named directory, **sorted by name** bytewise
 //! (the C locale's order: `Mid` before `alpha`). No operand lists the working directory. A file
 //! operand is listed as itself (files first, then each directory in name order); `-d` lists a
 //! directory operand itself instead of its contents. `-R` recurses (`dir:` headers). `-r`
@@ -9,6 +9,12 @@
 //! `.`/`..` themselves are never shown -- the kernel never returns them. `-l` shows, ahead of each
 //! name, the `d`/`w`/`x` attribute triple and the size, no owner and no link count (FAT has
 //! neither), and with `-h` the size reads `1.5K`, rounded up like GNU's.
+//!
+//! The layout follows the output, as GNU's does: on the terminal the names are filled into
+//! columns to the console's width (down the columns first; `-x` across the rows first), each
+//! column as wide as its widest name, widths measured in screen columns so wide glyphs line up;
+//! redirected or piped, one name per line. `-C`/`-x` force columns (80 wide when stdout is not a
+//! terminal), `-1` and `-l` force one per line; the last of `-1`/`-C`/`-x` wins.
 #![no_std]
 #![no_main]
 
@@ -20,17 +26,18 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use getargs::Arg;
 use progs::{Out, cli, join, read_dir};
+use textlib::columns::{self, Fill};
 use textlib::human::human_size;
-use userlib::{ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, Args, ExitCode, Stat, stat};
+use textlib::width::text_width;
+use userlib::{ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, Args, ExitCode, Stat, stat, winsize};
 
 userlib::entry_with_args!(run);
 
-const USAGE: &str = "ls [-1] [-a] [-d] [-F] [-h] [-l] [-R] [-r] [-S] [-t] [FILE...]";
+const USAGE: &str = "ls [-1] [-C] [-x] [-a] [-d] [-F] [-h] [-l] [-R] [-r] [-S] [-t] [FILE...]";
 const FLAGS: &[(&str, &str)] = &[
-    (
-        "-1",
-        "one entry per line (always the case; accepted for compatibility)",
-    ),
+    ("-1", "one entry per line (the default when not a terminal)"),
+    ("-C", "list in columns, down the columns first"),
+    ("-x", "list in columns, across the rows first"),
     ("-a, --all", "show names starting with '.' too"),
     (
         "-d, --directory",
@@ -59,6 +66,17 @@ struct Options {
     reverse: bool,
     by_size: bool,
     by_time: bool,
+    /// How names are arranged when not `-l`: `Some((fill, width))` for columns, `None` for one
+    /// per line. Decided once, from the flags and whether stdout is a terminal.
+    grid: Option<(Fill, usize)>,
+}
+
+/// What `-1`/`-C`/`-x` asked for, the last one winning; `Auto` is "columns on a terminal".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    Auto,
+    One,
+    Columns(Fill),
 }
 
 /// One line of a listing.
@@ -121,12 +139,34 @@ fn print(out: &mut Out, item: &Item, o: &Options) {
             let _ = write!(out, "{type_c}{w_c}{x_c} {:>10} ", item.size);
         }
     }
-    let suffix = match (o.classify, item.attrs) {
+    let _ = writeln!(out, "{}{}", item.name, suffix(item, o));
+}
+
+/// `-F`'s mark for `item`: `/` for a directory, `*` for an executable, nothing otherwise.
+fn suffix(item: &Item, o: &Options) -> &'static str {
+    match (o.classify, item.attrs) {
         (true, a) if a & ATTR_DIRECTORY != 0 => "/",
         (true, a) if a & ATTR_EXEC != 0 => "*",
         _ => "",
+    }
+}
+
+/// Writes `items` -- one per line (`-l`, `-1`, or not a terminal), or filled into columns.
+fn print_all(out: &mut Out, items: &[Item], o: &Options) {
+    let Some((fill, width)) = o.grid.filter(|_| !o.long) else {
+        for item in items {
+            print(out, item, o);
+        }
+        return;
     };
-    let _ = writeln!(out, "{}{suffix}", item.name);
+    let names: Vec<String> = items
+        .iter()
+        .map(|item| alloc::format!("{}{}", item.name, suffix(item, o)))
+        .collect();
+    let widths: Vec<usize> = names.iter().map(|n| text_width(n)).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let grid = columns::plan(&widths, width, fill);
+    out.put(columns::render(&refs, &widths, &grid).as_bytes());
 }
 
 /// Lists the contents of the directory `path`, and with `-R` each subdirectory after it. `false`
@@ -157,9 +197,7 @@ fn list_dir(out: &mut Out, path: &str, o: &Options) -> bool {
         }
     }
     sort(&mut items, o);
-    for item in &items {
-        print(out, item, o);
-    }
+    print_all(out, &items, o);
 
     let mut ok = true;
     if o.recursive {
@@ -179,6 +217,7 @@ fn run(args: Args) -> ExitCode {
 
 fn list(args: Args) -> Result<ExitCode, ExitCode> {
     let mut o = Options::default();
+    let mut layout = Layout::Auto;
     let mut n_operands = 0usize;
     let mut opts = cli::opts(args);
     while let Some(arg) = cli::next("ls", &mut opts)? {
@@ -193,13 +232,21 @@ fn list(args: Args) -> Result<ExitCode, ExitCode> {
             Arg::Short('r') | Arg::Long("reverse") => o.reverse = true,
             Arg::Short('S') => o.by_size = true,
             Arg::Short('t') => o.by_time = true,
-            // One entry per line is all this `ls` ever does, so `-1` is accepted and changes
-            // nothing.
-            Arg::Short('1') => {}
+            Arg::Short('1') => layout = Layout::One,
+            Arg::Short('C') => layout = Layout::Columns(Fill::Down),
+            Arg::Short('x') => layout = Layout::Columns(Fill::Across),
             Arg::Positional(_) => n_operands += 1,
             other => return Err(cli::invalid("ls", other)),
         }
     }
+
+    // Columns on a terminal use its width; forced columns off a terminal use 80, as GNU does.
+    let terminal = winsize(1).ok().map(|size| usize::from(size.cols).max(1));
+    o.grid = match layout {
+        Layout::One => None,
+        Layout::Columns(fill) => Some((fill, terminal.unwrap_or(80))),
+        Layout::Auto => terminal.map(|width| (Fill::Down, width)),
+    };
 
     let mut operands: Vec<&'static str> = cli::operands(args).collect();
     if operands.is_empty() {
@@ -229,9 +276,7 @@ fn list(args: Args) -> Result<ExitCode, ExitCode> {
     }
 
     sort(&mut files, &o);
-    for item in &files {
-        print(&mut out, item, &o);
-    }
+    print_all(&mut out, &files, &o);
 
     // A header names each directory when there is more than one thing to list, or when recursing.
     let headers = n_operands > 1 || o.recursive;

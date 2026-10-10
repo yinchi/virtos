@@ -27,7 +27,7 @@ def run(ctx):
     check("bad bytes each become one replacement character, and the rest goes on",
           s.run("cat /data/bad.bin"), "A�B�(C�\n")
     check("wc -m counts characters, wc -c bytes", s.run("wc -m /data/hello.txt"), "16 /data/hello.txt\n")
-    check("ls shows a name that is not ASCII", s.run("ls /data").count("日本語.txt"), 1)
+    check("ls shows a name that is not ASCII", s.run("ls -1 /data").count("日本語.txt"), 1)
 
     # ------------------------------------------------------------------ the display
     s.run("clear")

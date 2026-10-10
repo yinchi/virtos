@@ -36,7 +36,7 @@ def run(ctx):
     check("a comment is not a variable", s.run("printenv comment"), "")
     check("cd with no argument goes to $HOME", s.run("cd") + s.run("pwd"), "/root\n")
     check("HOME is the mounted volume, not the image's empty directory",
-          s.run("ls -a /root"), ".profile\n")
+          s.run("ls -1 -a /root"), ".profile\n")
     check("both volumes are mounted", s.run("mount"), "LABEL=SYSTEM on / type vfat\nLABEL=HOME on /root type vfat\n")
     s.run("cd /usr")
     check("the prompt shows the working directory and uses the PS1 from the environment",

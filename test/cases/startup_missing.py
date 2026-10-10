@@ -18,6 +18,6 @@ def run(ctx):
     check("the default prompt is the working directory and # (there is only root)", s.log().endswith("/# "), True)
     check("the HOME disk is there but not mounted", s.run("lsblk"),
           "SIZE  LABEL   UUID       MOUNTPOINT\n64M   SYSTEM  0000-0000  /\n64M   HOME    5E6F-7A8B\n")
-    check("/root is just an empty directory of the system image", s.run("ls -a /root"), "")
+    check("/root is just an empty directory of the system image", s.run("ls -1 -a /root"), "")
     check("mounting it by hand", s.run("mount LABEL=HOME /root") + s.run("cat /root/hello.txt"), "from home\n")
     check("cd with no argument and no HOME goes to /", s.run("cd /usr") + s.run("cd") + s.run("pwd"), "/\n")
