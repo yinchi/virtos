@@ -1,0 +1,23 @@
+[package]
+name = "editlib"
+version = "0.1.0"
+edition = "2024"
+
+# The pure, host-testable logic behind `edit` (the full-screen editor in `user/progs`): the line
+# buffer, the soft-wrap layout, the view's scrolling, the mark and cut buffer, the prompt widget,
+# search/go-to-line parsing, and the `.editrc` parser. `no_std` + `alloc` with no dependency on
+# `userlib`, so nothing here can reach for a syscall (`abi` is only for `render`'s `Cell` type) and `just test-host` runs the unit
+# tests as ordinary `cargo test` on the host -- `user/progs` itself can't, since every program
+# there links against `userlib`'s EL0 entry stub. A plain library crate (no `[[bin]]`), same as
+# `textlib`: `justfile`'s `build-user` skips it, so it is never mistaken for a program.
+
+[dependencies]
+abi = { path = "../abi" }
+# The exact glyph widths the console renders with (the kernel's `console/font.rs` depends on it
+# too) -- so the editor's line wrapping agrees with what `CONSOLE_DRAW` puts on screen.
+unifont = "1.1.0"
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

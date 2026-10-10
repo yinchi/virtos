@@ -50,9 +50,11 @@ pub(crate) mod bare_metal {
     /// Size of the kernel heap. `aarch64-paging`'s `IdMap` allocates its page-table nodes from it, so
     /// it must be initialized before `mmu::enable` runs. Also holds each program's whole ELF file
     /// while it is loaded (`shell` reads it into a `Vec`), so it has to fit the largest program:
-    /// `date`/`stat`/`touch` carry the whole time-zone database (about 1.3 MB each), which a
-    /// 1 MiB heap could not.
-    pub(crate) const HEAP_SIZE: usize = 4 << 20; // 4 MiB
+    /// `date`/`stat`/`touch` carry the whole time-zone database (about 1.3 MB each) and `edit`
+    /// the font tables its width logic needs (about 2 MB). On top of that come the console's
+    /// saved screen while a full-screen program runs (about 1.2 MB) and the page tables, so
+    /// even 4 MiB fragmented and ran out.
+    pub(crate) const HEAP_SIZE: usize = 16 << 20; // 16 MiB
     /// The heap's backing storage: a plain `.bss` static, so it's already covered by `mmu::enable`'s
     /// `__data_start..__data_end` mapping -- nothing extra needs mapping for it.
     static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];

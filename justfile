@@ -11,6 +11,7 @@ test-host:
     cargo test --target aarch64-unknown-linux-gnu
     cd user/abi && cargo test --target aarch64-unknown-linux-gnu
     cd user/textlib && cargo test --target aarch64-unknown-linux-gnu
+    cd user/editlib && cargo test --target aarch64-unknown-linux-gnu
 
 # Boots the kernel headless in QEMU, one group (one QEMU) per module of test/cases/, in parallel,
 # after rebuilding the kernel and the system image (see test/README.md).

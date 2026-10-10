@@ -5,6 +5,7 @@
 
 pub mod blk;
 pub mod errno;
+pub mod ioctl;
 pub mod keys;
 
 /// Syscall numbers. Linux's real aarch64 numbers -- borrowed for familiarity, no other Linux-ABI-
@@ -92,12 +93,10 @@ pub const ATTR_DIRECTORY: u8 = 0x10;
 /// under `usr/bin/`).
 pub const ATTR_EXEC: u8 = 0x40;
 
-/// Not a real Linux syscall -- Linux clears a terminal through an `ioctl` a userspace tool
-/// interprets itself (writing ANSI escapes), and this project has no generic `ioctl` mechanism yet
-/// (`plans/USERSPACE_PLAN.md`'s divergence #5). A dedicated syscall is the smaller thing to build
-/// for the one thing that needs it today; revisit if/when a real `ioctl` exists for other reasons
-/// and this turns out to be one more request code on top of it, not a syscall of its own.
-pub const SYS_CLEAR: usize = 1000;
+/// `ioctl(fd, request, arg)`: out-of-band control of whatever `fd` is open on -- the request codes
+/// are in `ioctl`. Linux's number and shape; the requests are this project's own (except
+/// `TIOCGWINSZ`).
+pub const SYS_IOCTL: usize = 29;
 
 /// `utimensat`'s `times` argument: two `timespec`s (access, then modify), each an `i64` seconds and
 /// an `i64` nanoseconds field, little-endian -- `UTIMES_SIZE` bytes in all. A null pointer means
@@ -132,6 +131,7 @@ mod tests {
     fn values_match_what_fd_rs_and_io_rs_assume() {
         assert_eq!(SYS_CHMOD, 53);
         assert_eq!(SYS_BRK, 214);
+        assert_eq!(SYS_IOCTL, 29);
         assert_eq!(SYS_UTIMENSAT, 88);
         assert_eq!((SYS_MOUNT, SYS_UMOUNT2, SYS_BLKINFO), (40, 39, 1001));
         assert_eq!(

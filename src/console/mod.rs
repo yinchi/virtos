@@ -15,6 +15,7 @@ pub mod font;
 pub mod input_layout;
 pub mod utf8;
 
+use alloc::vec::Vec;
 use cells::{CellGrid, Cursor};
 use font::{GLYPH_HEIGHT, GLYPH_WIDTH, glyph_for, is_zero_width};
 use unifont::Glyph;
@@ -56,6 +57,9 @@ const TAB_WIDTH: usize = 8;
 /// and may as well use the real ones).
 pub const DEFAULT_FG: u32 = 0xFF77_FF77;
 pub const DEFAULT_BG: u32 = 0x0000_0000;
+/// `DEFAULT_FG` at about half brightness (each channel halved): what a dim cell (a line-number
+/// gutter) is drawn with.
+pub const DIM_FG: u32 = 0xFF3B_7F3B;
 
 /// A software text console: cursor-addressable character cells rendered as glyphs into a raw
 /// pixel framebuffer. A cell is 8x16 pixels; a wide glyph (CJK and the like) takes two adjacent
@@ -70,6 +74,22 @@ pub struct Console {
     /// waits there, and the wrap happens when the next glyph arrives (see `cells.rs`). Without it,
     /// a line that exactly fills the width followed by `\n` would advance a row twice.
     cursor: Cursor,
+    /// A program's saved view of the console while it has the "alternate screen" -- see
+    /// `SavedScreen`. `None` except while a program that has drawn a frame is running.
+    saved: Option<SavedScreen>,
+}
+
+/// What `Console::snapshot_once` saves and `Console::restore_saved` gives back: a real terminal
+/// gives a full-screen program (vim, nano, less) an alternate screen, saved and restored by the
+/// terminal emulator around it; with no emulator here, the console does it itself, at the pixel
+/// level, since it keeps no character-level record of what it drew. The pixels alone are not
+/// enough -- `grid` and `cursor` come back with them, or the shell's next write after the program
+/// exits would place text by bookkeeping that no longer matches what is on screen.
+struct SavedScreen {
+    /// A byte-for-byte copy of the framebuffer's own memory (`fb.stride * fb.height` bytes).
+    pixels: Vec<u8>,
+    grid: CellGrid,
+    cursor: Cursor,
 }
 
 impl Console {
@@ -82,7 +102,50 @@ impl Console {
             cols,
             rows,
             cursor: Cursor::new(),
+            saved: None,
         }
+    }
+
+    /// Saves the console's pixels, grid and cursor, unless this program already has (idempotent:
+    /// only a program's *first* drawn frame takes one). Called after a frame is validated but
+    /// before any of it is drawn, so a refused call never takes a snapshot.
+    pub fn snapshot_once(&mut self) {
+        if self.saved.is_some() {
+            return;
+        }
+        let len = self.fb.stride * self.fb.height;
+        let mut pixels = alloc::vec![0u8; len];
+        // SAFETY: `self.fb.ptr` is valid for `height * stride` bytes (see `Framebuffer`), and
+        // `pixels` is a fresh buffer of exactly that length, so the ranges cannot overlap.
+        unsafe { core::ptr::copy_nonoverlapping(self.fb.ptr, pixels.as_mut_ptr(), len) };
+        self.saved = Some(SavedScreen {
+            pixels,
+            grid: self.grid.clone(),
+            cursor: self.cursor,
+        });
+    }
+
+    /// Restores whatever `snapshot_once` saved, if anything was, and forgets it. Returns whether
+    /// anything was restored, so the caller knows to flush. A program that never drew a frame took
+    /// no snapshot, so this does nothing for it and its own output stays on screen.
+    pub fn restore_saved(&mut self) -> bool {
+        let Some(saved) = self.saved.take() else {
+            return false;
+        };
+        // SAFETY: the reverse of `snapshot_once`: `saved.pixels.len()` is exactly what was copied
+        // out of `self.fb.ptr`, and the two ranges cannot overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(saved.pixels.as_ptr(), self.fb.ptr, saved.pixels.len())
+        };
+        self.grid = saved.grid;
+        self.cursor = saved.cursor;
+        true
+    }
+
+    /// Discards any saved screen without restoring it, so a launch never starts with a snapshot
+    /// left over from a previous one.
+    pub fn forget_saved(&mut self) {
+        self.saved = None;
     }
 
     /// Draws `glyph` (`width` cells wide) with its left edge at (`row`, `col`), without moving the

@@ -66,6 +66,25 @@ pub fn read(buf: &mut [u8]) -> isize {
     n as isize
 }
 
+/// Blocks until a key is pressed and returns it: one token popped straight from the queue,
+/// bypassing the line discipline entirely -- no Enter-wait, no echo, and `read(0)`'s state
+/// (`PENDING`) untouched. This and `read` are two independent readers of the one token queue;
+/// whichever is called pops the next token, so a program that mixed them would simply split the
+/// stream (unsupported, not guarded). Nothing here is stateful, so there is nothing to reset on a
+/// launch, an exit or a fault, unlike a raw-mode toggle on `read(0)`.
+pub fn read_key() -> abi::keys::KeyEvent {
+    loop {
+        // IRQs are masked inside a syscall, so the device's events wait until fetched here --
+        // same reasoning as `read_line`'s loop.
+        queue::drain();
+        if let Some(token) = queue::pop() {
+            return token.to_key_event();
+        }
+        // SAFETY: plain `wfi`, no memory or register effects.
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
 /// Blocks until Enter finishes a line, or Ctrl+D delivers what's typed so far -- either way,
 /// what's returned already has whatever trailing newline the caller should see (one for Enter,
 /// none for Ctrl+D's partial delivery). `None` on Ctrl+D with nothing typed, or with nothing to

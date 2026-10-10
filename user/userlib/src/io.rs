@@ -6,9 +6,18 @@
 //! (every call is its own `write` syscall); revisit if that ever shows up as an actual cost, not
 //! preemptively.
 
+use abi::ioctl::{
+    CONSOLE_CLEAR, CONSOLE_DRAW, CONSOLE_READ_KEY, TIOCGWINSZ, WINSIZE_SIZE, WinSize,
+};
+use abi::keys::{KEYEVENT_SIZE, KeyEvent};
 use abi::{
-    SYS_CHMOD, SYS_CLEAR, SYS_CLOSE, SYS_GETCWD, SYS_GETDENTS, SYS_MKDIRAT, SYS_NEWFSTATAT,
+    SYS_CHMOD, SYS_CLOSE, SYS_GETCWD, SYS_GETDENTS, SYS_IOCTL, SYS_MKDIRAT, SYS_NEWFSTATAT,
     SYS_OPEN, SYS_READ, SYS_RENAMEAT, SYS_UNLINKAT, SYS_WRITE,
+};
+
+/// The console `ioctl`s' own types -- re-exported so a program writes `userlib::Cell`, etc.
+pub use abi::ioctl::{
+    ATTR_DIM, ATTR_INVERSE, CELL_SIZE, CONSOLE_DRAW_HEADER_SIZE, Cell, ConsoleDraw,
 };
 
 /// `open`'s `flags` -- re-exported so a program writes `userlib::O_RDONLY`/`userlib::O_WRONLY`/
@@ -166,10 +175,40 @@ pub fn chmod(path: &str, set: u8, clear: u8) -> isize {
 }
 
 /// Clears the console (and, via an ANSI escape sequence, whatever real terminal is watching the
-/// UART). No fd argument -- there's only ever one console, unlike a real `ioctl(1, CONSOLE_CLEAR)`
-/// this project has no generic mechanism for yet (`plans/USERSPACE_PLAN.md`'s divergence #5).
+/// UART): `ioctl(1, CONSOLE_CLEAR)`. `ENOTTY` if stdout is not the console (redirected).
 pub fn clear() -> isize {
-    syscall!(SYS_CLEAR)
+    syscall!(SYS_IOCTL, 1, CONSOLE_CLEAR, 0)
+}
+
+/// The console's size in character cells, asked of `fd` (0, 1 or 2 -- any of them answers while it
+/// is the terminal). `Err` carries a negated errno: `ENOTTY` when `fd` is redirected.
+pub fn winsize(fd: usize) -> Result<WinSize, isize> {
+    let mut buf = [0u8; WINSIZE_SIZE];
+    let ret = syscall!(SYS_IOCTL, fd, TIOCGWINSZ, buf.as_mut_ptr() as usize);
+    if ret < 0 {
+        return Err(ret);
+    }
+    Ok(WinSize::decode(buf))
+}
+
+/// Blocks until a key is pressed and returns it, read from `fd` (stdin, 0, while it is the
+/// keyboard). This and `read(0)` are two ways to drain the one keyboard queue -- use one or the
+/// other in a program, never both. `Err` carries a negated errno (`ENOTTY` when redirected).
+pub fn read_key(fd: usize) -> Result<KeyEvent, isize> {
+    let mut buf = [0u8; KEYEVENT_SIZE];
+    let ret = syscall!(SYS_IOCTL, fd, CONSOLE_READ_KEY, buf.as_mut_ptr() as usize);
+    if ret < 0 {
+        return Err(ret);
+    }
+    Ok(KeyEvent::decode(buf))
+}
+
+/// Draws one frame on the console `fd` (1 or 2, while it is the console): `buf` is an encoded
+/// `ConsoleDraw` header immediately followed by `rows * cols` encoded `Cell`s. The caller builds
+/// the buffer -- its size depends on the frame, and this crate does not allocate on its behalf.
+/// Returns `0` or a negated errno (`EINVAL` for a malformed frame, `ENOTTY` when redirected).
+pub fn console_draw(fd: usize, buf: &[u8]) -> isize {
+    syscall!(SYS_IOCTL, fd, CONSOLE_DRAW, buf.as_ptr() as usize)
 }
 
 /// Mounts the volume `source` names (`LABEL=name` or `UUID=XXXX-XXXX`) on the existing directory

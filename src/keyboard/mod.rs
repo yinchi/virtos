@@ -29,7 +29,8 @@ pub mod stdin;
 use abi::keys::{
     KEY_BACKSPACE, KEY_ENTER, KEY_KP0, KEY_KP1, KEY_KP2, KEY_KP3, KEY_KP4, KEY_KP5, KEY_KP6,
     KEY_KP7, KEY_KP8, KEY_KP9, KEY_KPASTERISK, KEY_KPDOT, KEY_KPMINUS, KEY_KPPLUS, KEY_KPSLASH,
-    KEY_SPACE, KEY_TAB, effective_code,
+    KEY_SPACE, KEY_TAB, KeyEvent, MOD_ALT, MOD_CAPS, MOD_CTRL, MOD_NUM, MOD_REPEAT, MOD_SHIFT,
+    effective_code,
 };
 
 const KEY_LSHIFT: u16 = 42;
@@ -210,6 +211,36 @@ impl Token {
     /// the raw evdev code.
     pub fn effective_code(&self) -> u16 {
         effective_code(self.code, self.num)
+    }
+
+    /// The record `CONSOLE_READ_KEY` hands a program (`abi::keys::KeyEvent`): the raw `code`, every
+    /// modifier and lock packed into `mods`, and `char()` -- or 0, "no character" -- resolved here
+    /// because only this module owns the layout.
+    pub fn to_key_event(self) -> KeyEvent {
+        let mut mods = 0;
+        for (on, bit) in [
+            (self.shift, MOD_SHIFT),
+            (self.ctrl, MOD_CTRL),
+            (self.alt, MOD_ALT),
+            (self.caps, MOD_CAPS),
+            (self.num, MOD_NUM),
+            (self.repeat, MOD_REPEAT),
+        ] {
+            if on {
+                mods |= bit;
+            }
+        }
+        KeyEvent {
+            code: self.code,
+            mods,
+            // Unlike `char()`, Ctrl and Alt do not blank it: a program that inserts text checks
+            // those bits itself (see `KeyEvent`). Enter and Backspace are keys, not text, so
+            // they carry none; Tab is the one control character a program inserts as typed.
+            ch: keypad_char(self.code, self.num)
+                .or_else(|| translate(self.code, self.shift, self.caps))
+                .filter(|c| !c.is_control() || *c == '\t')
+                .map_or(0, |c| c as u32),
+        }
     }
 
     /// The character this press types, if any: `None` for a key with no character, and for any
@@ -476,5 +507,35 @@ mod tests {
         assert!(admits(&fresh, 5));
         assert!(admits(&repeat, 0));
         assert!(!admits(&repeat, 1));
+    }
+
+    #[test]
+    fn a_key_event_packs_the_code_every_modifier_and_the_character() {
+        let mut keys = KeyState::new();
+        keys.apply(KEY_LSHIFT, 1);
+        keys.apply(KEY_LCTRL, 1);
+        keys.apply(KEY_CAPSLOCK, 1);
+        keys.apply(KEY_CAPSLOCK, 0);
+        let token = keys.apply(KEY_A, 1).unwrap();
+        let repeat = keys.apply(KEY_A, 1).unwrap();
+        let event = token.to_key_event();
+        assert_eq!(event.code, KEY_A);
+        // NumLock starts on; Shift, Ctrl and CapsLock were set above.
+        assert_eq!(event.mods, MOD_SHIFT | MOD_CTRL | MOD_CAPS | MOD_NUM);
+        // Ctrl does not blank the character (`Token::char` does; a program checks the bits).
+        // Shift and CapsLock cancel, so it is lower case.
+        assert_eq!(event.ch, 'a' as u32);
+        assert_eq!(token.char(), None);
+        assert_eq!(repeat.to_key_event().mods & MOD_REPEAT, MOD_REPEAT);
+    }
+
+    #[test]
+    fn enter_and_backspace_carry_no_character_but_tab_does() {
+        let mut keys = KeyState::new();
+        for (code, want) in [(KEY_ENTER, 0), (KEY_BACKSPACE, 0), (KEY_TAB, '\t' as u32)] {
+            let event = keys.apply(code, 1).unwrap().to_key_event();
+            keys.apply(code, 0);
+            assert_eq!(event.ch, want, "key {code}");
+        }
     }
 }

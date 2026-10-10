@@ -47,7 +47,7 @@ def run(ctx):
     addr = s.run("/tests/heap dirty").strip()
     check("a program can grow and fill its heap", addr.isdigit(), True)
     out, status = s.status(f"/tests/heap peek {addr}")
-    check("the next program cannot read the previous program's heap", out.startswith("Segmentation fault (address "), True)
+    check("the next program cannot read the previous program's heap", out.startswith(f"Segmentation fault (address {hex(int(addr))},"), True)
     check("...status 139", status, 139)
     check("a fresh program's grown heap is zero, not the previous one's bytes", s.run("/tests/heap clean"), "true\n")
     check("the shell goes on", s.run("echo ok"), "ok\n")

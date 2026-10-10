@@ -40,7 +40,7 @@ fn run(mut args: Args) -> ExitCode {
             return ExitCode(0);
         }
         Some("peek") => {
-            let addr: usize = args.nth(2).and_then(|a| a.parse().ok()).unwrap_or(0);
+            let addr: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(0);
             let _ = unsafe { read_volatile(addr as *const u8) };
             write(1, b"survived\n");
             return ExitCode(0);

@@ -32,6 +32,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "editlib"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "unifont",
+]
+
+[[package]]
 name = "getargs"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -89,6 +97,7 @@ dependencies = [
  "abi",
  "chrono",
  "chrono-tz",
+ "editlib",
  "getargs",
  "textlib",
  "userlib",
@@ -121,6 +130,12 @@ version = "0.1.0"
 dependencies = [
  "chrono",
 ]
+
+[[package]]
+name = "unifont"
+version = "1.1.0+data-15.1.05"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eb5abf597aaa6fff19801d6747672f56e618d60002e7191ea92773a5bcae156"
 
 [[package]]
 name = "userlib"

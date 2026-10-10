@@ -39,9 +39,14 @@ use crate::fs::rtc_time::RTC_TIME;
 use crate::keyboard::stdin;
 use abi::blk::BLKINFO_SIZE;
 use abi::errno::{
-    EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EIO, EISDIR, EMFILE, ENODEV, ENOTDIR, ERANGE, EXDEV,
-    errmsg,
+    EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EIO, EISDIR, EMFILE, ENODEV, ENOTDIR, ENOTTY, ERANGE,
+    EXDEV, errmsg,
 };
+use abi::ioctl::{
+    ATTR_DIM, ATTR_INVERSE, CELL_SIZE, CONSOLE_CLEAR, CONSOLE_DRAW, CONSOLE_DRAW_HEADER_SIZE,
+    CONSOLE_READ_KEY, Cell, ConsoleDraw, TIOCGWINSZ, WINSIZE_SIZE, WinSize,
+};
+use abi::keys::KEYEVENT_SIZE;
 use abi::{
     ATTR_DIRECTORY, ATTR_EXEC, ATTR_READ_ONLY, DIRENT_SIZE, NAME_MAX, O_APPEND, O_RDONLY, O_WRONLY,
     STAT_SIZE, UTIMES_SIZE,
@@ -128,6 +133,9 @@ pub fn reset_for_launch() {
     let table = table();
     *table = [const { None }; MAX_FDS];
     stdin::reset();
+    if let Some(con) = console::get() {
+        con.forget_saved();
+    }
     table[0] = Some(FileDescriptor::Keyboard);
     table[1] = Some(FileDescriptor::Console);
     table[2] = Some(FileDescriptor::Console);
@@ -150,6 +158,13 @@ pub fn end_launch() {
     decoder().finish(|c| tail.push(c));
     if !tail.is_empty() {
         console_text(&tail);
+    }
+    // Give back the screen a full-screen program (one that drew a frame) replaced.
+    if let Some(con) = console::get()
+        && con.restore_saved()
+        && let Some(gpu_dev) = gpu::get()
+    {
+        gpu_dev.flush();
     }
     for slot in table().iter_mut() {
         if let Some(FileDescriptor::FileWrite(_, writer)) = slot.take()
@@ -902,11 +917,166 @@ pub fn blkinfo(index: usize, out_ptr: usize) -> isize {
     0
 }
 
-/// Clears the console -- both the graphical one (if a GPU device exists) and, via an ANSI escape
+/// Out-of-band control of what `fd` is open on (see `abi::ioctl` for the requests). Only the
+/// terminal understands any. `CONSOLE_CLEAR` clears the console (stdout/stderr) and, via an ANSI
+/// escape sequence, whatever real terminal is watching the UART. `TIOCGWINSZ` writes the console's
+/// size in cells to `arg`, answered for the keyboard (stdin) as well as the console, so a program
+/// learns from any of its three standard fds whether it is on a terminal and how big. `CONSOLE_
+/// READ_KEY` blocks for one key press and writes it to `arg`; stdin only -- the console fd is for
+/// drawing, not reading. `CONSOLE_DRAW` draws a whole frame from `arg`; the console only, the
+/// opposite way round. Any other request, or any other kind of fd, is `ENOTTY`; an fd that is not
+/// open is `EBADF`.
+pub fn ioctl(fd: usize, request: usize, arg: usize) -> isize {
+    let entry = table().get(fd).and_then(Option::as_ref);
+    match (entry, request) {
+        (None, _) => EBADF,
+        (Some(FileDescriptor::Console | FileDescriptor::Keyboard), TIOCGWINSZ) => window_size(arg),
+        (Some(FileDescriptor::Keyboard), CONSOLE_READ_KEY) => read_key(arg),
+        (Some(FileDescriptor::Console), CONSOLE_DRAW) => draw_frame(arg),
+        (Some(FileDescriptor::Console), CONSOLE_CLEAR) => clear(),
+        _ => ENOTTY,
+    }
+}
+
+/// `CONSOLE_READ_KEY`: blocks until a key is pressed and writes it (`abi::keys::KeyEvent`) to the
+/// user buffer `ptr`; `EFAULT` if it is not writable user memory. The pointer is validated
+/// *before* blocking, so a bad one is refused at once rather than after making the caller wait for
+/// a keypress that was never going to be delivered anywhere.
+fn read_key(ptr: usize) -> isize {
+    if !validate(ptr, KEYEVENT_SIZE, true) {
+        return EFAULT;
+    }
+    let event = stdin::read_key();
+    let _user = mmu::user_access(); // writes a user buffer: clear PAN while it does
+    // SAFETY: validated above to lie entirely within writable user memory.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, KEYEVENT_SIZE) };
+    out.copy_from_slice(&event.encode());
+    0
+}
+
+/// `TIOCGWINSZ`: writes the console's rows and columns (`abi::ioctl::WinSize`, pixel fields 0) to
+/// the user buffer `ptr`; `EFAULT` if it is not writable user memory.
+fn window_size(ptr: usize) -> isize {
+    if !validate(ptr, WINSIZE_SIZE, true) {
+        return EFAULT;
+    }
+    let Some(con) = console::get() else {
+        return ENOTTY;
+    };
+    let size = WinSize::cells(con.rows as u16, con.cols as u16);
+    let _user = mmu::user_access();
+    // SAFETY: validated above to lie entirely within writable user memory.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, WINSIZE_SIZE) };
+    out.copy_from_slice(&size.encode());
+    0
+}
+
+/// What `draw_frame` needs of one `Cell`: the character, its attribute and how many columns it
+/// takes (2 for a wide glyph, 1 otherwise) -- or `None` for a cell that is not a valid,
+/// non-control Unicode scalar value, which refuses the whole frame.
+fn decode_cell(bytes: [u8; CELL_SIZE]) -> Option<(char, u8, usize)> {
+    let cell = Cell::decode(bytes);
+    let c = char::from_u32(cell.ch).filter(|c| !c.is_control())?;
+    let width = if console::font::glyph_for(c).is_fullwidth() {
+        2
+    } else {
+        1
+    };
+    Some((c, cell.attr, width))
+}
+
+/// The `(fg, bg)` pair for one cell's `attr`. Reserved bits beyond `ATTR_INVERSE`/`ATTR_DIM` are
+/// masked off, not refused, so a future flag does not break a program built against this one.
+fn cell_colors(attr: u8) -> (u32, u32) {
+    let (fg, bg) = (console::DEFAULT_FG, console::DEFAULT_BG);
+    match (attr & ATTR_INVERSE != 0, attr & ATTR_DIM != 0) {
+        (false, false) => (fg, bg),
+        (false, true) => (console::DIM_FG, bg),
+        (true, false) => (bg, fg),
+        (true, true) => (bg, console::DIM_FG),
+    }
+}
+
+/// `CONSOLE_DRAW`: draws a whole frame from the header-then-cells buffer at `ptr` (see
+/// `abi::ioctl::CONSOLE_DRAW`). Walks the frame **twice**: once to check every cell decodes to a
+/// character with room for its width in its row (`EINVAL` on the first violation -- a malformed
+/// frame is refused whole, never drawn in part and then rejected), and again to draw. A wide
+/// glyph's second column is walked (its bytes still exist in the buffer) but never separately
+/// decoded or drawn.
+fn draw_frame(ptr: usize) -> isize {
+    if !validate(ptr, CONSOLE_DRAW_HEADER_SIZE, false) {
+        return EFAULT;
+    }
+    let Some(con) = console::get() else {
+        return ENOTTY;
+    };
+    let _user = mmu::user_access(); // reads a user buffer: clear PAN while it does
+    // SAFETY: validated above to lie entirely within mapped user memory.
+    let header_bytes =
+        unsafe { core::slice::from_raw_parts(ptr as *const u8, CONSOLE_DRAW_HEADER_SIZE) };
+    let header = ConsoleDraw::decode(header_bytes.try_into().unwrap());
+
+    let (rows, cols) = (con.rows, con.cols);
+    if usize::from(header.rows) != rows || usize::from(header.cols) != cols {
+        return EINVAL;
+    }
+    let Some(cell_bytes_len) = (rows * cols).checked_mul(CELL_SIZE) else {
+        return EINVAL;
+    };
+    let Some(cells_ptr) = ptr.checked_add(CONSOLE_DRAW_HEADER_SIZE) else {
+        return EFAULT;
+    };
+    if !validate(cells_ptr, cell_bytes_len, false) {
+        return EFAULT;
+    }
+    // SAFETY: validated above to lie entirely within mapped user memory.
+    let cell_bytes = unsafe { core::slice::from_raw_parts(cells_ptr as *const u8, cell_bytes_len) };
+    let cell_at = |row: usize, col: usize| -> [u8; CELL_SIZE] {
+        let start = (row * cols + col) * CELL_SIZE;
+        cell_bytes[start..start + CELL_SIZE].try_into().unwrap()
+    };
+
+    // Pass 1: every cell that will be drawn must decode, and fit in what is left of its row.
+    for row in 0..rows {
+        let mut col = 0;
+        while col < cols {
+            let Some((_, _, width)) = decode_cell(cell_at(row, col)) else {
+                return EINVAL;
+            };
+            if col + width > cols {
+                return EINVAL;
+            }
+            col += width;
+        }
+    }
+
+    // Pass 2: draw, now that nothing in the frame can panic `put_char_at`. A program's first
+    // frame saves what was on screen, for `end_launch` to give back (the alternate screen).
+    con.snapshot_once();
+    for row in 0..rows {
+        let mut col = 0;
+        while col < cols {
+            let (c, attr, width) = decode_cell(cell_at(row, col)).unwrap();
+            let (fg, bg) = cell_colors(attr);
+            con.put_char_at(row, col, c, fg, bg);
+            col += width;
+        }
+    }
+    con.move_cursor(
+        usize::from(header.cursor_row).min(rows - 1),
+        usize::from(header.cursor_col).min(cols - 1),
+    );
+    if let Some(gpu_dev) = gpu::get() {
+        gpu_dev.flush();
+    }
+    0
+}
+
+/// `CONSOLE_CLEAR`: clears the console -- both the graphical one (if a GPU device exists) and, via an ANSI escape
 /// sequence (cursor home, erase display), whatever real terminal is watching the UART, the serial
 /// counterpart of clearing the console. No fd argument: there's only ever one console, so there's
 /// nothing to look up (unlike `read`/`write`, which are addressing one of several fds).
-pub fn clear() -> isize {
+fn clear() -> isize {
     if let Some(con) = console::get() {
         con.clear(console::DEFAULT_BG);
         if let Some(gpu_dev) = gpu::get() {

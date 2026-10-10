@@ -16,9 +16,9 @@ use core::fmt::Write;
 use crate::exec::process;
 use abi::errno::ENOSYS;
 use abi::{
-    SYS_BLKINFO, SYS_BRK, SYS_CHMOD, SYS_CLEAR, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_EXIT, SYS_GETCWD,
-    SYS_GETDENTS, SYS_MKDIRAT, SYS_MOUNT, SYS_NEWFSTATAT, SYS_OPEN, SYS_READ, SYS_REBOOT,
-    SYS_RENAMEAT, SYS_UMOUNT2, SYS_UNLINKAT, SYS_UTIMENSAT, SYS_WRITE,
+    SYS_BLKINFO, SYS_BRK, SYS_CHMOD, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_EXIT, SYS_GETCWD,
+    SYS_GETDENTS, SYS_IOCTL, SYS_MKDIRAT, SYS_MOUNT, SYS_NEWFSTATAT, SYS_OPEN, SYS_READ,
+    SYS_REBOOT, SYS_RENAMEAT, SYS_UMOUNT2, SYS_UNLINKAT, SYS_UTIMENSAT, SYS_WRITE,
 };
 
 // The ESR_EL1 EC field values this handler decodes -- see `sync_el0_handler` for what each one
@@ -104,7 +104,7 @@ extern "C" fn sync_el0_handler(regs: *mut TrapFrame) {
                 // Not an errno convention (Linux's): the new break, or the old one if it could
                 // not move.
                 SYS_BRK => regs.x[0] = crate::exec::elf::program_break(a0) as u64,
-                SYS_CLEAR => regs.x[0] = fd::clear() as u64,
+                SYS_IOCTL => regs.x[0] = fd::ioctl(a0, a1, a2) as u64,
                 SYS_REBOOT => regs.x[0] = power::reboot(a0) as u64,
                 SYS_EXIT => {
                     // Never returns to kernel_exit's normal eret-back-to-EL0 path --
