@@ -28,6 +28,7 @@ use hadris_fat::{FatVolumeReadExt, FatVolumeWriteExt};
 
 use crate::arch::mmu::{self, USER_BASE, USER_STACK_TOP};
 use crate::console;
+use crate::console::utf8::Utf8Decoder;
 use crate::drivers::virtio::gpu;
 use crate::fs;
 use crate::fs::blkio::BlkIo;
@@ -142,6 +143,13 @@ pub fn reset_for_launch() {
 /// in an earlier or later slot of the same table, this leaves it be, and that slot's own turn
 /// through this loop finishes it instead once it, in turn, is the last one left.
 pub fn end_launch() {
+    // A character the program left half written is one replacement character, not a stray start
+    // for the next program's first byte.
+    let mut tail = String::new();
+    decoder().finish(|c| tail.push(c));
+    if !tail.is_empty() {
+        console_text(&tail);
+    }
     for slot in table().iter_mut() {
         if let Some(FileDescriptor::FileWrite(_, writer)) = slot.take()
             && let Ok(writer) = Rc::try_unwrap(writer)
@@ -151,6 +159,42 @@ pub fn end_launch() {
     }
 }
 
+/// Decodes what a program writes to the console as UTF-8, a byte at a time: a character cut in two
+/// by the end of one `write` (`cat` writes 4096-byte chunks) is finished by the next, and a byte
+/// that is not valid UTF-8 comes out as U+FFFD instead of ending the stream.
+///
+/// SAFETY (every access, via `decoder`): single core, and syscalls run with IRQs masked.
+static mut DECODER: Utf8Decoder = Utf8Decoder::new();
+
+#[allow(clippy::deref_addrof)]
+fn decoder() -> &'static mut Utf8Decoder {
+    // SAFETY: see DECODER.
+    unsafe { &mut *(&raw mut DECODER) }
+}
+
+/// Draws `text` on the console and sends it to the UART, the same dual visibility every
+/// diagnostic print in this project already has.
+fn console_text(text: &str) {
+    if let Some(con) = console::get() {
+        con.puts(text, console::DEFAULT_FG, console::DEFAULT_BG);
+        if let Some(gpu_dev) = gpu::get() {
+            gpu_dev.flush();
+        }
+    }
+    let mut uart = crate::bare_metal::get_uart();
+    let _ = uart.write_str(text);
+}
+
+/// A program's write to the console: `bytes` through the decoder, then drawn.
+fn console_write(bytes: &[u8]) {
+    let mut text = String::with_capacity(bytes.len());
+    let decoder = decoder();
+    for &byte in bytes {
+        decoder.push(byte, |c| text.push(c));
+    }
+    console_text(&text);
+}
+
 impl FileDescriptor {
     /// Writes to the console or a write-only file. Writing to `Keyboard`, a read-only `File`, or a
     /// `Dir` is rejected outright, not silently accepted as a no-op: a mixed-up fd number should
@@ -158,17 +202,7 @@ impl FileDescriptor {
     fn write(&mut self, bytes: &[u8]) -> isize {
         match self {
             Self::Console => {
-                let text = core::str::from_utf8(bytes).unwrap_or("<invalid utf8>");
-                if let Some(con) = console::get() {
-                    con.puts(text, console::DEFAULT_FG, console::DEFAULT_BG);
-                    if let Some(gpu_dev) = gpu::get() {
-                        gpu_dev.flush();
-                    }
-                }
-                // Also the UART, the same dual visibility every diagnostic print in this project
-                // already has.
-                let mut uart = crate::bare_metal::get_uart();
-                let _ = uart.write_str(text);
+                console_write(bytes);
                 bytes.len() as isize
             }
             Self::FileWrite(_, writer) => writer

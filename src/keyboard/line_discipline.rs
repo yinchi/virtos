@@ -117,7 +117,7 @@ impl LineDiscipline {
     /// places the visible cursor. The first row is recomputed afterward from where the console's
     /// own cursor ended up, which absorbs a scroll the rewrite itself caused (the line moved up).
     fn redraw(&mut self, console: &mut Console) {
-        let needed = rows_needed(self.prefix.len(), self.buf.as_str().len(), console.cols);
+        let needed = rows_needed(&self.prefix, self.buf.as_str(), console.cols);
         for row in self.row..(self.row + self.drawn_rows.max(needed)).min(console.rows) {
             console.clear_row(row, BG);
         }
@@ -133,21 +133,21 @@ impl LineDiscipline {
     /// character is actually there, or a space past the end of the text. Takes `text` explicitly
     /// rather than reading the buffer, since un-inverting a line's cursor cell when it ends needs
     /// the text as it was *before* the buffer was emptied.
-    fn draw_cell_at(&self, console: &Console, text: &str, cursor: usize, inverted: bool) {
-        let (rel_row, col) = cursor_position(self.prefix.len(), text.len(), cursor, console.cols);
+    fn draw_cell_at(&self, console: &mut Console, text: &str, cursor: usize, inverted: bool) {
+        let (rel_row, col) = cursor_position(&self.prefix, text, cursor, console.cols);
         let ch = text[cursor..].chars().next().unwrap_or(' ');
         let (fg, bg) = if inverted { (BG, FG) } else { (FG, BG) };
-        console.put_char(self.row + rel_row, col, ch, fg, bg);
+        console.put_char_at(self.row + rel_row, col, ch, fg, bg);
     }
 
-    fn draw_cursor(&self, console: &Console) {
+    fn draw_cursor(&self, console: &mut Console) {
         self.draw_cell_at(console, self.buf.as_str(), self.buf.cursor(), true);
     }
 
     /// A pure cursor move: un-inverts the old cursor cell, then draws the new one -- two cell
     /// writes however far apart they are. `old_cursor` is an offset into the *current* text, valid
     /// because `LineEvent::CursorMoved` only fires when the text itself didn't change.
-    fn redraw_cursor(&self, console: &Console, old_cursor: usize) {
+    fn redraw_cursor(&self, console: &mut Console, old_cursor: usize) {
         self.draw_cell_at(console, self.buf.as_str(), old_cursor, false);
         self.draw_cursor(console);
     }
@@ -191,7 +191,7 @@ impl LineDiscipline {
             let text = String::from(text);
             // An entry recorded under a shorter prompt (the directory changed since) may no
             // longer fit; leave the line as it is rather than draw past the screen.
-            if !fits_on_screen(self.prefix.len(), text.len(), console.cols, console.rows) {
+            if !fits_on_screen(&self.prefix, &text, console.cols, console.rows) {
                 return LineOutcome::Ignored;
             }
             self.buf.set(&text);
@@ -201,17 +201,12 @@ impl LineDiscipline {
 
         // A character that would push the line past the screen is dropped before it ever reaches
         // the buffer, which has no way to take one back.
-        if token
-            .char()
-            .is_some_and(|c| c == ' ' || c.is_ascii_graphic())
-            && !fits_on_screen(
-                self.prefix.len(),
-                self.buf.as_str().len() + 1,
-                console.cols,
-                console.rows,
-            )
-        {
-            return LineOutcome::Ignored;
+        if let Some(c) = token.char().filter(|&c| c == ' ' || c.is_ascii_graphic()) {
+            let mut longer = String::from(self.buf.as_str());
+            longer.push(c);
+            if !fits_on_screen(&self.prefix, &longer, console.cols, console.rows) {
+                return LineOutcome::Ignored;
+            }
         }
         let old_cursor = self.buf.cursor();
         match self.buf.feed(token, self.mode) {

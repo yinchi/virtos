@@ -9,10 +9,9 @@
 //! - Nothing else is interpreted: no `$` expansion (bash expands `$VAR` in a prompt; here the
 //!   value is text with those four escapes), no `\n` (a prompt of one row keeps the line editor's
 //!   layout simple), no colours.
-//! - **Anything that isn't a printable ASCII character is dropped**: control characters, so a
-//!   prompt cannot move the cursor or clear the screen, and -- for now -- everything non-ASCII,
-//!   since the console has no UTF-8 decoding and the line editor's layout counts one cell per
-//!   byte.
+//! - **Control characters are dropped**, so a prompt cannot move the cursor or clear the screen;
+//!   every other character stays, non-ASCII included (the console draws UTF-8, wide glyphs take
+//!   two cells, and the line editor's layout counts cells, `console::input_layout`).
 //! - A prompt over `MAX_PROMPT` characters keeps its **last** `MAX_PROMPT` (a long directory under
 //!   `\w` must not leave no room to type, and the end is where the `> ` is).
 
@@ -59,13 +58,13 @@ pub fn render(ps1: Option<&str>, cwd: &str) -> String {
         }
         chars.next(); // the escape's second character
     }
-    out.retain(|c| c == ' ' || c.is_ascii_graphic());
+    out.retain(|c| !c.is_control());
     if out.is_empty() {
         return String::from(DEFAULT_PROMPT);
     }
-    let count = out.len();
+    let count = out.chars().count();
     if count > MAX_PROMPT {
-        out.drain(..count - MAX_PROMPT);
+        out = out.chars().skip(count - MAX_PROMPT).collect();
     }
     out
 }
@@ -136,24 +135,36 @@ mod tests {
     }
 
     #[test]
-    // Interim: non-ASCII is dropped only because the console has no UTF-8 decoding yet, so the
-    // last assertion flips when that lands.
-    fn control_and_non_ascii_characters_are_dropped() {
+    fn control_characters_are_dropped_and_the_rest_stays() {
         assert_eq!(r("a\tb\x1b[2Jc> ", "/"), "ab[2Jc> ");
         assert_eq!(r("a\nb> ", "/"), "ab> ");
         assert_eq!(r("\x07\x08", "/"), "> "); // nothing left: the default
-        assert_eq!(r("é日> ", "/"), "> ");
+        assert_eq!(r("é日> ", "/"), "é日> ");
+        assert_eq!(r("\u{85}x", "/"), "x"); // a C1 control too
+    }
+
+    #[test]
+    fn a_directory_with_non_ascii_letters_is_kept_whole() {
+        assert_eq!(r("\\w> ", "/données"), "/données> ");
+        assert_eq!(r("\\W> ", "/root/日本語"), "日本語> ");
     }
 
     #[test]
     fn a_long_prompt_keeps_its_end() {
         let long = "x".repeat(500) + "> ";
         let got = r(&long, "/");
-        assert_eq!(got.len(), MAX_PROMPT);
+        assert_eq!(got.chars().count(), MAX_PROMPT);
         assert!(got.ends_with("x> "));
         let deep = "/".to_string() + &"d/".repeat(200);
         let got = r("\\w> ", &deep);
-        assert_eq!(got.len(), MAX_PROMPT);
+        assert_eq!(got.chars().count(), MAX_PROMPT);
         assert!(got.ends_with("/> "));
+    }
+
+    #[test]
+    fn the_length_limit_counts_characters_not_bytes() {
+        let wide = "日".repeat(MAX_PROMPT);
+        assert_eq!(r(&wide, "/").chars().count(), MAX_PROMPT);
+        assert_eq!(r(&(wide + "x"), "/").chars().count(), MAX_PROMPT);
     }
 }

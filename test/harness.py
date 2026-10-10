@@ -155,6 +155,39 @@ class Session:
         self.pos += len(text)
         return text[:PROMPT.search(text).start()]
 
+    # ------------------------------------------------------------------- the display
+
+    def screendump(self, settle=0.3, timeout=10):
+        """The display as it is now: `(width, height, rgb)` where `rgb` is the P6 PPM's pixel
+        bytes. The serial log is written as the guest draws, but the display is flushed a moment
+        after; so the dump is taken again until two in a row agree (`settle` seconds apart)."""
+        path = self.sock_path + ".ppm"
+        deadline = time.time() + timeout
+        previous = None
+        while True:
+            if os.path.exists(path):
+                os.remove(path)
+            self.sock.sendall(f"screendump {path}\n".encode())
+            while not os.path.exists(path):
+                if time.time() > deadline:
+                    raise TimeoutError("the screendump never appeared")
+                time.sleep(0.02)
+            time.sleep(0.05)  # let QEMU finish writing it
+            with open(path, "rb") as f:
+                data = f.read()
+            if data == previous:
+                break
+            if time.time() > deadline:
+                raise TimeoutError("the display never settled")
+            previous = data
+            time.sleep(settle)
+        header, rest = data.split(b"\n", 1)
+        assert header == b"P6", header
+        dims, rest = rest.split(b"\n", 1)
+        width, height = (int(n) for n in dims.split())
+        _maxval, pixels = rest.split(b"\n", 1)
+        return width, height, pixels
+
     # ------------------------------------------------------------------- running
 
     def run(self, command, timeout=TIMEOUT):
@@ -241,6 +274,31 @@ def make_home_image(mkimage, path, workdir, files, label="HOME", volume_id="5e6f
         with open(target, "wb") as f:
             f.write(content.encode() if isinstance(content, str) else content)
     subprocess.run([mkimage, path, "64M", label, volume_id, seed], check=True, capture_output=True, stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+class Screen:
+    """A display captured by `Session.screendump`, in 8x16-pixel character cells."""
+
+    CELL_W, CELL_H = 8, 16
+
+    def __init__(self, width, height, pixels):
+        self.width, self.height, self.pixels = width, height, pixels
+        self.cols, self.rows = width // self.CELL_W, height // self.CELL_H
+
+    def cell(self, row, col):
+        """The pixels of one cell, as bytes (row by row)."""
+        out = bytearray()
+        for y in range(row * self.CELL_H, (row + 1) * self.CELL_H):
+            start = (y * self.width + col * self.CELL_W) * 3
+            out += self.pixels[start:start + self.CELL_W * 3]
+        return bytes(out)
+
+    def drawn(self, row, col):
+        """Whether anything but background is in the cell."""
+        return any(self.cell(row, col))
+
+    def blank_row(self, row):
+        return not any(self.drawn(row, c) for c in range(self.cols))
 
 
 class Context:

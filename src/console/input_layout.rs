@@ -1,46 +1,69 @@
-//! Where an input line (a prompt prefix plus the text typed after it) lands on the screen --
-//! pure arithmetic, so the line discipline can tell how many rows to clear before redrawing it
-//! and when a line has grown as long as the screen allows. ASCII only, like the console itself:
-//! one character is one cell.
+//! Where a typed line lands on the screen: how many rows a prefix plus text needs, and where a given
+//! cursor byte offset lands. The line discipline (`keyboard/line_discipline.rs`) uses it both to size
+//! and place the input area, and to find the screen cell for the visible cursor (`cursor_position`).
 //!
-//! Follows the console's own xterm wrap-pending rule (`Console::putc`): a line that exactly fills
-//! its last row stays on that row until the next character arrives, so it does not claim another.
+//! It replays exactly what `Console::write_char` does, by driving the same `Cursor` (`cells.rs`) over
+//! an endless screen -- a glyph that ends in the last column leaves the wrap pending, a wide glyph that
+//! does not fit moves to the next row whole -- so the layout and the drawing cannot disagree. Text is
+//! taken to be printable: the line buffer never holds control characters (`line.rs`), and the
+//! prompt is plain text.
+//!
+//! Pure `no_std`, with no dependency on the rest of the kernel, so it is tested on the host
+//! (`just test-host`).
 
-/// How many rows a line of `prefix_len + text_len` cells occupies on a `cols`-wide console -- at
-/// least one, even when empty (the cursor still sits on a row).
-pub fn rows_needed(prefix_len: usize, text_len: usize, cols: usize) -> usize {
-    (prefix_len + text_len).div_ceil(cols).max(1)
-}
+use super::cells::Cursor;
+use super::font::cell_width;
 
-/// Whether the line fits on a `rows`-tall console: it may use at most `rows - 1` rows, leaving
-/// the last for the cursor to move onto once the line is finished.
-pub fn fits_on_screen(prefix_len: usize, text_len: usize, cols: usize, rows: usize) -> bool {
-    rows_needed(prefix_len, text_len, cols) < rows
-}
-
-/// The `(row, col)`, relative to the line's first row, of the cell the visible cursor occupies
-/// when it sits at byte offset `cursor` of a `text_len`-byte text (ASCII, so a byte is a cell).
-///
-/// Follows the same deferred-wrap rule as drawing: a cursor at the very end of text that exactly
-/// fills a row stays on that row's last column rather than jumping to a row nothing has been drawn
-/// on yet (which would be past `rows_needed`'s own count -- and off the screen entirely if that is
-/// the screen's last row). For any `cursor` short of the end, the character at that offset really
-/// is drawn one row down, so it resolves there.
-pub fn cursor_position(
-    prefix_len: usize,
-    text_len: usize,
-    cursor: usize,
-    cols: usize,
-) -> (usize, usize) {
-    let cells = prefix_len + cursor;
-    if cells > 0 && cells.is_multiple_of(cols) {
-        if cursor < text_len {
-            (cells / cols, 0)
-        } else {
-            (cells / cols - 1, cols - 1)
+/// Where the cursor ends up after drawing `prefix` and then `text` from the top-left cell of a screen
+/// `cols` cells wide and endlessly tall.
+fn end_cursor(prefix: &str, text: &str, cols: usize) -> Cursor {
+    let mut cursor = Cursor::new();
+    for c in prefix.chars().chain(text.chars()) {
+        let width = cell_width(c);
+        if width == 0 {
+            continue; // draws nothing and takes no cell
         }
+        cursor.start_glyph(width, cols, usize::MAX);
+        cursor.end_glyph(width, cols);
+    }
+    cursor
+}
+
+/// How many rows `prefix` and `text` occupy: at least one (the prefix's row, even when both are empty).
+/// A row filled exactly does not start the next -- that happens only when another glyph arrives.
+pub fn rows_needed(prefix: &str, text: &str, cols: usize) -> usize {
+    end_cursor(prefix, text, cols).row + 1
+}
+
+/// Whether the line may be as long as it is on a screen of `rows` rows: it may use at most `rows - 1`
+/// of them, so it can never scroll off the top or push its own first row out of view.
+pub fn fits_on_screen(prefix: &str, text: &str, cols: usize, rows: usize) -> bool {
+    rows_needed(prefix, text, cols) < rows
+}
+
+/// Where the cursor sits on screen, as (row, column) relative to the line's first row, given a byte
+/// offset `cursor` into `text` (always on a char boundary -- `line.rs`'s own invariant). Computed by
+/// replaying only `prefix` plus the text *before* the cursor, so the character actually at the cursor
+/// (if any) never affects where it's drawn -- the cell right after whatever's been laid out so far.
+/// This is the same computation for `cursor == text.len()` (the end of the line) as for any other
+/// offset, so it covers Home/End and a wrapped line with no special-casing at any call site .
+///
+/// A pending wrap resolves to the start of the next row *unless* `cursor` is at the very end of
+/// `text` -- there is no real character actually drawn there to justify jumping ahead, and doing so
+/// anyway can point past the last row the text actually occupies (`rows_needed`'s own count), which
+/// is not always a valid screen row. Matches xterm's own deferred-wrap rule (`cells.rs`'s `Cursor`):
+/// a glyph that exactly fills the last column leaves the *visible* cursor sitting on it, not already
+/// wrapped to a row nothing has been drawn on yet -- the wrap happens only once another glyph
+/// actually arrives. For any `cursor` short of the end, the character that would be at that offset
+/// really is drawn one row down (the full line was laid out in one pass), so resolving there matches
+/// what is actually on screen.
+pub fn cursor_position(prefix: &str, text: &str, cursor: usize, cols: usize) -> (usize, usize) {
+    let before = &text[..cursor];
+    let c = end_cursor(prefix, before, cols);
+    if c.wrap_pending && cursor < text.len() {
+        (c.row + 1, 0)
     } else {
-        (cells / cols, cells % cols)
+        (c.row, c.col)
     }
 }
 
@@ -48,65 +71,133 @@ pub fn cursor_position(
 mod tests {
     use super::*;
 
-    #[test]
-    fn an_empty_line_still_occupies_a_row() {
-        assert_eq!(rows_needed(0, 0, 80), 1);
+    const COLS: usize = 10;
+
+    /// Where a visible cursor at the end of `text` sits -- `cursor_position` at the end of the
+    /// line, the shape every existing test below was written against before `cursor_position` grew
+    /// a `cursor` parameter. Not "where the next glyph would go": at a full row, those differ (see
+    /// `cursor_position`'s own doc comment).
+    fn insertion_point(prefix: &str, text: &str, cols: usize) -> (usize, usize) {
+        cursor_position(prefix, text, text.len(), cols)
     }
 
     #[test]
-    fn a_short_line_is_one_row() {
-        assert_eq!(rows_needed(10, 5, 80), 1);
+    fn an_empty_line_is_one_row_with_the_cursor_after_the_prefix() {
+        assert_eq!(rows_needed("", "", COLS), 1);
+        assert_eq!(rows_needed("> ", "", COLS), 1);
+        assert_eq!(insertion_point("> ", "", COLS), (0, 2));
+        assert_eq!(insertion_point("", "", COLS), (0, 0));
     }
 
     #[test]
-    fn a_line_exactly_filling_a_row_does_not_claim_another() {
-        assert_eq!(rows_needed(10, 70, 80), 1);
+    fn a_line_grows_a_row_only_when_a_glyph_no_longer_fits() {
+        // "> " is two cells, so eight characters fill the row exactly.
+        assert_eq!(rows_needed("> ", "1234567", COLS), 1);
+        assert_eq!(rows_needed("> ", "12345678", COLS), 1);
+        assert_eq!(rows_needed("> ", "123456789", COLS), 2);
+        assert_eq!(rows_needed("> ", "12345678901234567890", COLS), 3);
     }
 
     #[test]
-    fn one_cell_past_a_full_row_wraps() {
-        assert_eq!(rows_needed(10, 71, 80), 2);
-        assert_eq!(rows_needed(0, 161, 80), 3);
+    fn the_insertion_point_after_a_full_row_is_the_start_of_the_next() {
+        assert_eq!(insertion_point("> ", "1234567", COLS), (0, 9));
+        // Exactly 10 cells (a full row): the cursor stays on the last column, deferred-wrap style
+        // (`cursor_position`'s own doc comment) -- there's no real next character to jump to yet.
+        assert_eq!(insertion_point("> ", "12345678", COLS), (0, 9));
+        assert_eq!(insertion_point("> ", "123456789", COLS), (1, 1));
+        assert_eq!(insertion_point("> ", "1234567890123456", COLS), (1, 8));
+        // 20 cells: two full rows, same deferred-wrap reasoning -- stays on the second row's last column.
+        assert_eq!(insertion_point("> ", "123456789012345678", COLS), (1, 9));
     }
 
     #[test]
-    fn the_prefix_counts_toward_the_row() {
-        assert_eq!(rows_needed(79, 2, 80), 2);
+    fn a_wide_glyph_that_does_not_fit_moves_to_the_next_row_whole() {
+        // Two prefix cells plus seven letters leave one cell: the wide glyph starts the next row.
+        assert_eq!(rows_needed("> ", "1234567日", COLS), 2);
+        assert_eq!(insertion_point("> ", "1234567日", COLS), (1, 2));
+        // With room for it, it stays.
+        assert_eq!(rows_needed("> ", "123456日", COLS), 1);
+        // Filled the row exactly: deferred-wrap, stays on the last column (same as the plain-text case above).
+        assert_eq!(insertion_point("> ", "123456日", COLS), (0, 9));
+        assert_eq!(insertion_point("> ", "12345日", COLS), (0, 9));
     }
 
     #[test]
-    fn a_line_may_use_all_but_the_last_row() {
-        // 30 rows: 29 are allowed, 30 are not.
-        assert!(fits_on_screen(0, 29 * 80, 80, 30));
-        assert!(!fits_on_screen(0, 29 * 80 + 1, 80, 30));
+    fn a_line_of_wide_glyphs_takes_two_cells_each() {
+        // Five per row on ten columns.
+        assert_eq!(rows_needed("", "日日日日日", COLS), 1);
+        assert_eq!(rows_needed("", "日日日日日日", COLS), 2);
+        assert_eq!(insertion_point("", "日日日日日日", COLS), (1, 2));
+        // An odd number of columns leaves one cell blank at the end of each row.
+        assert_eq!(rows_needed("", "日日日", 5), 2);
     }
 
     #[test]
-    fn the_cursor_at_the_start_is_right_after_the_prefix() {
-        assert_eq!(cursor_position(2, 5, 0, 10), (0, 2));
-        assert_eq!(cursor_position(0, 5, 0, 10), (0, 0));
+    fn zero_width_characters_take_no_cell() {
+        assert_eq!(insertion_point("> ", "a\u{200D}b", COLS), (0, 4));
+        assert_eq!(rows_needed("", "\u{200D}\u{FE0F}", COLS), 1);
     }
 
     #[test]
-    fn the_cursor_mid_line_depends_only_on_what_precedes_it() {
-        assert_eq!(cursor_position(2, 5, 3, 10), (0, 5));
-        assert_eq!(cursor_position(2, 3, 3, 10), (0, 5));
+    fn the_line_may_use_all_but_one_row_of_the_screen() {
+        let rows = 4; // three rows of ten cells = 30 cells, prefix included
+        let ok = "x".repeat(28);
+        let full = "x".repeat(30);
+        assert!(fits_on_screen("> ", &ok, COLS, rows)); // 30 cells: three rows, the last one exactly full
+        assert!(!fits_on_screen("> ", &full, COLS, rows)); // 32 cells: a fourth row
+        assert!(fits_on_screen("", "", COLS, 2));
+        assert!(!fits_on_screen("", "", COLS, 1));
     }
 
     #[test]
-    fn the_cursor_at_the_very_end_of_a_full_row_stays_on_it() {
-        // Regression: this once resolved to "the next row", past `rows_needed`'s own count -- an
-        // out-of-range row for `put_char_at` when the line ended on the screen's last row.
-        assert_eq!(cursor_position(0, 10, 10, 10), (0, 9));
-        assert_eq!(rows_needed(0, 10, 10) - 1, 0);
-        assert_eq!(cursor_position(2, 18, 18, 10), (1, 9));
+    fn cursor_position_at_the_start_is_right_after_the_prefix() {
+        assert_eq!(cursor_position("> ", "hello", 0, COLS), (0, 2));
+        assert_eq!(cursor_position("", "hello", 0, COLS), (0, 0));
     }
 
     #[test]
-    fn the_cursor_just_before_the_end_of_a_full_row_wraps_to_the_next_row() {
-        // "> " (2) + 8 characters fill row 0 exactly, so byte 8 of a longer line starts row 1.
-        assert_eq!(cursor_position(2, 20, 8, 10), (1, 0));
-        assert_eq!(cursor_position(2, 20, 9, 10), (1, 1));
-        assert_eq!(cursor_position(2, 20, 20, 10), (2, 2));
+    fn cursor_position_mid_line_ignores_what_comes_after_it() {
+        // Same offset regardless of what follows the cursor -- only the text *before* it counts.
+        assert_eq!(cursor_position("> ", "hello", 3, COLS), (0, 5));
+        assert_eq!(cursor_position("> ", "hel", 3, COLS), (0, 5));
+    }
+
+    #[test]
+    fn cursor_position_at_the_very_end_of_a_full_row_stays_on_it() {
+        // Regression: a cursor at the end of text that exactly fills the last row of the *screen*
+        // (not just of the line) once resolved to "the next row" past `rows_needed`'s own count --
+        // an out-of-range row `console::put_char_at` then panicked on. Deferred-wrap keeps it in
+        // bounds: with nothing actually typed past this point, the cursor stays on the row the text
+        // occupies, at its last column, exactly like `Cursor::end_glyph`'s own `wrap_pending` state
+        // (`cells.rs`) -- never past `rows_needed(prefix, text, cols) - 1`.
+        let text = "1234567890"; // exactly one full row of COLS=10
+        assert_eq!(cursor_position("", text, text.len(), COLS), (0, COLS - 1));
+        assert_eq!(rows_needed("", text, COLS) - 1, 0); // the row `cursor_position` landed on
+    }
+
+    #[test]
+    fn cursor_position_on_a_wrapped_line() {
+        // "> " (2) + 8 chars fills row 0 exactly, so a cursor at byte 8 starts row 1.
+        assert_eq!(
+            cursor_position("> ", "12345678901234567890", 8, COLS),
+            (1, 0)
+        );
+        assert_eq!(
+            cursor_position("> ", "12345678901234567890", 9, COLS),
+            (1, 1)
+        );
+        // The end of the line, on a line that wraps twice.
+        assert_eq!(
+            cursor_position("> ", "12345678901234567890", 20, COLS),
+            (2, 2)
+        );
+    }
+
+    #[test]
+    fn cursor_position_right_after_a_wide_character() {
+        // "日" occupies two cells; a cursor placed right after it (byte offset 3, its UTF-8 width)
+        // lands in the third cell, not inside the glyph it just passed.
+        assert_eq!(cursor_position("", "日", 3, COLS), (0, 2));
+        assert_eq!(cursor_position("> ", "日日", 3, COLS), (0, 4));
     }
 }
