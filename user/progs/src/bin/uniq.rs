@@ -1,6 +1,7 @@
-//! `uniq [-c] [-d] [-u] [file]`: collapses each run of identical adjacent lines to one (so it
+//! `uniq [-c] [-d] [-i] [-u] [file]`: collapses each run of identical adjacent lines to one (so it
 //! wants sorted input, as `sort | uniq` gives it): `-c` prefixes each line with how many there
-//! were, `-d` prints only lines that were repeated, `-u` only lines that were not. Standard input
+//! were, `-d` prints only lines that were repeated, `-u` only lines that were not, `-i` compares
+//! without regard to ASCII case (the first line of a run is printed as typed). Standard input
 //! for no file, or `-`. Output goes to standard output only.
 #![no_std]
 #![no_main]
@@ -16,19 +17,32 @@ use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
 
-const USAGE: &str = "uniq [-c] [-d] [-u] [file]";
+const USAGE: &str = "uniq [-c] [-d] [-i] [-u] [file]";
 const FLAGS: &[(&str, &str)] = &[
     ("-c", "prefix each line with the number of times it occurs"),
     ("-d", "print only lines that are repeated"),
+    (
+        "-i",
+        "ignore differences in case (ASCII letters) when comparing",
+    ),
     ("-u", "print only lines that are not repeated"),
 ];
+
+fn same(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
+    if ignore_case {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
 
 fn run(args: Args) -> ExitCode {
     cli::status(uniq(args))
 }
 
 fn uniq(args: Args) -> Result<ExitCode, ExitCode> {
-    let (mut count, mut only_repeated, mut only_unique) = (false, false, false);
+    let (mut count, mut only_repeated, mut only_unique, mut ignore_case) =
+        (false, false, false, false);
     let mut file: Option<&'static str> = None;
     let mut opts = cli::opts(args);
     while let Some(arg) = cli::next("uniq", &mut opts)? {
@@ -36,6 +50,7 @@ fn uniq(args: Args) -> Result<ExitCode, ExitCode> {
             Arg::Long("help") => return Ok(progs::help(USAGE, FLAGS)),
             Arg::Short('c') | Arg::Long("count") => count = true,
             Arg::Short('d') | Arg::Long("repeated") => only_repeated = true,
+            Arg::Short('i') | Arg::Long("ignore-case") => ignore_case = true,
             Arg::Short('u') | Arg::Long("unique") => only_unique = true,
             Arg::Positional(name) => {
                 if file.replace(name).is_some() {
@@ -60,7 +75,7 @@ fn uniq(args: Args) -> Result<ExitCode, ExitCode> {
     let mut i = 0;
     while i < lines.len() {
         let mut j = i + 1;
-        while j < lines.len() && lines[j] == lines[i] {
+        while j < lines.len() && same(lines[j], lines[i], ignore_case) {
             j += 1;
         }
         let n = j - i;

@@ -1,8 +1,9 @@
-//! `cut (-c LIST | -f LIST) [-d C] [-s] [file...]`: prints selected parts of each line: with `-c`
+//! `cut (-c LIST | -f LIST) [-d C] [-s] [--complement] [--output-delimiter=STR] [file...]`: prints selected parts of each line: with `-c`
 //! the characters at the positions in LIST (counted in UTF-8 characters, from 1), with `-f` the
 //! fields (split at the delimiter `C`, a tab by default) whose numbers are in LIST. A LIST is `N`,
 //! `N-M`, `N-`, `-M`, separated by commas. Selected fields are joined with the delimiter, in their
-//! original order; a line with no delimiter is printed whole, unless `-s`.
+//! original order; a line with no delimiter is printed whole, unless `-s`. `--complement` selects
+//! everything *not* in LIST instead.
 #![no_std]
 #![no_main]
 
@@ -18,12 +19,18 @@ use userlib::{Args, ExitCode};
 
 userlib::entry_with_args!(run);
 
-const USAGE: &str = "cut (-c LIST | -f LIST) [-d C] [-s] [file...]";
+const USAGE: &str =
+    "cut (-c LIST | -f LIST) [-d C] [-s] [--complement] [--output-delimiter=STR] [file...]";
 const FLAGS: &[(&str, &str)] = &[
     ("-c LIST", "select these character positions"),
     ("-f LIST", "select these fields"),
     ("-d C", "the field delimiter, one character (default: tab)"),
     ("-s", "with -f, skip lines that have no delimiter"),
+    ("--complement", "select everything except the LIST"),
+    (
+        "--output-delimiter=STR",
+        "with -f, join the selected fields with STR (default: the delimiter)",
+    ),
 ];
 
 fn run(args: Args) -> ExitCode {
@@ -49,6 +56,8 @@ fn cut(args: Args) -> Result<ExitCode, ExitCode> {
     let (mut fields, mut chars): (Option<&'static str>, Option<&'static str>) = (None, None);
     let mut delimiter = "\t";
     let mut only_delimited = false;
+    let mut complement = false;
+    let mut output_delimiter: Option<&'static str> = None;
     // Operands are gathered here, not by `cli::operands`: that second walk would take an option's
     // value for one.
     let mut names: Vec<&'static str> = Vec::new();
@@ -64,6 +73,10 @@ fn cut(args: Args) -> Result<ExitCode, ExitCode> {
                 delimiter = cli::value("cut", &mut opts)?;
             }
             Arg::Short('s') | Arg::Long("only-delimited") => only_delimited = true,
+            Arg::Long("complement") => complement = true,
+            Arg::Long("output-delimiter") => {
+                output_delimiter = Some(cli::value("cut", &mut opts)?);
+            }
             Arg::Positional(name) => names.push(name),
             other => return Err(cli::invalid("cut", other)),
         }
@@ -113,11 +126,13 @@ fn cut(args: Args) -> Result<ExitCode, ExitCode> {
                     &mut out,
                     line,
                     delimiter.as_bytes(),
+                    output_delimiter.unwrap_or(delimiter).as_bytes(),
                     &ranges,
+                    complement,
                     only_delimited,
                 );
             } else {
-                cut_chars(&mut out, line, &ranges);
+                cut_chars(&mut out, line, &ranges, complement);
             }
         }
     }
@@ -128,7 +143,9 @@ fn cut_fields(
     out: &mut Out,
     line: &[u8],
     delimiter: &[u8],
+    joiner: &[u8],
     ranges: &[Range],
+    complement: bool,
     only_delimited: bool,
 ) {
     let fields = split_fields(line, delimiter);
@@ -142,9 +159,9 @@ fn cut_fields(
     }
     let mut first = true;
     for (i, field) in fields.iter().enumerate() {
-        if cutlist::contains(ranges, i + 1) {
+        if cutlist::contains(ranges, i + 1) != complement {
             if !first {
-                out.put(delimiter);
+                out.put(joiner);
             }
             out.put(field);
             first = false;
@@ -155,18 +172,18 @@ fn cut_fields(
 
 /// The characters of `line` at the positions in `ranges`. A line that is not valid UTF-8 is cut
 /// by bytes instead.
-fn cut_chars(out: &mut Out, line: &[u8], ranges: &[Range]) {
+fn cut_chars(out: &mut Out, line: &[u8], ranges: &[Range], complement: bool) {
     match core::str::from_utf8(line) {
         Ok(text) => {
             for (i, (at, c)) in text.char_indices().enumerate() {
-                if cutlist::contains(ranges, i + 1) {
+                if cutlist::contains(ranges, i + 1) != complement {
                     out.put(&line[at..at + c.len_utf8()]);
                 }
             }
         }
         Err(_) => {
             for (i, byte) in line.iter().enumerate() {
-                if cutlist::contains(ranges, i + 1) {
+                if cutlist::contains(ranges, i + 1) != complement {
                     out.put(core::slice::from_ref(byte));
                 }
             }

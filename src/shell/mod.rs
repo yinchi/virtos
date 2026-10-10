@@ -120,10 +120,26 @@ fn set_last_status(code: i32) {
 /// visible to the shell that launched it (real Unix's `cd` is a shell builtin for exactly this
 /// reason), and there's only one working directory to begin with here -- the shell's own, since
 /// at most one program is ever resident (`fs::cwd`'s own doc comment).
+///
+/// `cd -` goes back to `$OLDPWD` and says where it went, as bash does; every successful `cd`
+/// leaves the directory it came from in `OLDPWD` (an ordinary exported variable in the current
+/// frame, so a child scope's own `cd` doesn't change its parent's `$OLDPWD`, just as it doesn't
+/// change its working directory). The lab has neither.
 #[cfg(target_os = "none")]
 fn cd(uart: &mut Uart, argv: &[String]) -> i32 {
     let home = frame_stack::var("HOME").filter(|home| !home.is_empty());
-    let target = argv.get(1).map_or(home.unwrap_or("/"), String::as_str);
+    let back = argv.get(1).is_some_and(|a| a == "-");
+    let target = if back {
+        match frame_stack::var("OLDPWD").filter(|old| !old.is_empty()) {
+            Some(old) => old,
+            None => {
+                report(uart, "cd: OLDPWD not set");
+                return 1;
+            }
+        }
+    } else {
+        argv.get(1).map_or(home.unwrap_or("/"), String::as_str)
+    };
     let absolute = fs::cwd::absolute(target);
     let Some((_, vol, rest)) = fs::path::volume_for(&absolute) else {
         report(uart, "no volume mounted there");
@@ -133,7 +149,13 @@ fn cd(uart: &mut Uart, argv: &[String]) -> i32 {
         report(uart, &format!("cd: {target}: {}", errmsg(e)));
         return 1;
     }
-    fs::cwd::set(absolute);
+    let old = fs::cwd::get();
+    fs::cwd::set(absolute.clone());
+    // `OLDPWD` is a valid name, so this cannot fail.
+    let _ = frame_stack::export_var("OLDPWD", Some(&old));
+    if back {
+        report(uart, &absolute);
+    }
     0
 }
 

@@ -32,6 +32,7 @@ pub fn split_fields<'a>(line: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
     fields
 }
 
+/// `b`, ASCII-lowercased if `ignore_case`.
 fn fold(b: u8, ignore_case: bool) -> u8 {
     if ignore_case {
         b.to_ascii_lowercase()
@@ -40,17 +41,78 @@ fn fold(b: u8, ignore_case: bool) -> u8 {
     }
 }
 
+/// The first position at or after `from` where `needle` occurs in `haystack`, comparing ASCII letters without regard to case
+/// if `ignore_case`. An empty needle occurs at `from` (if that is within the haystack, or at its end).
+pub fn find(haystack: &[u8], needle: &[u8], from: usize, ignore_case: bool) -> Option<usize> {
+    if from > haystack.len() {
+        return None;
+    }
+    if needle.is_empty() {
+        return Some(from);
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| {
+            w.iter()
+                .zip(needle)
+                .all(|(&a, &b)| fold(a, ignore_case) == fold(b, ignore_case))
+        })
+        .map(|p| p + from)
+}
+
 /// Whether `needle` occurs in `haystack`, comparing ASCII letters without regard to case if `ignore_case`. An empty needle
 /// occurs everywhere.
 pub fn contains(haystack: &[u8], needle: &[u8], ignore_case: bool) -> bool {
-    if needle.is_empty() {
-        return true;
+    find(haystack, needle, 0, ignore_case).is_some()
+}
+
+/// Which occurrences of a pattern in a line count as a match (`fgrep`'s `-w` and `-x`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MatchMode {
+    /// Anywhere in the line.
+    Any,
+    /// `-w`: bounded on both sides by a non-word byte (or the line's end); a word byte is `[A-Za-z0-9_]`.
+    Word,
+    /// `-x`: the whole line.
+    Line,
+}
+
+fn is_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The first match of `pattern` in `line` at or after `from`, as `(start, end)`, under `mode`. `Word` retries later
+/// occurrences when an earlier one is not bounded (`foobar foo` for `foo` is the second), and an empty pattern matches
+/// only an empty line, or (in `Word`) where no word byte touches it -- as GNU's `grep -Fw ''` does.
+pub fn match_in_line(
+    line: &[u8],
+    pattern: &[u8],
+    from: usize,
+    ignore_case: bool,
+    mode: MatchMode,
+) -> Option<(usize, usize)> {
+    match mode {
+        MatchMode::Line => {
+            let whole = from == 0
+                && line.len() == pattern.len()
+                && find(line, pattern, 0, ignore_case) == Some(0);
+            whole.then_some((0, line.len()))
+        }
+        MatchMode::Any => find(line, pattern, from, ignore_case).map(|s| (s, s + pattern.len())),
+        MatchMode::Word => {
+            let mut at = from;
+            while let Some(start) = find(line, pattern, at, ignore_case) {
+                let end = start + pattern.len();
+                let left_ok = start == 0 || !is_word(line[start - 1]);
+                let right_ok = end == line.len() || !is_word(line[end]);
+                if left_ok && right_ok {
+                    return Some((start, end));
+                }
+                at = start + 1;
+            }
+            None
+        }
     }
-    haystack.windows(needle.len()).any(|w| {
-        w.iter()
-            .zip(needle)
-            .all(|(&a, &b)| fold(a, ignore_case) == fold(b, ignore_case))
-    })
 }
 
 #[cfg(test)]
@@ -106,5 +168,36 @@ mod tests {
         assert!(!contains(b"Hello", b"hELLO", false));
         assert!(contains("É".as_bytes(), "É".as_bytes(), true));
         assert!(!contains("É".as_bytes(), "é".as_bytes(), true)); // not folded
+    }
+
+    #[test]
+    fn find_from_a_position() {
+        assert_eq!(find(b"abcabc", b"bc", 0, false), Some(1));
+        assert_eq!(find(b"abcabc", b"bc", 2, false), Some(4));
+        assert_eq!(find(b"abcabc", b"bc", 5, false), None);
+        assert_eq!(find(b"abc", b"", 3, false), Some(3));
+        assert_eq!(find(b"abc", b"", 4, false), None);
+        assert_eq!(find(b"ABC", b"b", 0, true), Some(1));
+    }
+
+    #[test]
+    fn whole_line_matches() {
+        let line =
+            |l: &str, p: &str| match_in_line(l.as_bytes(), p.as_bytes(), 0, false, MatchMode::Line);
+        assert_eq!(line("abc", "abc"), Some((0, 3)));
+        assert_eq!(line("abcd", "abc"), None);
+        assert_eq!(line("", ""), Some((0, 0)));
+    }
+
+    #[test]
+    fn word_matches_retry_later_occurrences() {
+        let word =
+            |l: &str, p: &str| match_in_line(l.as_bytes(), p.as_bytes(), 0, false, MatchMode::Word);
+        assert_eq!(word("foo bar", "foo"), Some((0, 3)));
+        assert_eq!(word("foobar foo", "foo"), Some((7, 10)));
+        assert_eq!(word("foobar", "foo"), None);
+        assert_eq!(word("a_foo foo.", "foo"), Some((6, 9)));
+        assert_eq!(word("(foo)", "foo"), Some((1, 4)));
+        assert_eq!(word("xfoo", "foo"), None);
     }
 }

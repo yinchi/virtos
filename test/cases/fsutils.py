@@ -23,6 +23,14 @@ def run(ctx):
     # ------------------------------------------------------------------ pwd and cd
     check("pwd starts in $HOME", s.run("pwd"), "/root\n")
     check("cd to a directory", s.run("cd /data/tree") + s.run("pwd"), "/data/tree\n")
+    check("cd - goes back and says where", s.run("cd /tmp") + s.run("cd -") + s.run("pwd"), "/data/tree\n/data/tree\n")
+    check("$OLDPWD is where it came from", s.run("echo $OLDPWD"), "/tmp\n")
+    check("cd - toggles between two directories", s.run("cd -") + s.run("cd -"), "/tmp\n/data/tree\n")
+    check("OLDPWD is exported", s.run("printenv OLDPWD"), "/tmp\n")
+    s.run("unset OLDPWD")
+    check("cd - with no OLDPWD says so", s.run("cd -"), "cd: OLDPWD not set\n")
+    check("...with status 1", s.status("cd -")[1], 1)
+    check("...and the directory is unchanged", s.run("pwd"), "/data/tree\n")
     check("cd resolves .. lexically", s.run("cd b/..") + s.run("pwd"), "/data/tree\n")
     check("cd .. goes up", s.run("cd ..") + s.run("pwd"), "/data\n")
     check("cd with no argument goes to $HOME", s.run("cd") + s.run("pwd"), "/root\n")
@@ -130,6 +138,23 @@ def run(ctx):
     check("rmdir removes an empty directory", s.run("rmdir /tmp/d1") + s.run("ls /tmp"), "p\n")
     check("rmdir refuses a non-empty one", s.run("rmdir /tmp/p"), "rmdir: failed to remove '/tmp/p': Directory not empty\n")
     check("rmdir refuses a file", s.run("rmdir /data/small.txt"), "rmdir: failed to remove '/data/small.txt': Not a directory\n")
+    s.run("cd /tmp")
+    s.run("mkdir -p rp/a/b")
+    check("rmdir -p -v removes each parent, saying so",
+          s.run("rmdir -pv rp/a/b"),
+          "rmdir: removing directory, 'rp/a/b'\nrmdir: removing directory, 'rp/a'\nrmdir: removing directory, 'rp'\n")
+    check("...and they are gone", s.run("ls /tmp"), "p\n")
+    s.run("mkdir -p rp/a/b")
+    s.run("echo x > rp/a/f")
+    check("rmdir -p stops at the first parent that is not empty",
+          s.run("rmdir -p rp/a/b"),
+          "rmdir: failed to remove 'rp/a': Directory not empty\n")
+    check("...having removed the leaf", s.run("ls rp/a"), "f\n")
+    check("--ignore-fail-on-non-empty is quiet...", s.run("rmdir -p --ignore-fail-on-non-empty rp/a"), "")
+    check("...and not a failure", s.status("rmdir --ignore-fail-on-non-empty rp/a")[1], 0)
+    check("rmdir -v says each plain removal", s.run("mkdir rp/z") + s.run("rmdir -v rp/z"), "rmdir: removing directory, 'rp/z'\n")
+    s.run("rm -r rp")
+    s.run("cd -")
     check("rm removes a file", s.run("echo x > /tmp/f") + s.run("rm /tmp/f") + s.run("ls /tmp"), "p\n")
     check("rm of a missing file is an error", s.run("rm /tmp/f"), "rm: cannot remove '/tmp/f': No such file or directory\n")
     check("rm -f ignores it", s.run("rm -f /tmp/f"), "")

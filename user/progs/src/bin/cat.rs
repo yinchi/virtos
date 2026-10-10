@@ -1,4 +1,4 @@
-//! `cat [-n] [-E] [-T] [-s] [file...]`: prints each named file's content to stdout, in order. The
+//! `cat [-n] [-E] [-T] [-s] [-u] [file...]`: prints each named file's content to stdout, in order. The
 //! first real consumer of `open`/`close`, proving that round trip the same way `hello` proved
 //! `exit` and `echo` proved `argv`. No operand, or a lone `-` as one, reads fd 0 instead (GNU's
 //! own convention: `cat a - b` reads `a`, then stdin, then `b`) -- the interactive keyboard
@@ -7,7 +7,8 @@
 //! `-n` numbers every output line, `-E` puts a `$` at the end of each, `-T` shows a tab as `^I`,
 //! `-s` squeezes runs of blank lines into one. Numbers and the blank-line memory carry across
 //! files, as in GNU's. With none of the flags it is the plain byte copy it always was, streamed
-//! through a fixed buffer, so binary files are safe to `cat`.
+//! through a fixed buffer, so binary files are safe to `cat`. `-u` is accepted and changes
+//! nothing: output is never buffered here to begin with.
 #![no_std]
 #![no_main]
 
@@ -24,12 +25,13 @@ userlib::entry_with_args!(run);
 /// Read in fixed chunks off the stack -- no reason to reach for the heap just to copy bytes
 /// through unmodified.
 const BUF_SIZE: usize = 512;
-const USAGE: &str = "cat [-n] [-E] [-T] [-s] [file...]";
+const USAGE: &str = "cat [-n] [-E] [-T] [-s] [-u] [file...]";
 const FLAGS: &[(&str, &str)] = &[
     ("-n", "number all output lines"),
     ("-E", "display $ at the end of each line"),
     ("-T", "display tabs as ^I"),
     ("-s", "squeeze runs of blank lines into one"),
+    ("-u", "(ignored) output is never buffered"),
 ];
 
 /// Streams `path`'s content to stdout -- fd 0 directly if `path` is `-`, otherwise `open`ed and
@@ -88,6 +90,7 @@ fn concatenate(args: Args) -> Result<ExitCode, ExitCode> {
             Arg::Short('E') | Arg::Long("show-ends") => flags.dollar = true,
             Arg::Short('T') | Arg::Long("show-tabs") => flags.tabs = true,
             Arg::Short('s') | Arg::Long("squeeze-blank") => flags.squeeze = true,
+            Arg::Short('u') => {}
             Arg::Positional(_) => any_file = true,
             other => return Err(cli::invalid("cat", other)),
         }

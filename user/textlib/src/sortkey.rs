@@ -59,19 +59,49 @@ fn magnitude(a: &Number, b: &Number) -> Ordering {
         .then_with(|| a.frac.cmp(b.frac))
 }
 
-/// Compares two lines as `sort` does: numerically if `numeric`, else bytewise; with `last_resort`, lines whose keys are equal
-/// then compare bytewise as whole lines.
-pub fn compare(a: &[u8], b: &[u8], numeric: bool, last_resort: bool) -> Ordering {
-    let key = if numeric {
-        let (x, y) = (parse(a), parse(b));
+/// How a line is turned into its key before comparing: `-n`, `-f` and `-b`. (`-r` and `-u` are the caller's: they act on
+/// the order and the duplicates, not on the key.)
+#[derive(Clone, Copy, Default)]
+pub struct Opts {
+    /// `-n`: the key is the leading number.
+    pub numeric: bool,
+    /// `-f`: ASCII letters compare without regard to case (bytewise comparison only; a number has no letters to fold).
+    pub fold: bool,
+    /// `-b`: the line's leading blanks (spaces, tabs) are not part of the key.
+    pub skip_blanks: bool,
+}
+
+fn skip_blanks(line: &[u8]) -> &[u8] {
+    let n = line
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    &line[n..]
+}
+
+/// Compares two lines as `sort` does: numerically if `opts.numeric`, else bytewise (folded with `opts.fold`, from the
+/// first non-blank with `opts.skip_blanks`); with `last_resort`, lines whose keys are equal then compare bytewise as whole
+/// lines.
+pub fn compare(a: &[u8], b: &[u8], opts: Opts, last_resort: bool) -> Ordering {
+    let (ka, kb) = if opts.skip_blanks {
+        (skip_blanks(a), skip_blanks(b))
+    } else {
+        (a, b)
+    };
+    let key = if opts.numeric {
+        let (x, y) = (parse(ka), parse(kb));
         match (x.negative, y.negative) {
             (false, true) => Ordering::Greater,
             (true, false) => Ordering::Less,
             (false, false) => magnitude(&x, &y),
             (true, true) => magnitude(&y, &x),
         }
+    } else if opts.fold {
+        ka.iter()
+            .map(u8::to_ascii_lowercase)
+            .cmp(kb.iter().map(u8::to_ascii_lowercase))
     } else {
-        a.cmp(b)
+        ka.cmp(kb)
     };
     if last_resort {
         key.then_with(|| a.cmp(b))
@@ -84,13 +114,24 @@ pub fn compare(a: &[u8], b: &[u8], numeric: bool, last_resort: bool) -> Ordering
 mod tests {
     use super::*;
 
+    const NUMERIC: Opts = Opts {
+        numeric: true,
+        fold: false,
+        skip_blanks: false,
+    };
+    const PLAIN: Opts = Opts {
+        numeric: false,
+        fold: false,
+        skip_blanks: false,
+    };
+
     fn num(a: &str, b: &str) -> Ordering {
-        compare(a.as_bytes(), b.as_bytes(), true, false)
+        compare(a.as_bytes(), b.as_bytes(), NUMERIC, false)
     }
 
     #[test]
     fn bytewise_by_default() {
-        let cmp = |a: &str, b: &str| compare(a.as_bytes(), b.as_bytes(), false, true);
+        let cmp = |a: &str, b: &str| compare(a.as_bytes(), b.as_bytes(), PLAIN, true);
         assert_eq!(cmp("a", "b"), Ordering::Less);
         assert_eq!(cmp("Z", "a"), Ordering::Less); // the C locale
         assert_eq!(cmp("ab", "abc"), Ordering::Less); // a prefix is smaller
@@ -153,10 +194,38 @@ mod tests {
 
     #[test]
     fn equal_keys_fall_back_to_the_whole_line() {
-        let with = |a: &str, b: &str| compare(a.as_bytes(), b.as_bytes(), true, true);
+        let with = |a: &str, b: &str| compare(a.as_bytes(), b.as_bytes(), NUMERIC, true);
         assert_eq!(with("1 b", "1 a"), Ordering::Greater);
         assert_eq!(with("1", "01"), Ordering::Greater); // "1" > "01" as text
         assert_eq!(with("a", "b"), Ordering::Less); // both zero
         assert_eq!(num("1 b", "1 a"), Ordering::Equal); // without the last resort, equal
+    }
+
+    #[test]
+    fn folding_ignores_ascii_case() {
+        let fold = Opts {
+            fold: true,
+            ..PLAIN
+        };
+        let cmp = |a: &str, b: &str, last| compare(a.as_bytes(), b.as_bytes(), fold, last);
+        assert_eq!(cmp("Apple", "apple", false), Ordering::Equal);
+        assert_eq!(cmp("apple", "Banana", false), Ordering::Less); // not the C locale's `B` < `a`
+        assert_eq!(cmp("Z", "a", false), Ordering::Greater);
+        // Equal under folding falls back to the whole line, bytewise: `A` before `a`.
+        assert_eq!(cmp("a", "A", true), Ordering::Greater);
+        assert_eq!(cmp("É", "é", false), Ordering::Less); // only ASCII folds
+    }
+
+    #[test]
+    fn skipping_blanks_compares_from_the_first_non_blank() {
+        let blanks = Opts {
+            skip_blanks: true,
+            ..PLAIN
+        };
+        let cmp = |a: &str, b: &str| compare(a.as_bytes(), b.as_bytes(), blanks, false);
+        assert_eq!(cmp("  b", "a"), Ordering::Greater); // plain: a leading space sorts first
+        assert_eq!(cmp(" \t a", "a"), Ordering::Equal);
+        assert_eq!(cmp("", "   "), Ordering::Equal);
+        assert_eq!(compare(b"  b", b"a", PLAIN, false), Ordering::Less);
     }
 }
