@@ -5,10 +5,16 @@
 //! never splits here -- that already happened once, at lex time (`lexer`'s own doc comment) --
 //! only an expansion's *resolved value*, unknown until now, can still need it.
 //!
-//! Pure logic: the actual variable/`$?` lookup is a parameter (`var`/`status` below), supplied by
-//! the real call site (`shell::mod`, bare-metal only, backed by `frame_stack::var`/
-//! `shell::last_status`) rather than reached into directly -- host-tested the same way `fs::
-//! sector`/`exec::argplan` already are.
+//! A command substitution (`Part::Subst`) is just another expansion whose value comes from
+//! outside: it is run by `subst` -- a callback taking the inner command's source and returning
+//! what it wrote to stdout, or a message if it could not run -- and its result then has *all*
+//! trailing newlines removed, as the shell's does, before being spliced in like any other value
+//! (quoted: one field; unquoted: split on blanks, vanishing if empty).
+//!
+//! Pure logic: the actual variable/`$?` lookup and the running of a substitution are parameters
+//! (`var`/`status`/`subst` below), supplied by the real call site (`shell::mod`, bare-metal only,
+//! backed by `frame_stack::var`/`shell::last_status`/the executor) rather than reached into
+//! directly -- host-tested the same way `fs::sector`/`exec::argplan` already are.
 
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -19,15 +25,31 @@ use super::lexer::{Part, Word};
 /// Expands every word in `words` into real argument strings, in order -- a word that vanishes
 /// entirely (an unquoted expansion whose value is empty/all-blank, and nothing else in that word)
 /// contributes no argument at all, so the output can have fewer entries than `words` itself.
+///
+/// `Err` is the message from a substitution that could not run; nothing after it is expanded.
 pub fn expand_words(
     words: &[Word],
     var: &impl Fn(&str) -> Option<String>,
     status: i32,
-) -> Vec<String> {
-    words
-        .iter()
-        .flat_map(|word| expand_word(word, var, status))
-        .collect()
+    subst: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for word in words {
+        out.extend(expand_word(word, var, status, subst)?);
+    }
+    Ok(out)
+}
+
+/// A substitution's value as spliced in: its output with every trailing newline removed.
+fn subst_value(
+    text: &str,
+    subst: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    let mut value = subst(text)?;
+    while value.ends_with('\n') {
+        value.pop();
+    }
+    Ok(value)
 }
 
 /// Expands `word` (an assignment's *value* half, from `Word::assignment`) into one string, with
@@ -39,25 +61,49 @@ pub fn expand_assignment_value(
     word: &Word,
     var: &impl Fn(&str) -> Option<String>,
     status: i32,
-) -> String {
+    subst: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
     let mut s = String::new();
     for part in &word.parts {
         match part {
             Part::Lit(text) => s.push_str(text),
             Part::Var { name, .. } => s.push_str(&var(name).unwrap_or_default()),
             Part::Status { .. } => s.push_str(&status.to_string()),
+            Part::Subst { text, .. } => s.push_str(&subst_value(text, subst)?),
         }
     }
-    s
+    Ok(s)
+}
+
+/// Expands `word` as a redirection's target: variables and substitutions expanded, **no**
+/// splitting beyond what quoting already decided -- it must come out as exactly one field, else
+/// `ambiguous redirect` (an unquoted expansion that is empty, or that holds blanks).
+pub fn expand_target(
+    word: &Word,
+    var: &impl Fn(&str) -> Option<String>,
+    status: i32,
+    subst: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    let mut fields = expand_word(word, var, status, subst)?;
+    if fields.len() == 1 {
+        Ok(fields.remove(0))
+    } else {
+        Err(alloc::format!("{}: ambiguous redirect", word.raw()))
+    }
 }
 
 /// Expands one word into zero or more fields. `parts` empty (only ever an explicitly empty quoted
 /// word, `""`/`''` -- `lexer::Word`'s own doc comment) is always exactly one empty field, never
 /// zero: that distinction -- "a word that happens to be empty" vs. "nothing here at all" -- is
 /// exactly what quoting decides, and an empty `Word` only ever arises from the former.
-fn expand_word(word: &Word, var: &impl Fn(&str) -> Option<String>, status: i32) -> Vec<String> {
+fn expand_word(
+    word: &Word,
+    var: &impl Fn(&str) -> Option<String>,
+    status: i32,
+    subst: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<Vec<String>, String> {
     if word.parts.is_empty() {
-        return vec![String::new()];
+        return Ok(vec![String::new()]);
     }
     let mut fields = Vec::new();
     let mut current = String::new();
@@ -88,12 +134,22 @@ fn expand_word(word: &Word, var: &impl Fn(&str) -> Option<String>, status: i32) 
                     *quoted,
                 );
             }
+            Part::Subst { text, quoted } => {
+                let value = subst_value(text, subst)?;
+                glue(
+                    &mut fields,
+                    &mut current,
+                    &mut have_current,
+                    &value,
+                    *quoted,
+                );
+            }
         }
     }
     if have_current {
         fields.push(current);
     }
-    fields
+    Ok(fields)
 }
 
 /// Glues one expansion's `value` onto `current` (the field being built so far), splitting it
@@ -158,8 +214,28 @@ mod tests {
         }
     }
 
+    /// A stand-in for running a substitution: `echo X` prints `X` and a newline, `blanks` prints
+    /// a few words with trailing newlines, anything else is a failure.
+    fn fake_subst(text: &str) -> Result<String, String> {
+        match text {
+            "echo hi" => Ok("hi\n".into()),
+            "words" => Ok("a b\nc\n\n\n".into()),
+            "empty" => Ok(String::new()),
+            "inner-newlines" => Ok("x\n\ny\n".into()),
+            "blank" => Ok("  \n".into()),
+            _ => Err("substitution failed".into()),
+        }
+    }
+
     fn expand_one(w: Word, status: i32) -> Vec<String> {
-        expand_word(&w, &lookup, status)
+        expand_word(&w, &lookup, status, &mut fake_subst).unwrap()
+    }
+
+    fn subst_part(text: &str, quoted: bool) -> Part {
+        Part::Subst {
+            text: text.into(),
+            quoted,
+        }
     }
 
     #[test]
@@ -254,13 +330,22 @@ mod tests {
             word(vec![var_part("MISSING", false)]),
             word(vec![lit("a"), var_part("FOO", false)]),
         ];
-        assert_eq!(expand_words(&words, &lookup, 0), ["echo", "abar"]);
+        assert_eq!(
+            expand_words(&words, &lookup, 0, &mut fake_subst).unwrap(),
+            ["echo", "abar"]
+        );
     }
 
     #[test]
     fn assignment_value_does_not_split_a_multi_word_variable() {
         assert_eq!(
-            expand_assignment_value(&word(vec![var_part("MULTI", false)]), &lookup, 0),
+            expand_assignment_value(
+                &word(vec![var_part("MULTI", false)]),
+                &lookup,
+                0,
+                &mut fake_subst
+            )
+            .unwrap(),
             "a b c"
         );
     }
@@ -268,7 +353,13 @@ mod tests {
     #[test]
     fn assignment_value_of_an_unset_variable_is_empty_not_vanished() {
         assert_eq!(
-            expand_assignment_value(&word(vec![var_part("MISSING", false)]), &lookup, 0),
+            expand_assignment_value(
+                &word(vec![var_part("MISSING", false)]),
+                &lookup,
+                0,
+                &mut fake_subst
+            )
+            .unwrap(),
             ""
         );
     }
@@ -276,8 +367,130 @@ mod tests {
     #[test]
     fn assignment_value_can_glue_literal_text_and_an_expansion() {
         assert_eq!(
-            expand_assignment_value(&word(vec![lit("x="), var_part("FOO", false)]), &lookup, 0),
+            expand_assignment_value(
+                &word(vec![lit("x="), var_part("FOO", false)]),
+                &lookup,
+                0,
+                &mut fake_subst
+            )
+            .unwrap(),
             "x=bar"
+        );
+    }
+
+    // ---- command substitution ----
+
+    #[test]
+    fn a_substitutions_trailing_newlines_are_all_removed() {
+        assert_eq!(
+            expand_one(word(vec![subst_part("echo hi", true)]), 0),
+            ["hi"]
+        );
+        assert_eq!(
+            expand_one(word(vec![subst_part("inner-newlines", true)]), 0),
+            ["x\n\ny"]
+        );
+    }
+
+    #[test]
+    fn a_quoted_substitution_is_one_field_even_with_blanks_or_empty() {
+        assert_eq!(
+            expand_one(word(vec![subst_part("words", true)]), 0),
+            ["a b\nc"]
+        );
+        assert_eq!(expand_one(word(vec![subst_part("empty", true)]), 0), [""]);
+    }
+
+    #[test]
+    fn an_unquoted_substitution_splits_and_an_empty_one_vanishes() {
+        assert_eq!(
+            expand_one(word(vec![subst_part("words", false)]), 0),
+            ["a", "b", "c"]
+        );
+        let none: Vec<String> = Vec::new();
+        assert_eq!(expand_one(word(vec![subst_part("empty", false)]), 0), none);
+        assert_eq!(expand_one(word(vec![subst_part("blank", false)]), 0), none);
+    }
+
+    #[test]
+    fn a_substitution_glues_to_the_text_around_it() {
+        assert_eq!(
+            expand_one(
+                word(vec![lit("<"), subst_part("echo hi", false), lit(">")]),
+                0
+            ),
+            ["<hi>"]
+        );
+        assert_eq!(
+            expand_one(
+                word(vec![lit("<"), subst_part("words", false), lit(">")]),
+                0
+            ),
+            ["<a", "b", "c>"]
+        );
+    }
+
+    #[test]
+    fn an_assignment_value_is_not_split() {
+        let value = expand_assignment_value(
+            &word(vec![lit("x="), subst_part("words", false)]),
+            &lookup,
+            0,
+            &mut fake_subst,
+        )
+        .unwrap();
+        assert_eq!(value, "x=a b\nc");
+    }
+
+    #[test]
+    fn a_failing_substitution_stops_the_expansion() {
+        let words = [
+            word(vec![lit("a")]),
+            word(vec![subst_part("boom", false)]),
+            word(vec![subst_part("echo hi", false)]),
+        ];
+        let mut calls = 0;
+        let result = expand_words(&words, &lookup, 0, &mut |t| {
+            calls += 1;
+            fake_subst(t)
+        });
+        assert_eq!(result, Err("substitution failed".into()));
+        assert_eq!(calls, 1); // the one after it never ran
+    }
+
+    #[test]
+    fn substitutions_run_in_word_order() {
+        let words = [
+            word(vec![subst_part("echo hi", false)]),
+            word(vec![subst_part("words", false)]),
+        ];
+        let mut order: Vec<String> = Vec::new();
+        expand_words(&words, &lookup, 0, &mut |t| {
+            order.push(t.into());
+            fake_subst(t)
+        })
+        .unwrap();
+        assert_eq!(order, ["echo hi", "words"]);
+    }
+
+    #[test]
+    fn a_redirect_target_must_be_exactly_one_field() {
+        let one = word(vec![lit("f"), subst_part("echo hi", false)]);
+        assert_eq!(
+            expand_target(&one, &lookup, 0, &mut fake_subst),
+            Ok("fhi".into())
+        );
+        let many = word(vec![var_part("MULTI", false)]);
+        assert_eq!(
+            expand_target(&many, &lookup, 0, &mut fake_subst),
+            Err("$MULTI: ambiguous redirect".into())
+        );
+        let none = word(vec![var_part("EMPTY", false)]);
+        assert!(expand_target(&none, &lookup, 0, &mut fake_subst).is_err());
+        let quoted_empty = word(vec![var_part("EMPTY", true)]);
+        assert_eq!(
+            expand_target(&quoted_empty, &lookup, 0, &mut fake_subst),
+            Ok(String::new())
         );
     }
 }

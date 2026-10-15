@@ -12,15 +12,14 @@ use alloc::vec::Vec;
 
 use super::lexer::{self, LexError, Part, RedirOp, Token, Word};
 
-/// One redirection a `Segment` applies before its program starts. Its own target is plain text,
-/// not a `Word` -- `$VAR` expansion inside a redirect target isn't implemented yet (`echo x >
-/// $FILE` stays unimplemented, `$FILE` taken as a literal name): `Word::raw()` reconstructs
-/// whatever text the lexer matched, rendering any expansion marker back as literal `$name`/`$?`
-/// rather than silently doing the wrong thing.
+/// One redirection a `Segment` applies before its program starts. A file target is a `Word`,
+/// expanded when the command runs (variables and command substitutions, but never split: it must
+/// come out as exactly one word, `shell::expand::expand_target`); `>&`'s target is plain text,
+/// checked here to be `1` or `2`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redirection {
-    In(String),
-    Out { fd: u8, path: String, append: bool },
+    In(Word),
+    Out { fd: u8, path: Word, append: bool },
     Dup { fd: u8, target: u8 },
 }
 
@@ -88,7 +87,41 @@ pub fn parse(line: &str) -> Result<List, SyntaxError> {
     if tokens.is_empty() {
         return Err(SyntaxError::EmptyCommand);
     }
-    grammar::list(&SliceByRef(&tokens)).map_err(decode_error)
+    let list = grammar::list(&SliceByRef(&tokens)).map_err(decode_error)?;
+    validate_substitutions(&list)?;
+    Ok(list)
+}
+
+/// Parses the inside of every command substitution in `list`, only to find a syntax error of the
+/// whole line now rather than when the substitution runs (after the commands before it did): a
+/// line is parsed before any of it runs, as a shell's is. The results are thrown away -- the
+/// executor parses a substitution's text again when it expands the word -- and an empty one
+/// (`$()`) is fine, just an empty string.
+fn validate_substitutions(list: &List) -> Result<(), SyntaxError> {
+    let words = list
+        .iter()
+        .flat_map(|and_or| {
+            core::iter::once(&and_or.first).chain(and_or.rest.iter().map(|(_, c)| c))
+        })
+        .flat_map(|command| command.pipeline.iter())
+        .flat_map(|segment| {
+            let targets = segment.redirs.iter().filter_map(|r| match r {
+                Redirection::In(word) | Redirection::Out { path: word, .. } => Some(word),
+                Redirection::Dup { .. } => None,
+            });
+            segment.words.iter().chain(targets)
+        });
+    for word in words {
+        for part in &word.parts {
+            if let Part::Subst { text, .. } = part {
+                match parse(text) {
+                    Ok(_) | Err(SyntaxError::EmptyCommand) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Exposes a `&[T]` to `peg` as `&T` elements (themselves `Copy`, satisfying `peg`'s built-in
@@ -184,13 +217,13 @@ peg::parser! {
             = [Token::Word(w)] { w.raw() }
 
         rule redir() -> Redirection
-            = [Token::Redir { fd, op: RedirOp::In }] path:raw_word() { Redirection::In(path) }
+            = [Token::Redir { fd, op: RedirOp::In }] path:word() { Redirection::In(path) }
             / [Token::Redir { op: RedirOp::In, .. }] {? Err("missing-target-in") }
-            / [Token::Redir { fd, op: RedirOp::Out }] path:raw_word() {
+            / [Token::Redir { fd, op: RedirOp::Out }] path:word() {
                 Redirection::Out { fd: fd.unwrap_or(1), path, append: false }
               }
             / [Token::Redir { op: RedirOp::Out, .. }] {? Err("missing-target-out") }
-            / [Token::Redir { fd, op: RedirOp::Append }] path:raw_word() {
+            / [Token::Redir { fd, op: RedirOp::Append }] path:word() {
                 Redirection::Out { fd: fd.unwrap_or(1), path, append: true }
               }
             / [Token::Redir { op: RedirOp::Append, .. }] {? Err("missing-target-append") }
@@ -274,6 +307,13 @@ peg::parser! {
 mod tests {
     use super::*;
 
+    fn w(text: &str) -> Word {
+        Word {
+            parts: vec![Part::Lit(text.into())],
+            assign: None,
+        }
+    }
+
     /// The pipeline of a line that is exactly one non-negated command -- what every test below
     /// that predates lists means by `parse`.
     fn parse(line: &str) -> Result<Pipeline, SyntaxError> {
@@ -330,7 +370,7 @@ mod tests {
             p[0].redirs,
             [Redirection::Out {
                 fd: 1,
-                path: "f".into(),
+                path: w("f"),
                 append: false
             }]
         );
@@ -343,10 +383,10 @@ mod tests {
         assert_eq!(
             p[0].redirs,
             [
-                Redirection::In("in".into()),
+                Redirection::In(w("in")),
                 Redirection::Out {
                     fd: 1,
-                    path: "out".into(),
+                    path: w("out"),
                     append: true
                 },
                 Redirection::Dup { fd: 2, target: 1 },
@@ -361,7 +401,7 @@ mod tests {
             p[0].redirs,
             [Redirection::Out {
                 fd: 1,
-                path: "out".into(),
+                path: w("out"),
                 append: false
             }]
         );
@@ -375,7 +415,7 @@ mod tests {
             p[0].redirs,
             [Redirection::Out {
                 fd: 1,
-                path: "out".into(),
+                path: w("out"),
                 append: false
             }]
         );
@@ -536,9 +576,67 @@ mod tests {
     fn redirections_belong_to_their_own_command() {
         let a = one("a > x && b < y");
         assert_eq!(a.first.pipeline[0].redirs.len(), 1);
+        assert_eq!(a.rest[0].1.pipeline[0].redirs, [Redirection::In(w("y"))]);
+    }
+
+    // ---- command substitution ----
+
+    #[test]
+    fn a_substitution_is_part_of_its_word() {
+        let p = parse("echo a$(b c)d").unwrap();
+        assert_eq!(p[0].words.len(), 2);
         assert_eq!(
-            a.rest[0].1.pipeline[0].redirs,
-            [Redirection::In("y".into())]
+            p[0].words[1].parts,
+            [
+                Part::Lit("a".into()),
+                Part::Subst {
+                    text: "b c".into(),
+                    quoted: false
+                },
+                Part::Lit("d".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_syntax_error_inside_a_substitution_is_an_error_of_the_line() {
+        // Found before anything on the line runs, as a shell parses the whole line first.
+        assert_eq!(
+            super::parse("echo a ; echo $(echo b &&)"),
+            Err(SyntaxError::Incomplete("&&"))
+        );
+        assert_eq!(
+            super::parse("echo $(; a)"),
+            Err(SyntaxError::MissingCommand)
+        );
+        assert_eq!(
+            super::parse("echo $(echo >)"),
+            Err(SyntaxError::MissingTarget(">"))
+        );
+        assert_eq!(
+            super::parse("echo `a |`"),
+            Err(SyntaxError::Incomplete("|"))
+        );
+    }
+
+    #[test]
+    fn an_empty_substitution_is_fine_and_nests_are_checked() {
+        assert!(super::parse("echo $() `` \"$()\"").is_ok());
+        assert!(super::parse("echo $(echo $(echo hi))").is_ok());
+        assert_eq!(
+            super::parse("echo $(echo $(a &&))"),
+            Err(SyntaxError::Incomplete("&&"))
+        );
+    }
+
+    #[test]
+    fn a_redirection_target_may_be_a_substitution() {
+        let p = parse("cat < $(echo f) > $T").unwrap();
+        assert!(
+            matches!(&p[0].redirs[0], Redirection::In(w) if matches!(w.parts[0], Part::Subst { .. }))
+        );
+        assert!(
+            matches!(&p[0].redirs[1], Redirection::Out { path, .. } if matches!(path.parts[0], Part::Var { .. }))
         );
     }
 }

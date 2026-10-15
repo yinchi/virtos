@@ -85,8 +85,22 @@ impl RedirOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
     Lit(String),
-    Var { name: String, quoted: bool },
-    Status { quoted: bool },
+    Var {
+        name: String,
+        quoted: bool,
+    },
+    Status {
+        quoted: bool,
+    },
+    /// `$(text)` or a backtick pair: `text` is the inner command's *source* (backticks already
+    /// un-escaped), run when the word is expanded. The lexer only needed to find where it ends --
+    /// which takes lexing it -- and the syntax layer validates it by parsing, so a bad one is an
+    /// error of the whole line before anything runs (`shell::syntax::parse`). `quoted` decides, as
+    /// for `Var`, whether the result is split into fields.
+    Subst {
+        text: String,
+        quoted: bool,
+    },
 }
 
 /// A word: a run of adjacent [`Part`]s, in lexical order, plus `assign` -- the byte offset of `=`
@@ -124,6 +138,11 @@ impl Word {
                     s.push_str(name);
                 }
                 Part::Status { .. } => s.push_str("$?"),
+                Part::Subst { text, .. } => {
+                    s.push_str("$(");
+                    s.push_str(text);
+                    s.push(')');
+                }
             }
         }
         s
@@ -298,6 +317,8 @@ fn merge_lits(parts: Vec<Part>) -> Vec<Part> {
 enum DChar {
     Raw(char),
     Esc(char),
+    /// A whole command substitution (`$(…)` or backticks) inside the quotes.
+    Sub(Part),
 }
 
 /// Walks `chars` (one double-quoted string's content, in order), scanning each maximal run of
@@ -316,6 +337,12 @@ fn assemble_dquoted(chars: Vec<DChar>) -> Result<Vec<Part>, LexError> {
                 }
                 parts.push(Part::Lit(c.to_string()));
             }
+            DChar::Sub(part) => {
+                if !raw.is_empty() {
+                    parts.extend(scan_expansions(&core::mem::take(&mut raw), true)?);
+                }
+                parts.push(part);
+            }
         }
     }
     if !raw.is_empty() {
@@ -332,7 +359,7 @@ peg::parser! {
         // Characters excluded from an unquoted word: either an operator (its own rule
         // elsewhere) or refused outright (";", "&", "(", ")" have no rule anywhere else here).
         rule unquoted_start()
-            = !['"' | '\'' | '\\' | '|' | '<' | '>' | '#' | ';' | '&' | '(' | ')'
+            = !"$(" !"`" !['"' | '\'' | '\\' | '|' | '<' | '>' | '#' | ';' | '&' | '(' | ')'
                 | ' ' | '\t' | '\x0B' | '\x0C' | '\r' | '\n'] [_]
         // "#" may continue a word already started but is excluded from unquoted_start, so it
         // can never start one -- at a fresh position only `comment` matches "#".
@@ -349,7 +376,9 @@ peg::parser! {
         // No escaping or expansion inside single quotes.
 
         rule dquote_escape() -> DChar = "\\" c:['"' | '\\' | '$' | '`'] { DChar::Esc(c) }
-        rule dquote_char() -> DChar = dquote_escape() / (!"\"" c:[_] { DChar::Raw(c) })
+        rule dquote_sub() -> DChar = p:substitution(true) { DChar::Sub(p) }
+        rule dquote_char() -> DChar
+            = dquote_escape() / dquote_sub() / (!"\"" !"$((" c:[_] { DChar::Raw(c) })
         // A backslash not immediately before one of the four specials falls through to the
         // catch-all and is kept, as a raw character, by the *next* dquote_char -- pushing a lone
         // '\\' and letting the following character (or end of input) be handled normally on the
@@ -368,7 +397,27 @@ peg::parser! {
         // `piece` (below) and the raw text after it are two separate grammar productions, never
         // concatenated into one string before either is scanned for expansions.
 
-        rule piece() -> Vec<Part> = dquoted() / squoted() / escape_piece()
+        // Command substitution. The inside of `$( … )` is lexed with the ordinary token rules
+        // until the first unquoted ")" -- which is how a ")" in inner quotes or a nested `$(…)`
+        // is skipped, and why ")" is a token (an error) everywhere else. "#" starts a comment
+        // that runs to the end of the line, so a ")" after it does not close anything.
+        rule subst_items() = (token() {()} / blank() / comment())*
+        rule paren_subst(quoted: bool) -> Part
+            = "$(" !"(" s:$(subst_items()) ")" { Part::Subst { text: s.to_string(), quoted } }
+            / "$(" !"(" subst_items() ![_] {? Err("unterminated-subst") }
+        // `$((` is arithmetic, not a substitution of a subshell: refused by name.
+        rule arith() -> Part = "$((" {? Err("op-arith") }
+        // Backticks: a backslash makes the next character part of the body; the body is then
+        // un-escaped (`\$`, `\``, `\\`, and `\"` inside double quotes) and must lex.
+        rule bt_char() = "\\" [_] / !"`" [_]
+        rule backtick(quoted: bool) -> Part
+            = "`" s:$(bt_char()*) "`" {? backtick_part(s, quoted) }
+            / "`" bt_char()* {? Err("unterminated-subst") }
+        rule substitution(quoted: bool) -> Part
+            = arith() / paren_subst(quoted) / backtick(quoted)
+
+        rule piece() -> Vec<Part>
+            = dquoted() / squoted() / escape_piece() / p:substitution(false) { vec![p] }
         rule tail() -> Vec<Part>
             = p:piece() s:$(unquoted_tail_char()*) {?
                 let mut parts = p;
@@ -488,6 +537,57 @@ fn decode_as_token(_: LexError) -> &'static str {
     "bad-substitution"
 }
 
+/// The text of a backtick body, un-escaped as bash does: `\$`, `` \` `` and `\\` lose their
+/// backslash, and so does `\"` inside double quotes; every other backslash is kept.
+fn unescape_backticks(body: &str, quoted: bool) -> String {
+    let mut out = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek().copied() {
+                Some(n @ ('$' | '`' | '\\')) => {
+                    out.push(n);
+                    chars.next();
+                    continue;
+                }
+                Some('"') if quoted => {
+                    out.push('"');
+                    chars.next();
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What the grammar's own sentinel for `error` is, so a failure found while lexing a backtick
+/// body surfaces as that same error of the whole line.
+fn error_sentinel(error: LexError) -> &'static str {
+    match error {
+        LexError::Unterminated("quote") => "unterminated-quote",
+        LexError::Unterminated("escape") => "unterminated-escape",
+        LexError::Unterminated(_) => "unterminated-subst",
+        LexError::BadSubstitution => "bad-substitution",
+        LexError::Unsupported("<<") => "op-heredoc",
+        LexError::Unsupported("<&") => "op-dupin",
+        LexError::Unsupported(";;") => "op-dsemi",
+        LexError::Unsupported("(") => "op-lparen",
+        LexError::Unsupported(")") => "op-rparen",
+        LexError::Unsupported("$((") => "op-arith",
+        LexError::Unsupported(_) => "op-amp",
+    }
+}
+
+/// A backtick pair's body as a [`Part::Subst`], having checked it lexes.
+fn backtick_part(body: &str, quoted: bool) -> Result<Part, &'static str> {
+    let text = unescape_backticks(body, quoted);
+    lex(&text).map_err(error_sentinel)?;
+    Ok(Part::Subst { text, quoted })
+}
+
 /// Splits `line` into tokens, in order. An empty or comment-only line (`#` at the start of a
 /// word runs to the end of the line) produces an empty list, not an error.
 pub fn lex(line: &str) -> Result<Vec<Token>, LexError> {
@@ -501,18 +601,28 @@ pub fn lex(line: &str) -> Result<Vec<Token>, LexError> {
 /// every character this grammar doesn't otherwise recognize as an operator, quote, or expansion
 /// falls into an ordinary literal.
 fn decode_error(e: peg::error::ParseError<peg::str::LineCol>) -> LexError {
-    for token in e.expected.tokens() {
-        match token {
-            "unterminated-quote" => return LexError::Unterminated("quote"),
-            "unterminated-escape" => return LexError::Unterminated("escape"),
-            "bad-substitution" => return LexError::BadSubstitution,
-            "op-heredoc" => return LexError::Unsupported("<<"),
-            "op-dupin" => return LexError::Unsupported("<&"),
-            "op-dsemi" => return LexError::Unsupported(";;"),
-            "op-amp" => return LexError::Unsupported("&"),
-            "op-lparen" => return LexError::Unsupported("("),
-            "op-rparen" => return LexError::Unsupported(")"),
-            _ => {}
+    // Several sentinels can be expected at the furthest position (a failed alternative, then the
+    // fallback that also fails); this order says which the user is told about -- a refused
+    // operator before the "unterminated" the failure also looks like.
+    let expected: alloc::vec::Vec<&str> = e.expected.tokens().collect();
+    for (name, error) in [
+        ("op-arith", LexError::Unsupported("$((")),
+        ("op-heredoc", LexError::Unsupported("<<")),
+        ("op-dupin", LexError::Unsupported("<&")),
+        ("op-dsemi", LexError::Unsupported(";;")),
+        ("op-amp", LexError::Unsupported("&")),
+        ("op-lparen", LexError::Unsupported("(")),
+        ("op-rparen", LexError::Unsupported(")")),
+        ("bad-substitution", LexError::BadSubstitution),
+        (
+            "unterminated-subst",
+            LexError::Unterminated("command substitution"),
+        ),
+        ("unterminated-quote", LexError::Unterminated("quote")),
+        ("unterminated-escape", LexError::Unterminated("escape")),
+    ] {
+        if expected.contains(&name) {
+            return error;
         }
     }
     unreachable!("lexer grammar always tags its own failures with one of the strings above")
@@ -711,9 +821,10 @@ mod tests {
 
     #[test]
     fn non_dollar_expansion_characters_are_still_ordinary() {
+        // (The backtick used to be on this list; it now starts a command substitution.)
         assert_eq!(
-            lexed("echo `y` * ? ~ {a,b}"),
-            [w("echo"), w("`y`"), w("*"), w("?"), w("~"), w("{a,b}")]
+            lexed("echo * ? ~ {a,b}"),
+            [w("echo"), w("*"), w("?"), w("~"), w("{a,b}")]
         );
     }
 
@@ -899,5 +1010,117 @@ mod tests {
         assert_eq!(lexed("a!"), [w("a!")]);
         assert_eq!(lexed(r"\! a"), [w("!"), w("a")]);
         assert_eq!(lexed("'!' a"), [w("!"), w("a")]);
+    }
+
+    fn subst(text: &str, quoted: bool) -> Part {
+        Part::Subst {
+            text: text.into(),
+            quoted,
+        }
+    }
+
+    #[test]
+    fn a_command_substitution_is_one_part() {
+        assert_eq!(lexed("$(echo hi)"), [word(vec![subst("echo hi", false)])]);
+        assert_eq!(
+            lexed("a$(b)c"),
+            [word(vec![
+                Part::Lit("a".into()),
+                subst("b", false),
+                Part::Lit("c".into())
+            ])]
+        );
+        assert_eq!(
+            lexed("\"x$(b)y\""),
+            [word(vec![
+                Part::Lit("x".into()),
+                subst("b", true),
+                Part::Lit("y".into())
+            ])]
+        );
+    }
+
+    #[test]
+    fn the_inside_is_its_own_quoting_context() {
+        // The inner quotes do not end the outer ones, and a ")" inside them is not the end.
+        assert_eq!(
+            lexed(r#""$(echo "a b")""#),
+            [word(vec![subst(r#"echo "a b""#, true)])]
+        );
+        assert_eq!(
+            lexed("$(echo ')' \\) z)"),
+            [word(vec![subst("echo ')' \\) z", false)])]
+        );
+        assert_eq!(
+            lexed("$(echo $(echo hi))"),
+            [word(vec![subst("echo $(echo hi)", false)])]
+        );
+        // Operators that end a word elsewhere are ordinary inside.
+        assert_eq!(
+            lexed("$(a | b ; c && d > e)"),
+            [word(vec![subst("a | b ; c && d > e", false)])]
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_swallows_the_closing_paren() {
+        assert_eq!(
+            lex("$(echo a # c)"),
+            Err(LexError::Unterminated("command substitution"))
+        );
+    }
+
+    #[test]
+    fn unterminated_and_arithmetic_substitutions_are_refused() {
+        assert_eq!(
+            lex("echo $(a"),
+            Err(LexError::Unterminated("command substitution"))
+        );
+        assert_eq!(
+            lex("echo `a"),
+            Err(LexError::Unterminated("command substitution"))
+        );
+        assert_eq!(lex("echo $((1+2))"), Err(LexError::Unsupported("$((")));
+        assert_eq!(lex("echo \"$((1))\""), Err(LexError::Unsupported("$((")));
+        // A ")" outside any substitution is still refused.
+        assert_eq!(lex("echo a)"), Err(LexError::Unsupported(")")));
+    }
+
+    #[test]
+    fn a_lex_error_inside_a_substitution_is_the_lines() {
+        assert_eq!(lex("echo $(echo 'x)"), Err(LexError::Unterminated("quote")));
+        assert_eq!(lex("echo $(a & b)"), Err(LexError::Unsupported("&")));
+        assert_eq!(lex("echo $(echo ${)"), Err(LexError::BadSubstitution));
+    }
+
+    #[test]
+    fn quoting_and_escaping_keep_a_dollar_paren_literal() {
+        assert_eq!(lexed("'$(a)'"), [w("$(a)")]);
+        // An escaped `$` leaves a bare "(" behind, which is refused as it is anywhere.
+        assert_eq!(lex(r"\$(a)"), Err(LexError::Unsupported("(")));
+        assert_eq!(lexed(r#""\$(a)""#), [w("$(a)")]);
+    }
+
+    #[test]
+    fn backticks_are_a_substitution_with_their_own_escaping() {
+        assert_eq!(lexed("`echo hi`"), [word(vec![subst("echo hi", false)])]);
+        assert_eq!(
+            lexed(r#""`echo hi`""#),
+            [word(vec![subst("echo hi", true)])]
+        );
+        // `\`` inside is a nested pair, and `\$` and `\\` lose their backslash.
+        assert_eq!(
+            lexed(r"`echo \`date\``"),
+            [word(vec![subst("echo `date`", false)])]
+        );
+        assert_eq!(
+            lexed(r"`echo \$HOME \\ \x`"),
+            [word(vec![subst(r"echo $HOME \ \x", false)])]
+        );
+        // `\"` loses its backslash only inside double quotes.
+        assert_eq!(
+            lexed(r#""`echo \"a\"`""#),
+            [word(vec![subst(r#"echo "a""#, true)])]
+        );
     }
 }

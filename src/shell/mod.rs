@@ -154,7 +154,8 @@ fn cd(uart: &mut Uart, argv: &[String]) -> i32 {
     // `OLDPWD` is a valid name, so this cannot fail.
     let _ = frame_stack::export_var("OLDPWD", Some(&old));
     if back {
-        report(uart, &absolute);
+        // Standard output, as in any shell: `cd - > f` and `$(cd -)` see it.
+        fd::write_stdout(format!("{absolute}\n").as_bytes());
     }
     0
 }
@@ -310,35 +311,47 @@ fn unset(argv: &[String]) -> i32 {
     0
 }
 
-/// Appends `redirs`, in the order they were written, to `overrides` -- each `Redirection` names
-/// the fd it binds (`In` always fd 0; `Out`/`Dup` carry their own, defaulted to 1 by `syntax`'s
-/// own parsing). For a plain single command `overrides` starts empty; `run_pipeline` starts it
-/// from that stage's own pipe binding instead, so a stage's own redirect for the same fd comes
-/// later and wins (the reason `echo foo > bar | wc` sends `foo` to `bar`, not into the pipe,
-/// leaving `wc` to see nothing). Applied left to right (`syscall::fd::resolve_streams`), so
-/// `> f 2>&1` and `2>&1 > f` differ, as in any shell.
+/// Turns a segment's redirections, in the order they were written, into the stdio bindings
+/// (`fd`, what it becomes) the command is launched under: each `Redirection` names the fd it binds
+/// (`In` always fd 0; `Out`/`Dup` carry their own, defaulted to 1 by `syntax`'s own parsing), and
+/// a file target is expanded here -- variables and command substitutions, never split, and it
+/// must come out as exactly one word (`expand::expand_target`). `Err` is the message to report
+/// (a substitution that could not run, an `ambiguous redirect`); the command then does not run.
+///
+/// Appended after whatever a pipeline stage's own pipe binding already put there, so a stage's
+/// own redirect for the same fd comes later and wins (the reason `echo foo > bar | wc` sends `foo`
+/// to `bar`, not into the pipe, leaving `wc` to see nothing). Applied left to right
+/// (`syscall::fd::resolve_streams`), so `> f 2>&1` and `2>&1 > f` differ, as in any shell.
 #[cfg(target_os = "none")]
-fn apply_overrides(mut overrides: Stdio, redirs: &[syntax::Redirection]) -> Stdio {
+fn resolve_redirs(
+    uart: &mut Uart,
+    depth: usize,
+    redirs: &[syntax::Redirection],
+) -> Result<Stdio, String> {
+    let mut stdio: Stdio = Vec::new();
     for redir in redirs {
+        let mut subst = |text: &str| substitute(uart, text, depth);
         match redir {
-            syntax::Redirection::In(path) => {
-                overrides.push((0, StdioRedirect::In(path.clone())));
+            syntax::Redirection::In(word) => {
+                let path = expand::expand_target(word, &var_lookup, last_status(), &mut subst)?;
+                stdio.push((0, StdioRedirect::In(path)));
             }
             syntax::Redirection::Out { fd, path, append } => {
-                overrides.push((
+                let path = expand::expand_target(path, &var_lookup, last_status(), &mut subst)?;
+                stdio.push((
                     usize::from(*fd),
                     StdioRedirect::Out {
-                        path: path.clone(),
+                        path,
                         append: *append,
                     },
                 ));
             }
             syntax::Redirection::Dup { fd, target } => {
-                overrides.push((usize::from(*fd), StdioRedirect::Dup(*target)));
+                stdio.push((usize::from(*fd), StdioRedirect::Dup(*target)));
             }
         }
     }
-    overrides
+    Ok(stdio)
 }
 
 /// Every exported variable as a `"NAME=VALUE"` string, in storage order -- built fresh for every
@@ -359,9 +372,104 @@ fn var_lookup(name: &str) -> Option<String> {
     frame_stack::var(name).map(|value| value.to_string())
 }
 
+/// The most a command substitution's output may be: past it the substitution fails rather than
+/// risking the kernel heap (an allocation failure there is a panic).
 #[cfg(target_os = "none")]
-fn expand_argv(words: &[lexer::Word]) -> Vec<String> {
-    expand::expand_words(words, &var_lookup, last_status())
+const SUBST_OUTPUT_MAX: usize = 1 << 20;
+
+/// The status of the last command substitution that finished while the current command's words
+/// were being expanded, `None` if none has: a command with no command word (`X=$(false)`) takes
+/// its status from it. Reset at the start of every segment.
+///
+/// SAFETY (every access): single core, and the shell runs strictly sequentially.
+#[cfg(target_os = "none")]
+static mut LAST_SUBST_STATUS: Option<i32> = None;
+
+#[cfg(target_os = "none")]
+fn set_last_subst_status(status: Option<i32>) {
+    // SAFETY: see LAST_SUBST_STATUS.
+    unsafe { LAST_SUBST_STATUS = status };
+}
+
+#[cfg(target_os = "none")]
+fn last_subst_status() -> Option<i32> {
+    // SAFETY: see LAST_SUBST_STATUS.
+    unsafe { LAST_SUBST_STATUS }
+}
+
+/// Runs the command substitution whose source is `text` and returns what it wrote to stdout (its
+/// trailing newlines are `expand`'s business). A subshell: it runs in a copy of the current frame
+/// (`frame_stack::with_subshell`), so its `cd`, `export` and assignments do not leak, with stdout
+/// bound to a temp file in `/tmp` -- the pipe mechanism -- that is read back afterwards and
+/// removed on every path out. stdin and stderr are the command's own. `$?` is as it was before the
+/// substitution when this returns, and the substitution's own status is left in
+/// `LAST_SUBST_STATUS`.
+///
+/// `Err` is what to report: output past `SUBST_OUTPUT_MAX`, nesting past `MAX_SCRIPT_DEPTH` (it
+/// shares `source`'s counter, `depth`), no `/tmp` to put the capture in.
+#[cfg(target_os = "none")]
+fn substitute(uart: &mut Uart, text: &str, depth: usize) -> Result<String, String> {
+    if depth >= MAX_SCRIPT_DEPTH {
+        return Err("command substitution nested too deeply".into());
+    }
+    let list = match syntax::parse(text) {
+        Ok(list) => list,
+        Err(syntax::SyntaxError::EmptyCommand) => {
+            set_last_subst_status(Some(0));
+            return Ok(String::new());
+        }
+        // The line's own parse already checked every substitution, so this is only reachable if
+        // that and this ever disagree.
+        Err(e) => return Err(describe_syntax_error(e)),
+    };
+    let path = next_pipe_path()?;
+    let outer_status = last_status();
+    let stdio: Stdio = alloc::vec![(
+        1,
+        StdioRedirect::Out {
+            path: path.clone(),
+            append: false,
+        }
+    )];
+    let ran = fd::with_inherited_stdio(stdio, || {
+        frame_stack::with_subshell(|| {
+            let mut status = 0;
+            for and_or in &list {
+                status = run_and_or(uart, and_or, depth + 1);
+            }
+            status
+        })
+    });
+    // The commands inside set `$?` as they went; the outer command has not finished yet.
+    set_last_status(outer_status);
+    let output = match ran {
+        Ok(status) => capture_text(&path).inspect(|_| set_last_subst_status(Some(status))),
+        Err(msg) => Err(msg),
+    };
+    cleanup_temps(&[path]);
+    output
+}
+
+/// The text of the capture file at `path`, at most `SUBST_OUTPUT_MAX` bytes: invalid UTF-8
+/// becomes U+FFFD and NUL bytes are dropped.
+#[cfg(target_os = "none")]
+fn capture_text(path: &str) -> Result<String, String> {
+    let Some((_, vol, rest)) = fs::path::volume_for(path) else {
+        return Err("command substitution: no volume mounted".into());
+    };
+    let Ok(entry) = fs::path::resolve(vol, rest) else {
+        return Err("command substitution: its output file is gone".into());
+    };
+    if entry.len() as usize > SUBST_OUTPUT_MAX {
+        return Err("command substitution: output too large".into());
+    }
+    let Ok(mut reader) = vol.read_file(&entry) else {
+        return Err("command substitution: cannot read its output".into());
+    };
+    let Ok(bytes) = reader.read_to_vec() else {
+        return Err("command substitution: cannot read its output".into());
+    };
+    Ok(String::from_utf8_lossy(&bytes).replace('\0', ""))
 }
 
 /// Splits a leading run of `NAME=...`-shaped words (`lexer::Word::assignment`) off the front of
@@ -415,10 +523,11 @@ fn dispatch_segment(
     name: &str,
     argv: &[String],
     depth: usize,
-    redirs: &[syntax::Redirection],
+    redirs: Stdio,
     pipe_stdio: Option<Stdio>,
 ) -> i32 {
-    let stdio = apply_overrides(pipe_stdio.unwrap_or_default(), redirs);
+    let mut stdio = pipe_stdio.unwrap_or_default();
+    stdio.extend(redirs);
     if is_builtin(name) {
         // A builtin runs in the shell itself, but still under its own redirects: `cd` or `export`
         // with `> f` creates `f`, and `source script > out` collects what the script prints.
@@ -490,6 +599,7 @@ fn run_segment(
 ) -> i32 {
     let is_pipeline_stage = pipe_stdio.is_some();
     let body = || -> i32 {
+        set_last_subst_status(None);
         let (assignments, command_words) = split_assignments(&segment.words);
         // Left to right, each value already seeing the ones before it (`A=1 B=$A` makes `B` 1),
         // whether they end up as the shell's own variables or as the command's one-shot overlay.
@@ -503,8 +613,17 @@ fn run_segment(
                     .map(|(_, v)| v.clone())
                     .or_else(|| var_lookup(n))
             };
-            let value = expand::expand_assignment_value(&value_word, &seen, last_status());
-            overlay.push((name.to_string(), value));
+            let value = {
+                let mut subst = |text: &str| substitute(uart, text, depth);
+                expand::expand_assignment_value(&value_word, &seen, last_status(), &mut subst)
+            };
+            match value {
+                Ok(value) => overlay.push((name.to_string(), value)),
+                Err(msg) => {
+                    report(uart, &msg);
+                    return 1;
+                }
+            }
         }
 
         if command_words.is_empty() {
@@ -512,9 +631,16 @@ fn run_segment(
                 frame_stack::set_var(name, value).ok();
             }
             // Only the redirects: `> f` alone creates (or truncates) `f`.
-            let stdio = apply_overrides(Vec::new(), &segment.redirs);
+            let stdio = match resolve_redirs(uart, depth, &segment.redirs) {
+                Ok(stdio) => stdio,
+                Err(msg) => {
+                    report(uart, &msg);
+                    return 1;
+                }
+            };
+            // A command that is only assignments has the status of its last substitution.
             return match fd::with_inherited_stdio(stdio, || ()) {
-                Ok(()) => 0,
+                Ok(()) => last_subst_status().unwrap_or(0),
                 Err(msg) => {
                     report(uart, &msg);
                     1
@@ -522,8 +648,40 @@ fn run_segment(
             };
         }
 
-        let argv = expand_argv(command_words);
-        let name = argv[0].as_str();
+        let expanded = {
+            let mut subst = |text: &str| substitute(uart, text, depth);
+            expand::expand_words(command_words, &var_lookup, last_status(), &mut subst)
+        };
+        let argv = match expanded {
+            Ok(argv) => argv,
+            Err(msg) => {
+                report(uart, &msg);
+                return 1;
+            }
+        };
+        let redirs = match resolve_redirs(uart, depth, &segment.redirs) {
+            Ok(redirs) => redirs,
+            Err(msg) => {
+                report(uart, &msg);
+                return 1;
+            }
+        };
+        // Every word may have expanded away (`$EMPTY`, `$(true)`): no command word, so what is
+        // left is the assignments and redirections, which have already been dealt with the same
+        // way the all-assignments case above does.
+        let Some(name) = argv.first().map(String::as_str) else {
+            // As in a command that was only assignments: they stick.
+            for (name, value) in &overlay {
+                frame_stack::set_var(name, value).ok();
+            }
+            return match fd::with_inherited_stdio(redirs, || ()) {
+                Ok(()) => last_subst_status().unwrap_or(0),
+                Err(msg) => {
+                    report(uart, &msg);
+                    1
+                }
+            };
+        };
         // `with_overlay`'s own restore unconditionally puts the *whole* variable list back,
         // overlay or not -- exactly right for undoing the overlay itself, but it would just as
         // happily undo a builtin's own *permanent* mutation (`export`/`unset`/a `source`d
@@ -531,10 +689,10 @@ fn run_segment(
         // wrap when there's a real prefix to apply and later undo; skip it entirely otherwise, so
         // `export FOO=bar` (no prefix) really does stick.
         if overlay.is_empty() {
-            dispatch_segment(uart, name, &argv, depth, &segment.redirs, pipe_stdio)
+            dispatch_segment(uart, name, &argv, depth, redirs, pipe_stdio)
         } else {
             frame_stack::with_overlay(&overlay, || {
-                dispatch_segment(uart, name, &argv, depth, &segment.redirs, pipe_stdio)
+                dispatch_segment(uart, name, &argv, depth, redirs, pipe_stdio)
             })
         }
     };

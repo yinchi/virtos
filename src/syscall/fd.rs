@@ -483,6 +483,20 @@ pub fn bind_stdio(overrides: Stdio) -> Result<(), ()> {
     Ok(())
 }
 
+/// Writes `bytes` to the standard output the code running right now was given: what the enclosing
+/// script or builtin was itself redirected to (`with_inherited_stdio`), the console when it was
+/// not. For the shell's own builtins, which are not programs with an fd 1 of their own, to print
+/// where `cd - > f`, `cd - | cat` and `$(cd -)` expect. A failed write (a full disk) is dropped,
+/// as a builtin has nowhere else to report it.
+pub fn write_stdout(bytes: &[u8]) {
+    match base()[1].as_mut() {
+        Some(stream) => {
+            let _ = stream.write(bytes);
+        }
+        None => console_write(bytes),
+    }
+}
+
 /// Runs `f` -- a script, or a builtin that is not a program of its own -- with `overrides`
 /// applied on top of the streams it already has, as that code's own stdio: every program `f`
 /// launches (and every redirect inside it, layered on top) starts from them, so `./script > out`
