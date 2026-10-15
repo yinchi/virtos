@@ -171,6 +171,15 @@ fn detect_assign(parts: &[Part]) -> Option<usize> {
 pub enum Token {
     Word(Word),
     Pipe,
+    /// `;`: ends one pipeline-list entry and begins the next.
+    Semi,
+    /// `&&`: run the next pipeline only if the last one succeeded.
+    AndIf,
+    /// `||`: run the next pipeline only if the last one failed.
+    OrIf,
+    /// An unquoted `!` standing alone: negates the pipeline it starts. Anywhere but the start of a
+    /// pipeline the parser takes it back as the ordinary one-character word `!`.
+    Bang,
     /// A redirection operator and the descriptor number typed right before it, if any.
     Redir {
         fd: Option<u8>,
@@ -183,7 +192,7 @@ pub enum Token {
 pub enum LexError {
     /// An unclosed quote or a trailing, unescaped backslash -- `"quote"` or `"escape"`.
     Unterminated(&'static str),
-    /// A real shell operator this project doesn't implement: `;`, `&`, `(`, `)`, `<<`, `<&`.
+    /// A real shell operator this project doesn't implement: `;;`, `&`, `(`, `)`, `<<`, `<&`.
     Unsupported(&'static str),
     /// `${` with no matching `NAME}` (or `${?}`'s own `?`) -- bash's own "bad substitution".
     BadSubstitution,
@@ -419,12 +428,26 @@ peg::parser! {
         rule out_redir() -> Token
             = d:digit12()? ">" { Token::Redir { fd: d.map(|c| c as u8 - b'0'), op: RedirOp::Out } }
 
-        rule op_semicolon() -> Token = ";" {? Err("op-semicolon") }
+        // `;;` ends a `case` branch, which this shell has no use for yet: refused by name rather
+        // than lexed as two `;`, so its error says what was typed.
+        rule op_dsemi() -> Token = ";;" {? Err("op-dsemi") }
+        // The lookahead matters for the reason `in_redir`'s does: `op_dsemi`'s refusal only makes
+        // that alternative backtrack, so without it `;;` would lex as two `;`.
+        rule semi() -> Token = ";" !";" { Token::Semi }
+        // "&&" is listed before the lone "&" below, which is still refused (job control).
+        rule and_if() -> Token = "&&" { Token::AndIf }
         rule op_amp() -> Token = "&" {? Err("op-amp") }
         rule op_lparen() -> Token = "(" {? Err("op-lparen") }
         rule op_rparen() -> Token = ")" {? Err("op-rparen") }
 
+        // "||" before "|": the latter is a strict prefix of it.
+        rule or_if() -> Token = "||" { Token::OrIf }
         rule pipe() -> Token = "|" { Token::Pipe }
+
+        // A `!` is the negation operator only as a whole word of its own: followed by a blank,
+        // an operator or the end of the line. `!x` and `a!` are ordinary words.
+        rule bang() -> Token
+            = "!" &(blank() / ['|' | '<' | '>' | '&' | ';' | '(' | ')'] / ![_]) { Token::Bang }
 
         rule token() -> Token
             = op_heredoc()
@@ -433,11 +456,15 @@ peg::parser! {
             / append_redir()
             / dup_redir()
             / out_redir()
-            / op_semicolon()
+            / op_dsemi()
+            / semi()
+            / and_if()
             / op_amp()
             / op_lparen()
             / op_rparen()
+            / or_if()
             / pipe()
+            / bang()
             / w:word_token() { Token::Word(w) }
 
         // Blanks and comments are just two more no-op alternatives in the same repeated choice
@@ -481,7 +508,7 @@ fn decode_error(e: peg::error::ParseError<peg::str::LineCol>) -> LexError {
             "bad-substitution" => return LexError::BadSubstitution,
             "op-heredoc" => return LexError::Unsupported("<<"),
             "op-dupin" => return LexError::Unsupported("<&"),
-            "op-semicolon" => return LexError::Unsupported(";"),
+            "op-dsemi" => return LexError::Unsupported(";;"),
             "op-amp" => return LexError::Unsupported("&"),
             "op-lparen" => return LexError::Unsupported("("),
             "op-rparen" => return LexError::Unsupported(")"),
@@ -829,11 +856,48 @@ mod tests {
 
     #[test]
     fn unsupported_syntax_is_refused() {
-        assert_eq!(lex("a; b"), Err(LexError::Unsupported(";")));
-        assert_eq!(lex("a && b"), Err(LexError::Unsupported("&")));
+        assert_eq!(lex("a ;; b"), Err(LexError::Unsupported(";;")));
         assert_eq!(lex("a &"), Err(LexError::Unsupported("&")));
+        assert_eq!(lex("a &>f"), Err(LexError::Unsupported("&")));
         assert_eq!(lex("(a)"), Err(LexError::Unsupported("(")));
         assert_eq!(lex("a <<EOF"), Err(LexError::Unsupported("<<")));
         assert_eq!(lex("a <&0"), Err(LexError::Unsupported("<&")));
+    }
+
+    #[test]
+    fn list_operators_are_tokens() {
+        assert_eq!(
+            lexed("a; b && c || d"),
+            [
+                w("a"),
+                Token::Semi,
+                w("b"),
+                Token::AndIf,
+                w("c"),
+                Token::OrIf,
+                w("d")
+            ]
+        );
+        // No blanks needed around them, and `||` is not two pipes.
+        assert_eq!(lexed("a&&b"), [w("a"), Token::AndIf, w("b")]);
+        assert_eq!(lexed("a||b"), [w("a"), Token::OrIf, w("b")]);
+        assert_eq!(lexed("a|b"), [w("a"), Token::Pipe, w("b")]);
+    }
+
+    #[test]
+    fn a_quoted_list_operator_is_a_word() {
+        assert_eq!(lexed(r#"echo ";" "&&""#).len(), 3);
+        assert!(matches!(lexed(r#"echo ";""#)[1], Token::Word(_)));
+        assert!(matches!(lexed(r"echo \;")[1], Token::Word(_)));
+    }
+
+    #[test]
+    fn a_bang_is_an_operator_only_as_a_whole_word() {
+        assert_eq!(lexed("! a"), [Token::Bang, w("a")]);
+        assert_eq!(lexed("a && !b"), [w("a"), Token::AndIf, w("!b")]);
+        assert_eq!(lexed("!"), [Token::Bang]);
+        assert_eq!(lexed("a!"), [w("a!")]);
+        assert_eq!(lexed(r"\! a"), [w("!"), w("a")]);
+        assert_eq!(lexed("'!' a"), [w("!"), w("a")]);
     }
 }

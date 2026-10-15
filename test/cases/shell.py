@@ -102,9 +102,9 @@ def run(ctx):
     # ---------------------------------------------------------------- syntax errors
     check("a redirection with no target", s.run("echo >"), "no file name after '>'\n")
     check("...is status 2", s.status("echo >")[1], 2)
-    check("`;` is not supported, and says so", s.run("echo a ; echo b"), "';' is not supported yet\n")
-    check("a trailing pipe is refused", s.run("echo a |"), "no command next to '|'\n")
-    check("a leading pipe is refused", s.run("| echo a"), "no command next to '|'\n")
+    check("`&` is not supported, and says so", s.run("echo a &"), "'&' is not supported yet\n")
+    check("a trailing pipe is refused", s.run("echo a |"), "no command after '|'\n")
+    check("a leading pipe is refused", s.run("| echo a"), "no command next to an operator\n")
     check("...with status 2, not silently ignored", s.status("echo a |")[1], 2)
     check("an unterminated quote", s.run("echo 'x"), "unterminated quote\n")
     check(">& needs 1 or 2", s.run("echo a >&3"), "a '>&' target must be 1 or 2\n")

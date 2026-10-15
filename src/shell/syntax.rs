@@ -1,13 +1,16 @@
-//! Parses a lexed shell line into a `Pipeline`: one or more `|`-separated `Segment`s, each with
-//! its own argv and redirections. Parses the *token stream* `lexer::lex` produces, not the raw
-//! line -- `parse` (below) is the one public entry point, lexing internally, so callers never
-//! call `lexer::lex` themselves.
+//! Parses a lexed shell line into a `List`: `;`-separated `AndOr`s, each a `Command` (a pipeline,
+//! optionally negated by `!`) followed by any number of `&&`/`||` connectors and further commands.
+//! A `Pipeline` is one or more `|`-separated `Segment`s, each with its own argv and redirections.
+//! Parses the *token stream* `lexer::lex` produces, not the raw line -- `parse` (below) is the
+//! one public entry point, lexing internally, so callers never call `lexer::lex` themselves.
+//!
+//! Precedence, tightest first: `|`, then `&&`/`||` (equal, left-associative), then `;`.
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::lexer::{self, LexError, RedirOp, Token, Word};
+use super::lexer::{self, LexError, Part, RedirOp, Token, Word};
 
 /// One redirection a `Segment` applies before its program starts. Its own target is plain text,
 /// not a `Word` -- `$VAR` expansion inside a redirect target isn't implemented yet (`echo x >
@@ -32,6 +35,33 @@ pub struct Segment {
 
 pub type Pipeline = Vec<Segment>;
 
+/// A pipeline and whether a leading `!` negates its status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub negated: bool,
+    pub pipeline: Pipeline,
+}
+
+/// Which status lets the command after a connector run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connector {
+    /// `&&`: the previous status was 0.
+    And,
+    /// `||`: the previous status was not 0.
+    Or,
+}
+
+/// `first (connector command)*`, evaluated left to right: each connector looks at the status of
+/// everything to its left, and a command it skips leaves that status as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndOr {
+    pub first: Command,
+    pub rest: Vec<(Connector, Command)>,
+}
+
+/// What one line is: `AndOr`s run one after another, whatever each one's status.
+pub type List = Vec<AndOr>;
+
 /// Why `parse` refused a line outright.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyntaxError {
@@ -44,17 +74,21 @@ pub enum SyntaxError {
     /// A line with nothing on it at all -- blank or comment-only: not worth reporting.
     EmptyCommand,
     /// A pipeline stage with no words and no redirections, in a line that has other things on it:
-    /// a stray `|` with nothing on one side of it (`| a`, `a |`, `a | | b`).
+    /// a stray `|`, `&&`, `||` or `;` with nothing on one side of it (`| a`, `a | | b`, `; a`,
+    /// `a ; ; b`, `&& a`).
     MissingCommand,
+    /// The line ends right after `|`, `&&` or `||`: the command it needs is not there (yet -- a
+    /// continuation prompt would ask for it).
+    Incomplete(&'static str),
 }
 
-/// Lexes then parses `line` into a `Pipeline`.
-pub fn parse(line: &str) -> Result<Pipeline, SyntaxError> {
+/// Lexes then parses `line` into a `List`.
+pub fn parse(line: &str) -> Result<List, SyntaxError> {
     let tokens = lexer::lex(line).map_err(SyntaxError::Lex)?;
     if tokens.is_empty() {
         return Err(SyntaxError::EmptyCommand);
     }
-    grammar::pipeline(&SliceByRef(&tokens)).map_err(decode_error)
+    grammar::list(&SliceByRef(&tokens)).map_err(decode_error)
 }
 
 /// Exposes a `&[T]` to `peg` as `&T` elements (themselves `Copy`, satisfying `peg`'s built-in
@@ -91,15 +125,35 @@ impl<'a, T: 'a> peg::ParseElem<'a> for SliceByRef<'a, T> {
 /// action reported -- see `lexer::decode_error`'s own doc comment for why matching the sentinel
 /// string back to its variant works.
 fn decode_error(e: peg::error::ParseError<usize>) -> SyntaxError {
-    for token in e.expected.tokens() {
-        match token {
-            "missing-target-in" => return SyntaxError::MissingTarget(RedirOp::In.text()),
-            "missing-target-out" => return SyntaxError::MissingTarget(RedirOp::Out.text()),
-            "missing-target-append" => return SyntaxError::MissingTarget(RedirOp::Append.text()),
-            "missing-target-dup" => return SyntaxError::MissingTarget(RedirOp::DupOut.text()),
-            "bad-dup-target" => return SyntaxError::BadDupTarget,
-            "empty-command" => return SyntaxError::MissingCommand,
-            _ => {}
+    // The named failures the parser tried at the furthest position, most specific first: a line
+    // that ends in `&&` also "expected a command", and the more useful message is the first.
+    let expected: alloc::vec::Vec<&str> = e.expected.tokens().collect();
+    let has = |name: &str| expected.contains(&name);
+    for (name, error) in [
+        (
+            "missing-target-in",
+            SyntaxError::MissingTarget(RedirOp::In.text()),
+        ),
+        (
+            "missing-target-out",
+            SyntaxError::MissingTarget(RedirOp::Out.text()),
+        ),
+        (
+            "missing-target-append",
+            SyntaxError::MissingTarget(RedirOp::Append.text()),
+        ),
+        (
+            "missing-target-dup",
+            SyntaxError::MissingTarget(RedirOp::DupOut.text()),
+        ),
+        ("bad-dup-target", SyntaxError::BadDupTarget),
+        ("incomplete-pipe", SyntaxError::Incomplete("|")),
+        ("incomplete-and", SyntaxError::Incomplete("&&")),
+        ("incomplete-or", SyntaxError::Incomplete("||")),
+        ("empty-command", SyntaxError::MissingCommand),
+    ] {
+        if has(name) {
+            return error;
         }
     }
     // A structurally malformed token stream (e.g. two pipes in a row, each side otherwise empty)
@@ -149,8 +203,14 @@ peg::parser! {
               }
             / [Token::Redir { op: RedirOp::DupOut, .. }] {? Err("missing-target-dup") }
 
+        /// A `!` that is not negating anything (anywhere but the start of a pipeline) is just the
+        /// word `!`.
+        rule bang_word() -> Word
+            = [Token::Bang] { Word { parts: vec![Part::Lit("!".into())], assign: None } }
+
         rule item() -> Item
             = w:word() { Item::Arg(w) }
+            / w:bang_word() { Item::Arg(w) }
             / r:redir() { Item::Redir(r) }
 
         rule segment() -> Segment
@@ -170,10 +230,40 @@ peg::parser! {
                 }
               }
 
-        pub rule pipeline() -> Pipeline
-            = s0:segment() rest:([Token::Pipe] s:segment() { s })* {
+        // A trailing `|` is "incomplete", not "an empty stage": it is what a continuation prompt
+        // would ask the next line for. (A `|` followed by anything else that is not a command
+        // is still the empty-stage failure from `segment`.)
+        rule trailing_pipe() = [Token::Pipe] ![_] {? Err("incomplete-pipe") }
+
+        rule pipeline() -> Pipeline
+            = s0:segment() rest:([Token::Pipe] s:segment() { s })* trailing_pipe()? {
                 let mut v = Vec::with_capacity(1 + rest.len());
                 v.push(s0);
+                v.extend(rest);
+                v
+              }
+
+        rule command() -> Command
+            = bangs:[Token::Bang]* p:pipeline() {
+                Command { negated: bangs.len() % 2 == 1, pipeline: p }
+              }
+
+        rule connector() -> Connector
+            = [Token::AndIf] { Connector::And }
+            / [Token::OrIf] { Connector::Or }
+
+        rule trailing_connector() = [Token::AndIf] ![_] {? Err("incomplete-and") }
+                                  / [Token::OrIf] ![_] {? Err("incomplete-or") }
+
+        rule and_or() -> AndOr
+            = first:command() rest:(c:connector() x:command() { (c, x) })* trailing_connector()? {
+                AndOr { first, rest }
+              }
+
+        pub rule list() -> List
+            = first:and_or() rest:([Token::Semi] a:and_or() { a })* [Token::Semi]? {
+                let mut v = Vec::with_capacity(1 + rest.len());
+                v.push(first);
                 v.extend(rest);
                 v
               }
@@ -183,6 +273,17 @@ peg::parser! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pipeline of a line that is exactly one non-negated command -- what every test below
+    /// that predates lists means by `parse`.
+    fn parse(line: &str) -> Result<Pipeline, SyntaxError> {
+        let mut list = super::parse(line)?;
+        assert_eq!(list.len(), 1, "{line:?} is not a single and-or");
+        let and_or = list.remove(0);
+        assert!(and_or.rest.is_empty(), "{line:?} has connectors");
+        assert!(!and_or.first.negated, "{line:?} is negated");
+        Ok(and_or.first.pipeline)
+    }
 
     // `.raw()` is good enough for these tests -- none of them involve an expansion, so it's the
     // same text `argv` used to compare directly before `Segment.words` existed.
@@ -310,19 +411,12 @@ mod tests {
 
     #[test]
     fn a_pipe_with_nothing_on_a_side_is_an_error_not_a_blank_line() {
-        for line in [
-            "| a",
-            "a |",
-            "a | | b",
-            "|",
-            "a | # nothing",
-            "> f |",
-            "| > f",
-        ] {
-            let result = parse(line);
-            // `> f |` and `| > f` have a redirection-only stage on one side and nothing on the
-            // other; either way the empty stage is what is wrong.
-            assert_eq!(result, Err(SyntaxError::MissingCommand), "{line:?}");
+        for line in ["| a", "a | | b", "|", "| > f"] {
+            assert_eq!(parse(line), Err(SyntaxError::MissingCommand), "{line:?}");
+        }
+        // A pipe at the very end is the line asking for more, not a stray one.
+        for line in ["a |", "a | # nothing", "> f |"] {
+            assert_eq!(parse(line), Err(SyntaxError::Incomplete("|")), "{line:?}");
         }
     }
 
@@ -335,8 +429,116 @@ mod tests {
     #[test]
     fn a_lex_error_propagates_as_a_syntax_error() {
         assert_eq!(
-            parse("a;b"),
-            Err(SyntaxError::Lex(LexError::Unsupported(";")))
+            parse("a;;b"),
+            Err(SyntaxError::Lex(LexError::Unsupported(";;")))
+        );
+    }
+
+    // ---- lists: `;`, `&&`, `||`, `!` ----
+
+    fn names(c: &Command) -> Vec<Vec<String>> {
+        c.pipeline
+            .iter()
+            .map(|s| s.words.iter().map(Word::raw).collect())
+            .collect()
+    }
+
+    fn one(line: &str) -> AndOr {
+        let mut list = super::parse(line).unwrap();
+        assert_eq!(list.len(), 1, "{line:?}");
+        list.remove(0)
+    }
+
+    #[test]
+    fn semicolons_make_a_list() {
+        let list = super::parse("a; b ;c").unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(names(&list[1].first), [["b"]]);
+        assert!(list.iter().all(|a| a.rest.is_empty()));
+    }
+
+    #[test]
+    fn a_trailing_semicolon_is_allowed() {
+        assert_eq!(super::parse("a;").unwrap().len(), 1);
+        assert_eq!(super::parse("a; b;").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn connectors_are_left_associative_and_bind_tighter_than_semicolons() {
+        let list = super::parse("a && b || c ; d").unwrap();
+        assert_eq!(list.len(), 2);
+        let first = &list[0];
+        assert_eq!(names(&first.first), [["a"]]);
+        assert_eq!(first.rest.len(), 2);
+        assert_eq!(first.rest[0].0, Connector::And);
+        assert_eq!(first.rest[1].0, Connector::Or);
+        assert_eq!(names(&first.rest[1].1), [["c"]]);
+    }
+
+    #[test]
+    fn a_pipe_binds_tighter_than_a_connector() {
+        let a = one("a | b && c | d");
+        assert_eq!(names(&a.first), [["a"], ["b"]]);
+        assert_eq!(names(&a.rest[0].1), [["c"], ["d"]]);
+    }
+
+    #[test]
+    fn bang_negates_the_pipeline_after_it() {
+        assert!(one("! a | b").first.negated);
+        assert_eq!(names(&one("! a | b").first), [["a"], ["b"]]);
+        let a = one("a && ! b");
+        assert!(!a.first.negated && a.rest[0].1.negated);
+        assert!(!one("! ! a").first.negated); // twice is not at all
+    }
+
+    #[test]
+    fn a_bang_that_is_not_first_is_an_argument() {
+        let p = parse("echo !").unwrap();
+        assert_eq!(argv(&p, 0), ["echo", "!"]);
+        let p = parse("a | ! b").unwrap();
+        assert_eq!(argv(&p, 1), ["!", "b"]);
+    }
+
+    #[test]
+    fn a_connector_or_semicolon_with_nothing_beside_it_is_an_error() {
+        for line in [
+            "; a",
+            "a ; ; b",
+            "&& a",
+            "|| a",
+            "a && && b",
+            "a && ; b",
+            "!",
+            "a && !",
+        ] {
+            let result = super::parse(line);
+            assert!(
+                matches!(
+                    result,
+                    Err(SyntaxError::MissingCommand | SyntaxError::Incomplete(_))
+                ),
+                "{line:?}: {result:?}"
+            );
+        }
+        assert_eq!(super::parse("; a"), Err(SyntaxError::MissingCommand));
+        assert_eq!(super::parse("a ; ; b"), Err(SyntaxError::MissingCommand));
+        assert_eq!(super::parse("&& a"), Err(SyntaxError::MissingCommand));
+    }
+
+    #[test]
+    fn a_line_ending_in_a_connector_is_incomplete() {
+        assert_eq!(super::parse("a &&"), Err(SyntaxError::Incomplete("&&")));
+        assert_eq!(super::parse("a ||"), Err(SyntaxError::Incomplete("||")));
+        assert_eq!(super::parse("a && b |"), Err(SyntaxError::Incomplete("|")));
+    }
+
+    #[test]
+    fn redirections_belong_to_their_own_command() {
+        let a = one("a > x && b < y");
+        assert_eq!(a.first.pipeline[0].redirs.len(), 1);
+        assert_eq!(
+            a.rest[0].1.pipeline[0].redirs,
+            [Redirection::In("y".into())]
         );
     }
 }

@@ -746,7 +746,8 @@ fn describe_syntax_error(err: syntax::SyntaxError) -> String {
             format!("no file name after '{op}'")
         }
         syntax::SyntaxError::BadDupTarget => "a '>&' target must be 1 or 2".into(),
-        syntax::SyntaxError::MissingCommand => "no command next to '|'".into(),
+        syntax::SyntaxError::MissingCommand => "no command next to an operator".into(),
+        syntax::SyntaxError::Incomplete(op) => format!("no command after '{op}'"),
         syntax::SyntaxError::EmptyCommand => {
             unreachable!("run() handles this before calling describe_syntax_error")
         }
@@ -776,8 +777,8 @@ fn describe_syntax_error(err: syntax::SyntaxError) -> String {
 /// builtin succeeding/failing, and a launched program's own real exit code otherwise.
 #[cfg(target_os = "none")]
 fn run(uart: &mut Uart, line: &str, depth: usize) -> i32 {
-    let pipeline = match syntax::parse(line) {
-        Ok(pipeline) => pipeline,
+    let list = match syntax::parse(line) {
+        Ok(list) => list,
         Err(syntax::SyntaxError::EmptyCommand) => return last_status(),
         Err(e) => {
             report(uart, &describe_syntax_error(e));
@@ -786,15 +787,56 @@ fn run(uart: &mut Uart, line: &str, depth: usize) -> i32 {
         }
     };
 
+    // `;`-separated entries run one after another whatever each one's status; the line's status
+    // is the last one that ran.
+    let mut status = 0;
+    for and_or in &list {
+        status = run_and_or(uart, and_or, depth);
+    }
+    status
+}
+
+/// Runs one `command [&& | || command]...` chain left to right. Each connector looks at the
+/// status of everything to its left (`&&` runs the next command on 0, `||` on non-zero); a command
+/// it skips leaves that status as it was, so `false && x || y` runs `y`, and `true || x && y`
+/// runs `y` too. `$?` is updated after every command that runs, so each one sees its
+/// predecessor's. Returns the chain's status.
+#[cfg(target_os = "none")]
+fn run_and_or(uart: &mut Uart, and_or: &syntax::AndOr, depth: usize) -> i32 {
+    let mut status = run_command(uart, &and_or.first, depth);
+    set_last_status(status);
+    for (connector, command) in &and_or.rest {
+        let runs = match connector {
+            syntax::Connector::And => status == 0,
+            syntax::Connector::Or => status != 0,
+        };
+        if runs {
+            status = run_command(uart, command, depth);
+            set_last_status(status);
+        }
+    }
+    status
+}
+
+/// Runs one pipeline, negating its status if a `!` led it (`0` becomes `1`, anything else `0`).
+/// A pipeline of more than one segment runs via `run_pipeline`; a single segment runs through
+/// `run_segment` directly (`pipe_stdio: None` -- its own doc comment covers assignment words,
+/// builtins, redirections and launching a program).
+#[cfg(target_os = "none")]
+fn run_command(uart: &mut Uart, command: &syntax::Command, depth: usize) -> i32 {
+    let pipeline = &command.pipeline;
     let status = if pipeline.len() > 1 {
-        run_pipeline(uart, &pipeline, depth)
+        run_pipeline(uart, pipeline, depth)
     } else {
-        // `pipeline` always has at least one segment -- `syntax::parse` never returns an empty
-        // one (a pipeline with nothing in it is `SyntaxError::EmptyCommand`, handled above).
+        // `syntax::parse` never returns an empty pipeline (a stage with nothing in it is a
+        // syntax error), so there is always a first segment.
         run_segment(uart, &pipeline[0], depth, None)
     };
-    set_last_status(status);
-    status
+    if command.negated {
+        i32::from(status == 0)
+    } else {
+        status
+    }
 }
 
 /// The environment file: plain `NAME=VALUE` lines (see `environment.rs`), read once at boot.
