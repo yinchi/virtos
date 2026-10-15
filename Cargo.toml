@@ -7,6 +7,9 @@ edition = "2024"
 # Plain `no_std` constants (syscall numbers, key codes): builds on the host target too, so the
 # pure `keyboard` module can use `abi::keys` under `just test-host`.
 abi = { path = "user/abi" }
+# The pure text logic the user programs share: the shell's filename expansion uses its glob
+# matcher, so `find -name` and `ls *.c` agree on what a pattern means.
+textlib = { path = "user/textlib" }
 hadris-fat = { version = "2.4.0", default-features = false, features = ["alloc", "lfn", "read", "write", "sync"] }
 peg = { version = "0.8.6", default-features = false }
 spin = "0.12.3"

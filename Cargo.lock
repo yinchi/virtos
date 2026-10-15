@@ -521,6 +521,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "textlib"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "unifont",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -586,6 +594,7 @@ dependencies = [
  "linked_list_allocator",
  "peg",
  "spin",
+ "textlib",
  "unifont",
  "virtio-drivers",
 ]

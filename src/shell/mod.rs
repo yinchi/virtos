@@ -15,7 +15,7 @@
 //! currently-exported variable (`frame_stack`), plus any one-shot assignment prefix
 //! (`frame_stack::with_overlay`), as its `envp`.
 //!
-//! `lexer`/`syntax`/`frame_stack`/`expand`/`prompt` are pure logic, no hardware dependency: built and
+//! `lexer`/`syntax`/`frame_stack`/`expand`/`globbing`/`prompt` are pure logic, no hardware dependency: built and
 //! host-tested under both targets, like `fs::sector`/`exec::elfparse`. Everything below them
 //! touches the console, keyboard, or filesystem, so it's bare-metal-only, like `exec::process`.
 
@@ -23,6 +23,7 @@ mod environment;
 mod expand;
 mod frame_stack;
 mod fstab;
+mod globbing;
 mod lexer;
 mod path_search;
 mod program_kind;
@@ -82,7 +83,10 @@ fn report(uart: &mut Uart, msg: &str) {
 /// inherits them.
 #[cfg(target_os = "none")]
 fn is_builtin(name: &str) -> bool {
-    matches!(name, "cd" | "source" | "." | "sh" | "export" | "unset")
+    matches!(
+        name,
+        "cd" | "source" | "." | "sh" | "export" | "unset" | "shift"
+    )
 }
 
 /// `$?`'s current value -- deliberately *not* part of `frame_stack` (matching the lab's own
@@ -195,16 +199,16 @@ const MAX_SCRIPT_DEPTH: usize = 16;
 #[cfg(target_os = "none")]
 fn source(uart: &mut Uart, name: &str, argv: &[String], depth: usize) -> i32 {
     let path = match argv {
-        [_, path] => path.as_str(),
+        [_, path, ..] => path.as_str(),
         [_] => {
-            report(uart, &format!("{name}: usage: {name} FILE"));
+            report(uart, &format!("{name}: usage: {name} FILE [ARG]..."));
             return 1;
         }
-        _ => {
-            report(uart, &format!("{name}: too many arguments"));
-            return 1;
-        }
+        [] => return 1,
     };
+    // `source FILE a b` gives the file `a`, `b` as `$1`, `$2` for its run, then puts the caller's
+    // own back (`sh FILE a b` already did the same, in the scope it made for itself).
+    let extra = if name == "sh" { &[][..] } else { &argv[2..] };
     if depth >= MAX_SCRIPT_DEPTH {
         report(uart, &format!("{name}: {path}: too many levels of scripts"));
         return 1;
@@ -249,7 +253,13 @@ fn source(uart: &mut Uart, name: &str, argv: &[String], depth: usize) -> i32 {
         report(uart, &format!("{name}: {path}: not valid UTF-8"));
         return 1;
     };
-    run_script_content(uart, content, depth)
+    if extra.is_empty() {
+        return run_script_content(uart, content, depth);
+    }
+    let saved = frame_stack::replace_args(extra.to_vec());
+    let status = run_script_content(uart, content, depth);
+    frame_stack::replace_args(saved);
+    status
 }
 
 /// Runs each line of `content` as if typed at the prompt, one nesting level (`depth`) below
@@ -271,7 +281,13 @@ fn run_script_content(uart: &mut Uart, content: &str, depth: usize) -> i32 {
 /// immediate caller of `with_child`, which otherwise has none yet.
 #[cfg(target_os = "none")]
 fn sh(uart: &mut Uart, argv: &[String], depth: usize) -> i32 {
-    frame_stack::with_child(|| source(uart, "sh", argv, depth))
+    // `sh FILE a b`: in a scope of its own where `$0` is FILE and `$1`, `$2` are `a`, `b`.
+    let Some(file) = argv.get(1) else {
+        report(uart, "sh: usage: sh FILE [ARG]...");
+        return 1;
+    };
+    let args = argv[2..].to_vec();
+    frame_stack::with_child(file, args, || source(uart, "sh", argv, depth))
 }
 
 /// `export NAME[=VALUE]...`: marks each named variable exported -- handed to every program this
@@ -280,6 +296,33 @@ fn sh(uart: &mut Uart, argv: &[String], depth: usize) -> i32 {
 /// nothing to mark), matching the lab's own `export_var` exactly. Every operand is attempted even
 /// if an earlier one was an invalid identifier; the status is `1` if any operand was invalid, `0`
 /// otherwise.
+/// `shift [N]`: drops the first `N` (default 1) positional parameters, so `$2` becomes `$1`.
+/// Status 1, and nothing dropped, if there are fewer than `N`; 2 for an `N` that is not a
+/// non-negative number.
+#[cfg(target_os = "none")]
+fn shift(uart: &mut Uart, argv: &[String]) -> i32 {
+    let n = match argv {
+        [_] => 1,
+        [_, n] => match n.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                report(uart, &format!("shift: {n}: numeric argument required"));
+                return 2;
+            }
+        },
+        _ => {
+            report(uart, "shift: too many arguments");
+            return 2;
+        }
+    };
+    if frame_stack::shift(n) {
+        0
+    } else {
+        report(uart, "shift: shift count out of range");
+        1
+    }
+}
+
 #[cfg(target_os = "none")]
 fn export(uart: &mut Uart, argv: &[String]) -> i32 {
     if argv.len() < 2 {
@@ -330,14 +373,18 @@ fn resolve_redirs(
 ) -> Result<Stdio, String> {
     let mut stdio: Stdio = Vec::new();
     for redir in redirs {
-        let mut subst = |text: &str| substitute(uart, text, depth);
+        let mut env = ShellEnv {
+            uart: &mut *uart,
+            depth,
+            overlay: &[],
+        };
         match redir {
             syntax::Redirection::In(word) => {
-                let path = expand::expand_target(word, &var_lookup, last_status(), &mut subst)?;
+                let path = expand::expand_target(word, &mut env)?;
                 stdio.push((0, StdioRedirect::In(path)));
             }
             syntax::Redirection::Out { fd, path, append } => {
-                let path = expand::expand_target(path, &var_lookup, last_status(), &mut subst)?;
+                let path = expand::expand_target(path, &mut env)?;
                 stdio.push((
                     usize::from(*fd),
                     StdioRedirect::Out {
@@ -370,6 +417,80 @@ fn exported_env() -> Vec<String> {
 #[cfg(target_os = "none")]
 fn var_lookup(name: &str) -> Option<String> {
     frame_stack::var(name).map(|value| value.to_string())
+}
+
+/// What an expansion reads and writes of the shell (`expand::Env`): variables -- with `overlay`,
+/// the assignments earlier in the same command, looked at first -- `$?`, the positional
+/// parameters of the current frame, and the running of a command substitution at `depth`.
+#[cfg(target_os = "none")]
+struct ShellEnv<'a, 'u> {
+    uart: &'a mut Uart<'u>,
+    depth: usize,
+    overlay: &'a [(String, String)],
+}
+
+#[cfg(target_os = "none")]
+impl expand::Env for ShellEnv<'_, '_> {
+    fn var(&self, name: &str) -> Option<String> {
+        match name {
+            "#" => Some(frame_stack::args().len().to_string()),
+            "0" => Some(frame_stack::name().to_string()),
+            n if n.bytes().all(|b| b.is_ascii_digit()) => {
+                // `$1` is `args()[0]`; an index too large to parse is just unset.
+                let index: usize = n.parse().ok()?;
+                frame_stack::args().get(index.checked_sub(1)?).cloned()
+            }
+            _ => self
+                .overlay
+                .iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .or_else(|| var_lookup(name)),
+        }
+    }
+
+    fn status(&self) -> i32 {
+        last_status()
+    }
+
+    fn args(&self) -> Vec<String> {
+        frame_stack::args().to_vec()
+    }
+
+    fn subst(&mut self, text: &str) -> Result<String, String> {
+        substitute(self.uart, text, self.depth)
+    }
+
+    fn set(&mut self, name: &str, value: &str) {
+        let _ = frame_stack::set_var(name, value);
+    }
+}
+
+/// The entries of the directory a filename pattern's earlier components named (`""`: the working
+/// directory) -- `globbing::expand`'s `list`.
+#[cfg(target_os = "none")]
+fn glob_list(prefix: &str) -> Option<Vec<globbing::Entry>> {
+    let path = fs::cwd::absolute(if prefix.is_empty() { "." } else { prefix });
+    fd::dir_entries(&path)
+}
+
+/// Filename expansion over `fields`: each one with an unquoted wildcard is replaced by the sorted
+/// names matching its pattern, or kept as it is typed when nothing matches (bash's default).
+#[cfg(target_os = "none")]
+fn glob_fields(fields: Vec<expand::Field>) -> Vec<String> {
+    let mut argv = Vec::with_capacity(fields.len());
+    for field in fields {
+        if field.is_pattern() {
+            let matches = globbing::expand(&field.pattern, &mut glob_list);
+            if !matches.is_empty() {
+                argv.extend(matches);
+                continue;
+            }
+        }
+        argv.push(field.text);
+    }
+    argv
 }
 
 /// The most a command substitution's output may be: past it the substitution fails rather than
@@ -505,6 +626,7 @@ fn dispatch_builtin(uart: &mut Uart, name: &str, argv: &[String], depth: usize) 
         "sh" => sh(uart, argv, depth),
         "export" => export(uart, argv),
         "unset" => unset(argv),
+        "shift" => shift(uart, argv),
         _ => unreachable!("`is_builtin` already said {name} is one"),
     }
 }
@@ -605,17 +727,13 @@ fn run_segment(
         // whether they end up as the shell's own variables or as the command's one-shot overlay.
         let mut overlay: Vec<(String, String)> = Vec::new();
         for (name, value_word) in assignments {
-            let seen = |n: &str| {
-                overlay
-                    .iter()
-                    .rev()
-                    .find(|(k, _)| k == n)
-                    .map(|(_, v)| v.clone())
-                    .or_else(|| var_lookup(n))
-            };
             let value = {
-                let mut subst = |text: &str| substitute(uart, text, depth);
-                expand::expand_assignment_value(&value_word, &seen, last_status(), &mut subst)
+                let mut env = ShellEnv {
+                    uart: &mut *uart,
+                    depth,
+                    overlay: &overlay,
+                };
+                expand::expand_assignment_value(&value_word, &mut env)
             };
             match value {
                 Ok(value) => overlay.push((name.to_string(), value)),
@@ -649,11 +767,15 @@ fn run_segment(
         }
 
         let expanded = {
-            let mut subst = |text: &str| substitute(uart, text, depth);
-            expand::expand_words(command_words, &var_lookup, last_status(), &mut subst)
+            let mut env = ShellEnv {
+                uart: &mut *uart,
+                depth,
+                overlay: &[],
+            };
+            expand::expand_fields(command_words, &mut env)
         };
         let argv = match expanded {
-            Ok(argv) => argv,
+            Ok(fields) => glob_fields(fields),
             Err(msg) => {
                 report(uart, &msg);
                 return 1;
@@ -711,7 +833,7 @@ fn run_segment(
 /// binding), which every command inside it inherits (`fd::with_inherited_stdio`). Returns
 /// `dispatch_segment`'s status: the script's own once it has run, `126` if it was refused.
 ///
-/// A script takes no arguments: there are no positional parameters yet to hand them to.
+/// Its arguments are its positional parameters (`$1`..), and `$0` is the name it was run by.
 #[cfg(target_os = "none")]
 fn run_script_file(
     uart: &mut Uart,
@@ -725,14 +847,13 @@ fn run_script_file(
         report(uart, &format!("{name}: {why}"));
         launch::STATUS_CANNOT_EXECUTE
     };
-    if argv.len() > 1 {
-        return refuse(uart, "too many arguments");
-    }
     if depth >= MAX_SCRIPT_DEPTH {
         return refuse(uart, "too many levels of scripts");
     }
     let ran = fd::with_inherited_stdio(stdio, || {
-        frame_stack::with_child(|| run_script_content(uart, text, depth))
+        frame_stack::with_child(name, argv[1..].to_vec(), || {
+            run_script_content(uart, text, depth)
+        })
     });
     match ran {
         Ok(status) => status,

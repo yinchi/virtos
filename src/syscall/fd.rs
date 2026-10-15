@@ -116,6 +116,21 @@ fn list_dir(dir: &FatDir<'static, BlkIo>) -> Vec<(String, u32, u8)> {
     entries
 }
 
+/// The entries of the directory at the absolute `path` -- name and whether it is itself a
+/// directory -- for the shell's filename expansion; `None` if `path` is not a directory (or is on
+/// no volume). Sees mounts the way every path does (`fs::path::volume_for`).
+pub fn dir_entries(path: &str) -> Option<Vec<(String, bool)>> {
+    let (_, vol, rest) = fs::path::volume_for(path)?;
+    let vol: &'static FatVolume<BlkIo> = vol;
+    let dir = fs::path::resolve_dir(vol, rest).ok()?;
+    Some(
+        list_dir(&dir)
+            .into_iter()
+            .map(|(name, _, attrs)| (name, attrs & ATTR_DIRECTORY != 0))
+            .collect(),
+    )
+}
+
 /// SAFETY (every access, via `table`): single core, and every syscall runs with IRQs masked
 /// (`vectors.s`'s trap entry), so nothing else can touch the table while a call is in progress.
 static mut FD_TABLE: [Option<FileDescriptor>; MAX_FDS] = [const { None }; MAX_FDS];

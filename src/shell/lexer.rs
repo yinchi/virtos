@@ -84,7 +84,11 @@ impl RedirOp {
 /// each `Var`/`Status`'s own `quoted` decides (`shell::expand`'s own doc comment).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
+    /// Unquoted literal text: shell metacharacters in it (`*`, `?`, `[`) are pattern characters
+    /// for filename expansion.
     Lit(String),
+    /// Literal text that was quoted or escaped (`'…'`, `"…"` text, `\x`): never a pattern.
+    Quoted(String),
     Var {
         name: String,
         quoted: bool,
@@ -101,6 +105,49 @@ pub enum Part {
         text: String,
         quoted: bool,
     },
+    /// An unquoted `~` (or `~/…`) at the start of a word, or of an assignment's value: the home
+    /// directory, `$HOME`. The result is never split or globbed.
+    Home,
+    /// `${NAME-word}` and its relatives: `word` is expanded only when `op` calls for it.
+    Param {
+        name: String,
+        op: ParamOp,
+        word: Vec<Part>,
+        quoted: bool,
+    },
+    /// `${#NAME}`: the length of `NAME`'s value, in characters.
+    Length {
+        name: String,
+    },
+}
+
+/// The operator of a `${NAME<op>word}` expansion. `colon` is whether it was written with a
+/// leading `:`, which makes an *empty* value count as unset too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamOp {
+    /// `-`/`:-`: the value, or `word` if there is none.
+    Default { colon: bool },
+    /// `+`/`:+`: `word` if there is a value, nothing otherwise.
+    Alternate { colon: bool },
+    /// `=`/`:=`: the value, or `word` -- which is also assigned to `NAME`.
+    Assign { colon: bool },
+    /// `?`/`:?`: the value, or an error naming `NAME` with `word` as the message.
+    Error { colon: bool },
+}
+
+impl ParamOp {
+    fn text(self) -> &'static str {
+        match self {
+            ParamOp::Default { colon: false } => "-",
+            ParamOp::Default { colon: true } => ":-",
+            ParamOp::Alternate { colon: false } => "+",
+            ParamOp::Alternate { colon: true } => ":+",
+            ParamOp::Assign { colon: false } => "=",
+            ParamOp::Assign { colon: true } => ":=",
+            ParamOp::Error { colon: false } => "?",
+            ParamOp::Error { colon: true } => ":?",
+        }
+    }
 }
 
 /// A word: a run of adjacent [`Part`]s, in lexical order, plus `assign` -- the byte offset of `=`
@@ -132,7 +179,7 @@ impl Word {
         let mut s = String::new();
         for part in &self.parts {
             match part {
-                Part::Lit(t) => s.push_str(t),
+                Part::Lit(t) | Part::Quoted(t) => s.push_str(t),
                 Part::Var { name, .. } => {
                     s.push('$');
                     s.push_str(name);
@@ -142,6 +189,23 @@ impl Word {
                     s.push_str("$(");
                     s.push_str(text);
                     s.push(')');
+                }
+                Part::Home => s.push('~'),
+                Part::Param { name, op, word, .. } => {
+                    s.push_str("${");
+                    s.push_str(name);
+                    s.push_str(op.text());
+                    let inner = Word {
+                        parts: word.clone(),
+                        assign: None,
+                    };
+                    s.push_str(&inner.raw());
+                    s.push('}');
+                }
+                Part::Length { name } => {
+                    s.push_str("${#");
+                    s.push_str(name);
+                    s.push('}');
                 }
             }
         }
@@ -217,6 +281,15 @@ pub enum LexError {
     BadSubstitution,
 }
 
+/// A literal run as a part: `Quoted` when it came from inside quotes (never a pattern).
+fn lit_part(text: String, quoted: bool) -> Part {
+    if quoted {
+        Part::Quoted(text)
+    } else {
+        Part::Lit(text)
+    }
+}
+
 /// Scans already-matched text -- from inside unquoted or double-quoted context; single-quoted and
 /// escaped text never reach this at all, so a `$` there is never special in the first place -- for
 /// `$NAME`, `${NAME}`/`${?}` and `$?`, returning the resulting parts in order. A `$` followed by
@@ -236,9 +309,21 @@ fn scan_expansions(text: &str, quoted: bool) -> Result<Vec<Part>, LexError> {
             Some('?') => {
                 chars.next();
                 if !lit.is_empty() {
-                    parts.push(Part::Lit(core::mem::take(&mut lit)));
+                    parts.push(lit_part(core::mem::take(&mut lit), quoted));
                 }
                 parts.push(Part::Status { quoted });
+            }
+            // Positional parameters: one digit (`$10` is `${1}0`, as in every shell), and the
+            // count and the whole list.
+            Some(c2 @ ('0'..='9' | '#' | '@' | '*')) => {
+                chars.next();
+                if !lit.is_empty() {
+                    parts.push(lit_part(core::mem::take(&mut lit), quoted));
+                }
+                parts.push(Part::Var {
+                    name: c2.to_string(),
+                    quoted,
+                });
             }
             Some('{') => {
                 chars.next();
@@ -255,7 +340,7 @@ fn scan_expansions(text: &str, quoted: bool) -> Result<Vec<Part>, LexError> {
                     return Err(LexError::BadSubstitution);
                 }
                 if !lit.is_empty() {
-                    parts.push(Part::Lit(core::mem::take(&mut lit)));
+                    parts.push(lit_part(core::mem::take(&mut lit), quoted));
                 }
                 if name == "?" {
                     parts.push(Part::Status { quoted });
@@ -276,7 +361,7 @@ fn scan_expansions(text: &str, quoted: bool) -> Result<Vec<Part>, LexError> {
                     }
                 }
                 if !lit.is_empty() {
-                    parts.push(Part::Lit(core::mem::take(&mut lit)));
+                    parts.push(lit_part(core::mem::take(&mut lit), quoted));
                 }
                 parts.push(Part::Var { name, quoted });
             }
@@ -284,7 +369,7 @@ fn scan_expansions(text: &str, quoted: bool) -> Result<Vec<Part>, LexError> {
         }
     }
     if !lit.is_empty() {
-        parts.push(Part::Lit(lit));
+        parts.push(lit_part(lit, quoted));
     }
     Ok(parts)
 }
@@ -298,13 +383,46 @@ fn scan_expansions(text: &str, quoted: bool) -> Result<Vec<Part>, LexError> {
 fn merge_lits(parts: Vec<Part>) -> Vec<Part> {
     let mut merged: Vec<Part> = Vec::with_capacity(parts.len());
     for part in parts {
-        if let (Some(Part::Lit(prev)), Part::Lit(next)) = (merged.last_mut(), &part) {
-            prev.push_str(next);
-        } else {
-            merged.push(part);
+        match (merged.last_mut(), &part) {
+            (Some(Part::Lit(prev)), Part::Lit(next))
+            | (Some(Part::Quoted(prev)), Part::Quoted(next)) => prev.push_str(next),
+            _ => merged.push(part),
         }
     }
     merged
+}
+
+/// Replaces a word's leading unquoted `~` -- only as the whole word or before a `/` -- with
+/// [`Part::Home`], and likewise the `~` at the start of an assignment's value (`X=~/bin`). There is
+/// one user here, so `~name` is not a home directory: it stays text.
+fn apply_tilde(mut parts: Vec<Part>) -> Vec<Part> {
+    let alone = parts.len() == 1;
+    let Some(Part::Lit(first)) = parts.first() else {
+        return parts;
+    };
+    // Where a tilde prefix could start in the first literal: its start, or just after `NAME=`.
+    let start = match first.find('=') {
+        Some(eq) if is_valid_name(&first[..eq]) => eq + 1,
+        _ => 0,
+    };
+    let rest = &first[start..];
+    // A bare `~` counts only if nothing is glued after it (`~$X` is ordinary text); `~/…` always.
+    let is_tilde = (rest == "~" && alone) || rest.starts_with("~/");
+    if !is_tilde {
+        return parts;
+    }
+    let head = first[..start].to_string();
+    let tail = rest[1..].to_string();
+    let mut out = Vec::with_capacity(parts.len() + 2);
+    if !head.is_empty() {
+        out.push(Part::Lit(head));
+    }
+    out.push(Part::Home);
+    if !tail.is_empty() {
+        out.push(Part::Lit(tail));
+    }
+    out.extend(parts.drain(1..));
+    out
 }
 
 /// One escaped-or-raw character from inside a double-quoted string -- kept distinct until the
@@ -335,7 +453,7 @@ fn assemble_dquoted(chars: Vec<DChar>) -> Result<Vec<Part>, LexError> {
                 if !raw.is_empty() {
                     parts.extend(scan_expansions(&core::mem::take(&mut raw), true)?);
                 }
-                parts.push(Part::Lit(c.to_string()));
+                parts.push(Part::Quoted(c.to_string()));
             }
             DChar::Sub(part) => {
                 if !raw.is_empty() {
@@ -359,7 +477,7 @@ peg::parser! {
         // Characters excluded from an unquoted word: either an operator (its own rule
         // elsewhere) or refused outright (";", "&", "(", ")" have no rule anywhere else here).
         rule unquoted_start()
-            = !"$(" !"`" !['"' | '\'' | '\\' | '|' | '<' | '>' | '#' | ';' | '&' | '(' | ')'
+            = !"$(" !"${" !"`" !['"' | '\'' | '\\' | '|' | '<' | '>' | '#' | ';' | '&' | '(' | ')'
                 | ' ' | '\t' | '\x0B' | '\x0C' | '\r' | '\n'] [_]
         // "#" may continue a word already started but is excluded from unquoted_start, so it
         // can never start one -- at a fresh position only `comment` matches "#".
@@ -371,7 +489,7 @@ peg::parser! {
 
         rule squote_char() = !"'" [_]
         rule squoted() -> Vec<Part>
-            = "'" s:$(squote_char()*) "'" { vec![Part::Lit(s.to_string())] }
+            = "'" s:$(squote_char()*) "'" { vec![Part::Quoted(s.to_string())] }
             / "'" squote_char()* {? Err("unterminated-quote") }
         // No escaping or expansion inside single quotes.
 
@@ -389,7 +507,7 @@ peg::parser! {
             / "\"" dquote_char()* {? Err("unterminated-quote") }
 
         rule escape_piece() -> Vec<Part>
-            = "\\" c:[_] { vec![Part::Lit(c.to_string())] }
+            = "\\" c:[_] { vec![Part::Quoted(c.to_string())] }
             / "\\" {? Err("unterminated-escape") }
         // Outside any quote, a backslash escapes exactly the next character, whatever it is --
         // including `$`, which this isolates from `tail`'s own trailing `unquoted_tail_char`
@@ -413,8 +531,46 @@ peg::parser! {
         rule backtick(quoted: bool) -> Part
             = "`" s:$(bt_char()*) "`" {? backtick_part(s, quoted) }
             / "`" bt_char()* {? Err("unterminated-subst") }
+        // `${NAME}` and the forms with an operator. The word after the operator is lexed with
+        // the same pieces as anywhere else (quotes, escapes, substitutions, nested `${…}`),
+        // up to the first unquoted `}`; plain `$NAME` runs inside it are scanned for expansions.
+        rule param_name() -> String
+            = s:$(['A'..='Z' | 'a'..='z' | '_'] ['A'..='Z' | 'a'..='z' | '0'..='9' | '_']*
+                  / ['0'..='9']+
+                  / ['?' | '#' | '@' | '*']) { s.to_string() }
+        rule param_op() -> ParamOp
+            = ":-" { ParamOp::Default { colon: true } }
+            / ":=" { ParamOp::Assign { colon: true } }
+            / ":+" { ParamOp::Alternate { colon: true } }
+            / ":?" { ParamOp::Error { colon: true } }
+            / "-" { ParamOp::Default { colon: false } }
+            / "=" { ParamOp::Assign { colon: false } }
+            / "+" { ParamOp::Alternate { colon: false } }
+            / "?" { ParamOp::Error { colon: false } }
+        rule param_raw(quoted: bool) -> Vec<Part>
+            = s:$((!"}" !"${" !"$(" !"`" !"'" !"\"" !"\\" [_])+) {?
+                scan_expansions(s, quoted).map_err(decode_as_token)
+              }
+        rule param_item(quoted: bool) -> Vec<Part>
+            = dquoted() / squoted() / escape_piece()
+            / p:substitution(quoted) { vec![p] }
+            / param_raw(quoted)
+        rule param_word(quoted: bool) -> Vec<Part>
+            = items:param_item(quoted)* { merge_lits(items.into_iter().flatten().collect()) }
+        rule param_exp(quoted: bool) -> Part
+            = "${" "#" n:param_name() "}" { Part::Length { name: n } }
+            / "${" n:param_name() op:param_op() w:param_word(quoted) "}" {
+                Part::Param { name: n, op, word: w, quoted }
+              }
+            / "${" n:param_name() "}" {
+                if n == "?" { Part::Status { quoted } } else { Part::Var { name: n, quoted } }
+              }
+            // Whatever else follows `${`: consume it up to the `}` (or the end) before refusing,
+            // so this failure is the furthest one and its sentinel is what gets reported.
+            / "${" (!"}" [_])* "}"? {? Err("bad-substitution") }
+
         rule substitution(quoted: bool) -> Part
-            = arith() / paren_subst(quoted) / backtick(quoted)
+            = arith() / paren_subst(quoted) / backtick(quoted) / param_exp(quoted)
 
         rule piece() -> Vec<Part>
             = dquoted() / squoted() / escape_piece() / p:substitution(false) { vec![p] }
@@ -433,14 +589,14 @@ peg::parser! {
             = u:unquoted() ts:tail()* {
                 let mut parts = u;
                 for t in ts { parts.extend(t); }
-                let parts = merge_lits(parts);
+                let parts = apply_tilde(merge_lits(parts));
                 let assign = detect_assign(&parts);
                 Word { parts, assign }
               }
             / ts:tail()+ {
                 let mut parts = Vec::new();
                 for t in ts { parts.extend(t); }
-                let parts = merge_lits(parts);
+                let parts = apply_tilde(merge_lits(parts));
                 let assign = detect_assign(&parts);
                 Word { parts, assign }
               }
@@ -651,8 +807,28 @@ mod tests {
     fn r(fd: Option<u8>, op: RedirOp) -> Token {
         Token::Redir { fd, op }
     }
+    /// `lex`, with quoted text folded into the literal text around it: most tests here are
+    /// about *where words end* and what expansions they hold, not about whether a piece was
+    /// quoted (the `quoted_text_is_kept_apart` tests below check that directly).
     fn lexed(line: &str) -> Vec<Token> {
-        lex(line).unwrap()
+        lex(line).unwrap().into_iter().map(flatten).collect()
+    }
+
+    fn flatten(token: Token) -> Token {
+        let Token::Word(word) = token else {
+            return token;
+        };
+        let parts = word
+            .parts
+            .into_iter()
+            .map(|p| match p {
+                Part::Quoted(t) => Part::Lit(t),
+                other => other,
+            })
+            .collect();
+        let parts = merge_lits(parts);
+        let assign = word.assign;
+        Token::Word(Word { parts, assign })
     }
 
     #[test]
@@ -821,10 +997,10 @@ mod tests {
 
     #[test]
     fn non_dollar_expansion_characters_are_still_ordinary() {
-        // (The backtick used to be on this list; it now starts a command substitution.)
+        // (The backtick and the tilde used to be on this list; each is an expansion now.)
         assert_eq!(
-            lexed("echo * ? ~ {a,b}"),
-            [w("echo"), w("*"), w("?"), w("~"), w("{a,b}")]
+            lexed("echo * ? {a,b}"),
+            [w("echo"), w("*"), w("?"), w("{a,b}")]
         );
     }
 
@@ -883,7 +1059,6 @@ mod tests {
     #[test]
     fn dollar_not_followed_by_a_name_is_literal() {
         assert_eq!(lexed("echo $"), [w("echo"), w("$")]);
-        assert_eq!(lexed("echo $1"), [w("echo"), w("$1")]);
         assert_eq!(lexed("echo $$"), [w("echo"), w("$$")]);
         assert_eq!(lexed(r#"echo "$""#), [w("echo"), w("$")]);
     }
@@ -1122,5 +1297,265 @@ mod tests {
             lexed(r#""`echo \"a\"`""#),
             [word(vec![subst(r#"echo "a""#, true)])]
         );
+    }
+
+    // ---- quoted text is kept apart from unquoted (it is never a filename pattern) ----
+
+    fn raw_word(line: &str) -> Vec<Part> {
+        let Token::Word(word) = lex(line).unwrap().remove(0) else {
+            panic!("expected a word")
+        };
+        word.parts
+    }
+
+    #[test]
+    fn quoted_text_is_kept_apart_quoted_text_tests() {
+        assert_eq!(raw_word("*.c"), [Part::Lit("*.c".into())]);
+        assert_eq!(raw_word("'*.c'"), [Part::Quoted("*.c".into())]);
+        assert_eq!(raw_word("\"*.c\""), [Part::Quoted("*.c".into())]);
+        assert_eq!(
+            raw_word("\\*.c"),
+            [Part::Quoted("*".into()), Part::Lit(".c".into())]
+        );
+        // A word is a mix, in order; adjacent pieces of the same kind merge.
+        assert_eq!(
+            raw_word("a'b'\"c\"*"),
+            [
+                Part::Lit("a".into()),
+                Part::Quoted("bc".into()),
+                Part::Lit("*".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn quoted_text_inside_double_quotes_around_an_expansion() {
+        assert_eq!(
+            raw_word("\"a$X*\""),
+            [
+                Part::Quoted("a".into()),
+                Part::Var {
+                    name: "X".into(),
+                    quoted: true
+                },
+                Part::Quoted("*".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quoted_name_is_not_an_assignment() {
+        let Token::Word(word) = lex("'X'=1").unwrap().remove(0) else {
+            panic!("expected a word")
+        };
+        assert_eq!(word.assign, None);
+        let Token::Word(word) = lex("X='a b'").unwrap().remove(0) else {
+            panic!("expected a word")
+        };
+        assert_eq!(word.assign, Some(1));
+        assert_eq!(
+            word.assignment().unwrap().1.parts,
+            [Part::Quoted("a b".into())]
+        );
+    }
+
+    // ---- tilde, `${…}` forms, positional parameters ----
+
+    #[test]
+    fn a_leading_tilde_is_the_home_directory() {
+        assert_eq!(raw_word("~"), [Part::Home]);
+        assert_eq!(raw_word("~/bin"), [Part::Home, Part::Lit("/bin".into())]);
+        // Only at the start of a word, and only as the whole prefix.
+        assert_eq!(raw_word("a~"), [Part::Lit("a~".into())]);
+        assert_eq!(raw_word("~x"), [Part::Lit("~x".into())]);
+        assert_eq!(raw_word("~root/x"), [Part::Lit("~root/x".into())]);
+        assert_eq!(raw_word("'~'"), [Part::Quoted("~".into())]);
+        assert_eq!(raw_word("\\~"), [Part::Quoted("~".into())]);
+        assert_eq!(
+            raw_word("~$X"),
+            [
+                Part::Lit("~".into()),
+                Part::Var {
+                    name: "X".into(),
+                    quoted: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tilde_at_the_start_of_an_assignments_value_is_home_too() {
+        let Token::Word(word) = lex("PATH=~/bin").unwrap().remove(0) else {
+            panic!("expected a word")
+        };
+        assert_eq!(word.assign, Some(4));
+        assert_eq!(
+            word.assignment().unwrap().1.parts,
+            [Part::Home, Part::Lit("/bin".into())]
+        );
+        // Not after a colon, as bash's would: one user, one home, no `PATH`-style lists here.
+        assert_eq!(raw_word("A=b:~"), [Part::Lit("A=b:~".into())]);
+    }
+
+    #[test]
+    fn positional_parameters_and_their_specials() {
+        for (text, name) in [
+            ("$1", "1"),
+            ("$9", "9"),
+            ("$0", "0"),
+            ("$#", "#"),
+            ("$@", "@"),
+            ("$*", "*"),
+        ] {
+            assert_eq!(
+                raw_word(text),
+                [Part::Var {
+                    name: name.into(),
+                    quoted: false
+                }],
+                "{text}"
+            );
+        }
+        // One digit: `$10` is `${1}` then `0`; the braces take a longer number.
+        assert_eq!(
+            raw_word("$10"),
+            [
+                Part::Var {
+                    name: "1".into(),
+                    quoted: false
+                },
+                Part::Lit("0".into())
+            ]
+        );
+        assert_eq!(
+            raw_word("${10}"),
+            [Part::Var {
+                name: "10".into(),
+                quoted: false
+            }]
+        );
+        assert_eq!(
+            raw_word("\"$@\""),
+            [Part::Var {
+                name: "@".into(),
+                quoted: true
+            }]
+        );
+        // `$$` and a lone `$` are still just text.
+        assert_eq!(raw_word("$$"), [Part::Lit("$$".into())]);
+    }
+
+    #[test]
+    fn a_parameter_expansion_with_an_operator() {
+        use ParamOp::*;
+        for (text, op) in [
+            ("${X:-w}", Default { colon: true }),
+            ("${X-w}", Default { colon: false }),
+            ("${X:=w}", Assign { colon: true }),
+            ("${X=w}", Assign { colon: false }),
+            ("${X:+w}", Alternate { colon: true }),
+            ("${X+w}", Alternate { colon: false }),
+            ("${X:?w}", Error { colon: true }),
+            ("${X?w}", Error { colon: false }),
+        ] {
+            assert_eq!(
+                raw_word(text),
+                [Part::Param {
+                    name: "X".into(),
+                    op,
+                    word: vec![Part::Lit("w".into())],
+                    quoted: false
+                }],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_word_of_an_expansion_may_hold_blanks_quotes_and_more_expansions() {
+        assert_eq!(
+            raw_word("${X:-a b}"),
+            [Part::Param {
+                name: "X".into(),
+                op: ParamOp::Default { colon: true },
+                word: vec![Part::Lit("a b".into())],
+                quoted: false
+            }]
+        );
+        assert_eq!(
+            raw_word("\"${X:-'q' $Y}\""),
+            [Part::Param {
+                name: "X".into(),
+                op: ParamOp::Default { colon: true },
+                word: vec![
+                    Part::Quoted("q ".into()),
+                    Part::Var {
+                        name: "Y".into(),
+                        quoted: true
+                    }
+                ],
+                quoted: true
+            }]
+        );
+        // Nested, and a `}` inside inner quotes does not close it.
+        assert_eq!(
+            raw_word("${A:-${B:-c}}"),
+            [Part::Param {
+                name: "A".into(),
+                op: ParamOp::Default { colon: true },
+                word: vec![Part::Param {
+                    name: "B".into(),
+                    op: ParamOp::Default { colon: true },
+                    word: vec![Part::Lit("c".into())],
+                    quoted: false
+                }],
+                quoted: false
+            }]
+        );
+        assert_eq!(
+            raw_word("${A:-'}'}"),
+            [Part::Param {
+                name: "A".into(),
+                op: ParamOp::Default { colon: true },
+                word: vec![Part::Quoted("}".into())],
+                quoted: false
+            }]
+        );
+    }
+
+    #[test]
+    fn an_empty_word_and_a_length() {
+        assert_eq!(
+            raw_word("${X:-}"),
+            [Part::Param {
+                name: "X".into(),
+                op: ParamOp::Default { colon: true },
+                word: vec![],
+                quoted: false
+            }]
+        );
+        assert_eq!(raw_word("${#X}"), [Part::Length { name: "X".into() }]);
+        // `${#}` is `$#`, the count.
+        assert_eq!(
+            raw_word("${#}"),
+            [Part::Var {
+                name: "#".into(),
+                quoted: false
+            }]
+        );
+    }
+
+    #[test]
+    fn a_malformed_braced_expansion_is_a_bad_substitution() {
+        for line in [
+            "echo ${",
+            "echo ${}",
+            "echo ${a b}",
+            "echo ${1x}",
+            "echo ${X:-a",
+            "echo ${-}",
+        ] {
+            assert_eq!(lex(line), Err(LexError::BadSubstitution), "{line:?}");
+        }
     }
 }

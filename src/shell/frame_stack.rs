@@ -33,7 +33,15 @@ struct Var {
 /// One level of shell scope: its own environment variables.
 struct ShellFrame {
     vars: Vec<Var>,
+    /// The positional parameters `$1`.. -- what a script (`sh FILE a b`, `./script a b`) or
+    /// `source FILE a b` was given, empty at the prompt.
+    args: Vec<String>,
+    /// `$0`: the script's own name, `sh` at the prompt.
+    name: String,
 }
+
+/// What `$0` is when no script is running.
+const SHELL_NAME: &str = "sh";
 
 /// SAFETY (every access, via `frames`): single core, and the shell runs strictly sequentially --
 /// same reasoning `shell::PIPE_COUNTER`/`fs::cwd`'s own `CWD` already rest on.
@@ -45,7 +53,11 @@ fn frames() -> &'static mut Vec<ShellFrame> {
     // SAFETY: see FRAMES.
     let frames = unsafe { &mut *(&raw mut FRAMES) };
     if frames.is_empty() {
-        frames.push(ShellFrame { vars: Vec::new() });
+        frames.push(ShellFrame {
+            vars: Vec::new(),
+            args: Vec::new(),
+            name: SHELL_NAME.to_string(),
+        });
     }
     frames
 }
@@ -129,6 +141,36 @@ fn only_exported(vars: &[Var]) -> Vec<Var> {
 }
 
 /// The current value of `name`, exported or not -- `shell::expand_argv`'s own variable lookup.
+/// The positional parameters of the current frame (`$1`, `$2`, ...).
+pub fn args() -> &'static [String] {
+    &top().args
+}
+
+/// `$0`: the running script's name, or `sh` at the prompt.
+pub fn name() -> &'static str {
+    &top().name
+}
+
+/// Drops the first `n` positional parameters (`shift [n]`); `false`, and nothing dropped, if there
+/// are fewer than `n`.
+pub fn shift(n: usize) -> bool {
+    shift_args(&mut top_mut().args, n)
+}
+
+/// Replaces the positional parameters, returning the old ones (`source FILE a b` sets them for
+/// the file's run and puts the old ones back).
+pub fn replace_args(args: Vec<String>) -> Vec<String> {
+    core::mem::replace(&mut top_mut().args, args)
+}
+
+fn shift_args(args: &mut Vec<String>, n: usize) -> bool {
+    if n > args.len() {
+        return false;
+    }
+    args.drain(..n);
+    true
+}
+
 pub fn var(name: &str) -> Option<&'static str> {
     top()
         .vars
@@ -204,8 +246,8 @@ pub fn with_overlay<R>(overlay: &[(String, String)], f: impl FnOnce() -> R) -> R
 /// declaration) -- everything above this point in the file is pure `Vec<Var>` manipulation with
 /// no such dependency, and stays host-testable.
 #[cfg(target_os = "none")]
-pub fn with_child<R>(f: impl FnOnce() -> R) -> R {
-    push_and_run(only_exported(&top().vars), f)
+pub fn with_child<R>(name: &str, args: Vec<String>, f: impl FnOnce() -> R) -> R {
+    push_and_run(only_exported(&top().vars), args, name.to_string(), f)
 }
 
 /// Same shape as `with_child`, but `vars` starts as a full copy of the current top -- every
@@ -213,13 +255,15 @@ pub fn with_child<R>(f: impl FnOnce() -> R) -> R {
 /// pipeline stage.
 #[cfg(target_os = "none")]
 pub fn with_subshell<R>(f: impl FnOnce() -> R) -> R {
-    push_and_run(top().vars.clone(), f)
+    // A subshell is the shell again, so it has the same positional parameters and `$0`.
+    let (args, name) = (top().args.clone(), top().name.clone());
+    push_and_run(top().vars.clone(), args, name, f)
 }
 
 #[cfg(target_os = "none")]
-fn push_and_run<R>(vars: Vec<Var>, f: impl FnOnce() -> R) -> R {
+fn push_and_run<R>(vars: Vec<Var>, args: Vec<String>, name: String, f: impl FnOnce() -> R) -> R {
     let cwd = crate::fs::cwd::get();
-    frames().push(ShellFrame { vars });
+    frames().push(ShellFrame { vars, args, name });
     let result = f();
     frames().pop();
     crate::fs::cwd::set(cwd);
@@ -334,5 +378,17 @@ mod tests {
             ],
         );
         assert_eq!(vars, [var("A", "1", true), var("B", "2", true)]);
+    }
+
+    #[test]
+    fn shift_drops_from_the_front_and_refuses_too_many() {
+        let mut args: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert!(shift_args(&mut args, 1));
+        assert_eq!(args, ["b", "c"]);
+        assert!(!shift_args(&mut args, 3));
+        assert_eq!(args, ["b", "c"]); // nothing dropped
+        assert!(shift_args(&mut args, 0));
+        assert!(shift_args(&mut args, 2));
+        assert!(args.is_empty());
     }
 }
